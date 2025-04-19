@@ -1159,36 +1159,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== Обработчик документов (обновлен для chat_data через handle_message) =====
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not update.effective_user: logger.warning(f"ChatID: {chat_id} | handle_document: Не удалось определить пользователя."); return
-    user_id = update.effective_user.id
-    message = update.message
-    if not message or not message.document: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | В handle_document нет документа."); return
-    doc = message.document; allowed_mime_prefixes = ('text/', 'application/json', 'application/xml', 'application/csv', 'application/x-python', 'application/x-sh', 'application/javascript', 'application/x-yaml', 'application/x-tex', 'application/rtf', 'application/sql'); allowed_mime_types = ('application/octet-stream',)
-    mime_type = doc.mime_type or "application/octet-stream"; is_allowed_prefix = any(mime_type.startswith(prefix) for prefix in allowed_mime_prefixes); is_allowed_type = mime_type in allowed_mime_types
-    if not (is_allowed_prefix or is_allowed_type): await update.message.reply_text(f"⚠️ Пока могу читать только текстовые файлы... Ваш тип: `{mime_type}`", parse_mode=ParseMode.MARKDOWN); logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Неподдерживаемый файл: {doc.file_name} (MIME: {mime_type})"); return
-    MAX_FILE_SIZE_MB = 15; file_size_bytes = doc.file_size or 0
-    if file_size_bytes == 0 and doc.file_name: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Пустой файл '{doc.file_name}'."); await update.message.reply_text(f"ℹ️ Файл '{doc.file_name}' пустой."); return
-    elif file_size_bytes == 0 and not doc.file_name: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Получен пустой документ без имени."); return
-    if file_size_bytes > MAX_FILE_SIZE_MB * 1024 * 1024: await update.message.reply_text(f"❌ Файл `{doc.file_name}` слишком большой (> {MAX_FILE_SIZE_MB} MB).", parse_mode=ParseMode.MARKDOWN); logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Слишком большой файл: {doc.file_name} ({file_size_bytes / (1024*1024):.2f} MB)"); return
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-    try:
-        doc_file = await doc.get_file(); file_bytes = await doc_file.download_as_bytearray()
-        if not file_bytes: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Файл '{doc.file_name}' скачан, но пуст."); await update.message.reply_text(f"ℹ️ Файл '{doc.file_name}' пустой."); return
-    # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
-    except Exception as e:
-        # logger.error перенесен на новую строку
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось скачать документ '{doc.file_name}': {e}", exc_info=True)
-        try:
-            await update.message.reply_text("❌ Не удалось загрузить файл.")
-        except Exception as e_reply_dl_err:
-            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке скачивания документа: {e_reply_dl_err}")
-        return
-    # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+    # ... (начало функции: chat_id, user_id, message, doc, MIME проверка, размер, download) ...
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     text = None; detected_encoding = None; encodings_to_try = ['utf-8-sig', 'utf-8', 'cp1251', 'latin-1', 'cp866', 'iso-8859-5']
-    chardet_available = False; try: import chardet; chardet_available = True; except ImportError: logger.info("Библиотека chardet не найдена.")
+
+    # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА (строка ~1191) ---
+    # Попытка использовать chardet, если установлен
+    chardet_available = False # Инициализируем как False
+    try:
+        import chardet # Пытаемся импортировать
+        chardet_available = True # Если импорт успешен, устанавливаем True
+    except ImportError:
+        # Если импорт не удался, логгируем и оставляем chardet_available = False
+        logger.info("Библиотека chardet не найдена. Автоопределение кодировки будет ограничено.")
+    # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+
     if chardet_available:
         try:
             chardet_limit = min(len(file_bytes), 50 * 1024)
@@ -1199,11 +1185,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       if potential_encoding == 'utf-8' and file_bytes.startswith(b'\xef\xbb\xbf'): logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обнаружен UTF-8 BOM, используем 'utf-8-sig'."); detected_encoding = 'utf-8-sig'; encodings_to_try.insert(0, 'utf-8-sig'); encodings_to_try = [e for e in encodings_to_try if e != 'utf-8'] # Убираем utf-8 если есть sig
                       else: detected_encoding = potential_encoding; encodings_to_try.insert(0, detected_encoding)
                  else: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Chardet не уверен ({detected.get('confidence', 0):.2f}) для '{doc.file_name}'.")
-        # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
         except Exception as e_chardet:
-            # logger.warning перенесен на новую строку
             logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка при использовании chardet для '{doc.file_name}': {e_chardet}")
-        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
 
     unique_encodings = list(dict.fromkeys(encodings_to_try)); logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Попытки декодирования для '{doc.file_name}': {unique_encodings}")
     for encoding in unique_encodings:
