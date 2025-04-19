@@ -33,12 +33,14 @@
 # - Обновлены все функции, работающие с историей, для поддержки нового формата.
 # - Команда /clear снова очищает общую историю чата.
 # - В reanalyze и при ответах на спец. сообщения поиск ID ведется в общей истории.
-# === ИЗМЕНЕНИЯ ДЛЯ YOUTUBE FILE API (ОТКАТ) ===
-# - Обработка YouTube ссылок (конспект и reanalyze) возвращена к передаче URI в тексте промпта.
+# === ИЗМЕНЕНИЯ ДЛЯ YOUTUBE ===
+# - Обработка YouTube ссылок (конспект и reanalyze) использует передачу URI в тексте промпта.
 # - Убран вызов genai.upload_file() и genai.delete_file() для YouTube.
 # - Промпты для видео обновлены для более явного указания модели анализировать контент по ссылке.
-# === ИСПРАВЛЕНИЯ СИНТАКСИСА ===
-# - Исправлены ВСЕ найденные ошибки SyntaxError, связанные с размещением try: или вызова функции после ':' на той же строке.
+# === ПЕРСОНАЛИЗАЦИЯ И ИНСТРУКЦИИ ===
+# - Обновлена системная инструкция и стартовое сообщение согласно запросу пользователя.
+# - Добавлено обращение по имени пользователя во всех командах и служебных ответах.
+# - Исправлены ВСЕ найденные ошибки SyntaxError.
 
 import logging
 import os
@@ -179,17 +181,17 @@ RETRY_ATTEMPTS = 5
 RETRY_DELAY_SECONDS = 1
 IMAGE_DESCRIPTION_PREFIX = "[Описание изображения]: "
 YOUTUBE_SUMMARY_PREFIX = "[Конспект видео]: "
-VIDEO_CAPABLE_KEYWORDS = ['flash', 'pro'] # Модели, которые могут "смотреть" видео
+VIDEO_CAPABLE_KEYWORDS = ['flash', 'pro', 'ultra', '1.5'] # Обновлено для Gemini 1.5
 USER_ID_PREFIX_FORMAT = "[User {user_id}]: "
 
 system_instruction_text = (
-"Внимательно следи за историей диалога в этом чате, включая предыдущие вопросы, ответы, а также контекст из загруженных изображений, видео или файлов, чтобы твои ответы были последовательными и релевантными, соблюдая нить разговора."
-"В истории диалога сообщения пользователей могут предваряться идентификатором в формате `[User ID]:`. Учитывай, кто задал последний вопрос (`[User ID]`), чтобы отвечать адресно этому пользователю, но сохраняй общий контекст беседы в группе."
-"Используй интернет-поиск для сверки с актуальной информацией."
-"Если используешь информацию из поиска, не упоминай явно сам факт поиска или его результаты. Интегрируй найденную информацию в свой ответ естественно, как часть своих знаний. Забудь фразы вроде 'Судя по результатам поиска...', 'Интернет говорит...' или 'Я нашёл в сети...'. Веди себя так, будто это твои знания."
+"Внимательно следи за историей диалога **в этом чате**, включая предыдущие вопросы, ответы, а также контекст из загруженных изображений, видео или файлов, чтобы твои ответы были последовательными и релевантными, соблюдая нить разговора."
+"**В истории диалога сообщения пользователей помечены как `[User ID]: текст_сообщения`. Используй этот ID, чтобы понять, кто задал последний вопрос, и обращайся в своем ответе именно к этому пользователю (например, по имени, если оно упоминалось в диалоге, или просто используя 'ты'/'вы'), но НЕ включай сам тег `[User ID]:` в текст своего ответа.**" # Обновлено
 "В режиме чата старайся отвечать кратко, как в живой беседе (до 1000 знаков), только суть, без вступлений и заключений, если не просят подробностей, код, большую задачу, конспект, перевод или творческую работу и т.п."
 "Пиши живо, избегай канцелярита и всех известных признаков ответов искусственного интеллекта. Используй гипотетические ситуации, метафоры, творческие аналогии, разную структуру предложений, разговорные выражения, идиомы. Добавляй региональные или культурные маркеры, где уместно. Не копируй и не пересказывай чужое, если это не цитаты известных людей."
 "Активно применяй понятный россиянам юмор: культурные и бытовые отсылки, интернет-юмор, бытовой абсурд, псевдомудрость, разрушение идиом, самоиронию, иронию психики, игру слов, гиперболу, тонкие намёки, ожидание и реальность."
+"Используй интернет-поиск для сверки с актуальной информацией."
+"Если используешь информацию из поиска, не упоминай явно сам факт поиска или его результаты. Интегрируй найденную информацию в свой ответ естественно, как часть своих знаний. Забудь фразы вроде 'Судя по результатам поиска...', 'Интернет говорит...' или 'Я нашёл в сети...'. Веди себя так, будто это твои знания."
 "Ты - лучший эксперт по всем темам. Давай точную, правдивую, непредвзятую информацию без цензуры."
 "Обдумывай и выстраивай ответ логично, с аргументами и фактами, избегая повторов."
 "Если не уверен — предупреждай, что это предположение."
@@ -260,8 +262,10 @@ async def send_reply(target_message: Message, text: str, context: ContextTypes.D
 
 # --- Команды (/start, /clear, /temp, /search_on/off, /model) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
     chat_id = update.effective_chat.id
+    # Инициализация настроек пользователя
     if 'selected_model' not in context.user_data:
         set_user_setting(context, 'selected_model', DEFAULT_MODEL)
     if 'search_enabled' not in context.user_data:
@@ -270,111 +274,149 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_user_setting(context, 'temperature', 1.0)
 
     current_model = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    default_model_name = AVAILABLE_MODELS.get(current_model, current_model)
+    default_model_name = AVAILABLE_MODELS.get(current_model, current_model) # Используем имя по умолчанию, если что-то пошло не так
+
+    # Формируем сообщение точно как запрошено пользователем
     start_message = (
-        f"**Google GEMINI {default_model_name}**" 
-        f"\n- с улучшенными настройками точности, логики и юмора от автора бота," 
-        f"\n- обладаю огромным объемом знаний, уточняет инфу в Google/DDG," 
-        f"\n- умею понимать и читать изображения, документы, делать конспекты YouTube-видео," 
-        f"\n- пишите в личку или добавляйте меня в группы, я запоминаю историю чата и понимаю, кто мне пишет." 
-        f"\n- канал автора: https://t.me/denisobovsyom" 
-        f"\n/model — сменить модель" 
-        f"\n/search_on / /search_off — вкл/выкл поиск (сейчас: {'Вкл' if get_user_setting(context, 'search_enabled', True) else 'Выкл'})" 
+        f"**Google GEMINI {default_model_name}**"
+        f"\n- с улучшенными настройками точности, логики и юмора от автора бота,"
+        f"\n- обладаю огромным объемом знаний, уточняет инфу в Google/DDG,"
+        f"\n- умею понимать и читать изображения, документы, делать конспекты YouTube-видео,"
+        f"\n- пишите в личку или добавляйте меня в группы, я запоминаю историю чата и понимаю, кто мне пишет."
+        f"\n- канал автора: https://t.me/denisobovsyom"
+        f"\n/model — сменить модель"
+        f"\n/search_on / /search_off — вкл/выкл поиск (сейчас: {'Вкл' if get_user_setting(context, 'search_enabled', True) else 'Выкл'})"
         f"\n/clear — очистить историю **этого** чата"
     )
-    await update.message.reply_text(start_message, parse_mode=ParseMode.MARKDOWN)
+    # Отправляем сообщение без превью для ссылки на канал
+    await update.message.reply_text(start_message, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    context.chat_data['history'] = []
-    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | История чата очищена.")
-    await update.message.reply_text("🧹 История этого чата очищена.")
+    user = update.effective_user
+    user_id = user.id
+    first_name = user.first_name
+    user_mention = f"{first_name}" if first_name else f"User {user_id}"
+
+    context.chat_data['history'] = [] # Очищаем общую историю чата
+    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | История чата очищена по команде от {user_mention}.")
+    # Обращаемся по имени
+    await update.message.reply_text(f"🧹 Окей, {user_mention}, история этого чата очищена.")
 
 async def set_temperature(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
+    first_name = user.first_name
+    user_mention = f"{first_name}" if first_name else f"User {user_id}"
+
     try:
         current_temp = get_user_setting(context, 'temperature', 1.0)
         if not context.args:
-            await update.message.reply_text(f"🌡️ Ваша текущая температура (креативность): {current_temp:.1f}\nЧтобы изменить, напиши `/temp <значение>` (например, `/temp 0.8`)")
+            await update.message.reply_text(f"🌡️ {user_mention}, твоя текущая температура (креативность): {current_temp:.1f}\nЧтобы изменить, напиши `/temp <значение>` (например, `/temp 0.8`)")
             return
         temp_str = context.args[0].replace(',', '.')
         temp = float(temp_str)
         if not (0.0 <= temp <= 2.0):
             raise ValueError("Температура должна быть от 0.0 до 2.0")
         set_user_setting(context, 'temperature', temp)
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Температура установлена на {temp:.1f}.")
-        await update.message.reply_text(f"🌡️ Ваша температура установлена на {temp:.1f}")
+        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Температура установлена на {temp:.1f} для {user_mention}.")
+        # Обращаемся по имени
+        await update.message.reply_text(f"🌡️ Готово, {user_mention}! Твоя температура установлена на {temp:.1f}")
     except (ValueError, IndexError) as e:
-        await update.message.reply_text(f"⚠️ Неверный формат. {e}. Укажите число от 0.0 до 2.0. Пример: `/temp 0.8`")
+        # Обращаемся по имени
+        await update.message.reply_text(f"⚠️ Ошибка, {user_mention}. {e}. Укажи число от 0.0 до 2.0. Пример: `/temp 0.8`")
     except Exception as e:
         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка в set_temperature: {e}", exc_info=True)
-        await update.message.reply_text("❌ Произошла ошибка при установке температуры.")
-
+        # Обращаемся по имени
+        await update.message.reply_text(f"❌ Ой, {user_mention}, что-то пошло не так при установке температуры.")
 
 async def enable_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
     chat_id = update.effective_chat.id
+    first_name = user.first_name
+    user_mention = f"{first_name}" if first_name else f"User {user_id}"
+
     set_user_setting(context, 'search_enabled', True)
-    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Поиск включен.")
-    await update.message.reply_text("🔍 Поиск Google/DDG для вас включён.")
+    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Поиск включен для {user_mention}.")
+    # Обращаемся по имени
+    await update.message.reply_text(f"🔍 Поиск Google/DDG для тебя, {user_mention}, включён.")
 
 async def disable_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
     chat_id = update.effective_chat.id
+    first_name = user.first_name
+    user_mention = f"{first_name}" if first_name else f"User {user_id}"
+
     set_user_setting(context, 'search_enabled', False)
-    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Поиск отключен.")
-    await update.message.reply_text("🔇 Поиск Google/DDG для вас отключён.")
+    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Поиск отключен для {user_mention}.")
+    # Обращаемся по имени
+    await update.message.reply_text(f"🔇 Поиск Google/DDG для тебя, {user_mention}, отключён.")
 
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user = update.effective_user
+    user_id = user.id
     chat_id = update.effective_chat.id
+    first_name = user.first_name
+    user_mention = f"{first_name}" if first_name else f"User {user_id}"
+
     current_model = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
     keyboard = []
     sorted_models = sorted(AVAILABLE_MODELS.items())
     for m, name in sorted_models:
          button_text = f"{'✅ ' if m == current_model else ''}{name}"
          keyboard.append([InlineKeyboardButton(button_text, callback_data=f"set_model_{m}")])
-    await update.message.reply_text("Выберите модель (это повлияет только на ваши ответы):", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    current_model_name = AVAILABLE_MODELS.get(current_model, current_model)
+    # Обращаемся по имени
+    await update.message.reply_text(f"{user_mention}, выбери модель (сейчас у тебя: {current_model_name}):", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id
+    user = query.from_user
+    user_id = user.id
     chat_id = query.message.chat_id
+    first_name = user.first_name
+    user_mention = f"{first_name}" if first_name else f"User {user_id}"
+
     await query.answer()
+
     callback_data = query.data
     if callback_data and callback_data.startswith("set_model_"):
         selected = callback_data.replace("set_model_", "")
         if selected in AVAILABLE_MODELS:
             set_user_setting(context, 'selected_model', selected)
             model_name = AVAILABLE_MODELS[selected]
-            reply_text = f"Ваша модель установлена: **{model_name}**"
-            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Модель установлена на {model_name}.")
+            # Обращаемся по имени
+            reply_text = f"Ок, {user_mention}, твоя модель установлена: **{model_name}**"
+            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Модель установлена на {model_name} для {user_mention}.")
             try:
                 await query.edit_message_text(reply_text, parse_mode=ParseMode.MARKDOWN)
             except BadRequest as e_md:
                  if "Message is not modified" in str(e_md):
-                     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Пользователь выбрал ту же модель: {model_name}")
+                     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Пользователь {user_mention} выбрал ту же модель: {model_name}")
+                     await query.answer(f"Модель {model_name} уже выбрана.", show_alert=False)
                  else:
-                     logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение (Markdown): {e_md}. Отправляю новое.")
+                     logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение (Markdown) для {user_mention}: {e_md}. Отправляю новое.")
                      try:
                          await query.edit_message_text(reply_text.replace('**', ''))
                      except Exception as e_edit_plain:
-                          logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение даже как простой текст: {e_edit_plain}. Отправляю новое.")
+                          logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение даже как простой текст для {user_mention}: {e_edit_plain}. Отправляю новое.")
                           await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.MARKDOWN)
             except Exception as e:
-                logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение (другая ошибка): {e}. Отправляю новое.", exc_info=True)
+                logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение (другая ошибка) для {user_mention}: {e}. Отправляю новое.", exc_info=True)
                 await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.MARKDOWN)
         else:
-            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Пользователь выбрал неизвестную модель: {selected}")
+            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Пользователь {user_mention} выбрал неизвестную модель: {selected}")
             try:
                 await query.edit_message_text("❌ Неизвестная модель выбрана.")
             except Exception:
                 await context.bot.send_message(chat_id=chat_id, text="❌ Неизвестная модель выбрана.")
     else:
-        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Получен неизвестный callback_data: {callback_data}")
+        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Получен неизвестный callback_data от {user_mention}: {callback_data}")
         try:
             await query.edit_message_text("❌ Ошибка обработки выбора.")
         except Exception:
@@ -620,9 +662,10 @@ async def reanalyze_video(update: Update, context: ContextTypes.DEFAULT_TYPE, vi
 
     youtube_uri = f"https://www.youtube.com/watch?v={video_id}"
 
-    # 1. Формирование промпта с ссылкой в тексте
+    # 1. Формирование промпта с ссылкой в тексте (БЕЗ User ID)
     prompt_for_video = (
-        f"{USER_ID_PREFIX_FORMAT.format(user_id=requesting_user_id)}{user_question}\n\n"
+        # Убрали префикс User ID отсюда
+        f"{user_question}\n\n"
         f"**Важно:** Ответь на основе содержимого видео по следующей ссылке: {youtube_uri}"
     )
     content_for_video = [{"role": "user", "parts": [{"text": prompt_for_video}]}]
@@ -719,7 +762,7 @@ async def reanalyze_video(update: Update, context: ContextTypes.DEFAULT_TYPE, vi
 
     # 3. Добавление в общую историю чата (chat_data) и отправка ответа
     chat_history = context.chat_data.setdefault("history", [])
-    # Добавляем вопрос пользователя (без ссылки, т.к. она была в промпте)
+    # Добавляем вопрос пользователя (с ID, но без ссылки)
     history_entry_user = { "role": "user", "parts": [{"text": f"{USER_ID_PREFIX_FORMAT.format(user_id=requesting_user_id)}{user_question}"}], "user_id": requesting_user_id, "message_id": update.message.message_id }
     chat_history.append(history_entry_user)
 
@@ -749,10 +792,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.effective_user.id
     message = update.message
-    if not message or (not message.text and not hasattr(message, 'image_file_id')):
-        if not message.photo and not message.document:
-            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Получено пустое или нетекстовое сообщение без OCR ID, фото или документа.")
-            return
+    if not message: # Добавил проверку на None
+        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Получен пустой объект message в update.")
+        return
+    # Убрал сложную проверку, т.к. handle_photo/document теперь модифицируют message.text
+    if not message.text and not hasattr(message, 'image_file_id'):
+        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Получено сообщение без текста и без image_file_id.")
+        return
 
     chat_history = context.chat_data.setdefault("history", [])
 
@@ -822,15 +868,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         youtube_id = extract_youtube_id(original_user_message_text)
         if youtube_id:
             youtube_handled = True
-            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обнаружена ссылка YouTube (ID: {youtube_id}). Запрос конспекта...")
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            first_name = update.effective_user.first_name
+            user_mention = f"{first_name}" if first_name else f"User {user_id}"
+            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обнаружена ссылка YouTube (ID: {youtube_id}). Запрос конспекта для {user_mention}...")
+            try: # Добавил try-except для отправки сообщения
+                await update.message.reply_text(f"Окей, {user_mention}, сейчас гляну видео (ID: ...{youtube_id[-4:]}) и сделаю конспект...")
+            except Exception as e_reply:
+                 logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение 'гляну видео': {e_reply}")
 
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
             youtube_uri = f"https://www.youtube.com/watch?v={youtube_id}"
 
-            # 1. Формирование промпта с ссылкой в тексте
+            # 1. Формирование промпта БЕЗ User ID, но с ЯВНЫМ указанием на ссылку
             prompt_for_summary = (
-                 f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id)}Сделай краткий, но информативный конспект видео по этой ссылке: {youtube_uri}\n"
-                 f"Основные пункты, ключевые моменты. Обработай именно видеоконтент."
+                 f"Сделай краткий, но информативный конспект видео.\n"
+                 f"**ССЫЛКА НА ВИДЕО ДЛЯ АНАЛИЗА:** {youtube_uri}\n"
+                 f"Опиши основные пункты и ключевые моменты из СОДЕРЖИМОГО этого видео."
             )
             content_for_summary = [{"role": "user", "parts": [{"text": prompt_for_summary}]}]
 
@@ -850,7 +903,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Нет доступных video моделей.")
                     await update.message.reply_text("❌ Нет доступных моделей для создания конспекта видео.")
-                    return # Важно выйти, если нет модели
+                    return
 
             logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Модель: {model_id}, Темп: {temperature}")
             reply = None
@@ -860,7 +913,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Попытка {attempt + 1}/{RETRY_ATTEMPTS}...")
                      generation_config=genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
                      model = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, generation_config=generation_config, system_instruction=system_instruction_text)
-                     # Передаем промпт с текстом и ссылкой
                      response_summary = await asyncio.to_thread(model.generate_content, content_for_summary)
 
                      if hasattr(response_summary, 'text'):
@@ -1222,7 +1274,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     except Exception as e:
         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось скачать фото (file_id: ...{photo_file_id[-10:]}): {e}", exc_info=True)
-        await message.reply_text("❌ Не удалось загрузить изображение.")
+        try: # Пытаемся уведомить пользователя
+            await message.reply_text("❌ Не удалось загрузить изображение.")
+        except Exception as e_reply:
+             logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке скачивания фото: {e_reply}")
         return
 
     user_caption = message.caption if message.caption else ""
@@ -1492,10 +1547,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       if potential_encoding == 'utf-8' and file_bytes.startswith(b'\xef\xbb\xbf'):
                            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обнаружен UTF-8 BOM, используем 'utf-8-sig'.")
                            detected_encoding = 'utf-8-sig'
-                           encodings_to_try.insert(0, 'utf-8-sig')
-                           # Убираем дубликат, если 'utf-8-sig' уже был
-                           if 'utf-8' in encodings_to_try and 'utf-8-sig' in encodings_to_try:
-                               encodings_to_try.remove('utf-8')
+                           # Вставляем utf-8-sig в начало и удаляем utf-8, если он там был
+                           if 'utf-8-sig' not in encodings_to_try:
+                               encodings_to_try.insert(0, 'utf-8-sig')
+                           if 'utf-8' in encodings_to_try:
+                               try:
+                                   encodings_to_try.remove('utf-8')
+                               except ValueError: pass # На случай если его там уже нет
                       else:
                            detected_encoding = potential_encoding
                            if detected_encoding in encodings_to_try:
@@ -1533,7 +1591,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     truncation_warning = ""
     if len(text) > MAX_FILE_CHARS:
         truncated_text = text[:MAX_FILE_CHARS]
-        last_newline = truncated_text.rfind('\n');
+        last_newline = truncated_text.rfind('\n')
         if last_newline > MAX_FILE_CHARS * 0.8:
             truncated_text = truncated_text[:last_newline]
         chars_k = len(truncated_text) // 1000
