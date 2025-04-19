@@ -279,7 +279,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Формируем сообщение точно как запрошено пользователем
     start_message = (
         f"Работаю на новейшей модели искуственного интеллекта" 
-        f"**Google GEMINI {default_model_name}**"
+        f" Google GEMINI {default_model_name}"
         f"\n- с улучшенными настройками точности, логики и юмора от автора бота,"
         f"\n- обладаю огромным объемом знаний, уточняю инфу в Google/DDG,"
         f"\n- умею понимать и читать изображения, документы,"
