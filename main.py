@@ -282,6 +282,7 @@ async def reanalyze_image(update: Update, context: ContextTypes.DEFAULT_TYPE, fi
     except Exception as e_download: logger.error(f"ChatID: {chat_id} | Reanalyze: ошибка скачивания/кодирования {file_id}: {e_download}", exc_info=True); await update.message.reply_text("❌ Ошибка подготовки изображения."); return
     parts = [{"text": user_question}, {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}}]; content_for_vision = [{"role": "user", "parts": parts}]
     model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL); temperature = get_user_setting(context, 'temperature', 1.0)
+    # Проверка vision модели...
     is_vision_model = any(keyword in model_id for keyword in ['flash', 'pro', 'vision', 'ultra'])
     if not is_vision_model: # Поиск fallback модели...
          vision_models = [m_id for m_id in AVAILABLE_MODELS if any(keyword in m_id for keyword in ['flash', 'pro', 'vision', 'ultra'])]
@@ -293,14 +294,10 @@ async def reanalyze_image(update: Update, context: ContextTypes.DEFAULT_TYPE, fi
             logger.info(f"ChatID: {chat_id} | Reanalyze: Попытка {attempt + 1}/{RETRY_ATTEMPTS}...")
             generation_config=genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS); model = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, generation_config=generation_config, system_instruction=system_instruction_text)
             response_vision = await asyncio.to_thread(model.generate_content, content_for_vision)
-
-            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<< ИСПРАВЛЕНО: else на новой строке <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
             if hasattr(response_vision, 'text'):
                 reply = response_vision.text
             else:
                 reply = None
-            # ============================================================================================
-
             if not reply: # Обработка пустого ответа...
                  reply = "🤖 Не могу ответить на вопрос об изображении (пустой ответ)."
                  logger.warning(f"ChatID: {chat_id} | Reanalyze: пустой ответ ({attempt + 1})...")
@@ -313,17 +310,26 @@ async def reanalyze_image(update: Update, context: ContextTypes.DEFAULT_TYPE, fi
              if not is_retryable and ("400" in error_message or "429" in error_message): reply = f"❌ Ошибка Reanalyze ({error_message[:100]}...)."; break
              if is_retryable and attempt < RETRY_ATTEMPTS - 1:
                  wait_time = RETRY_DELAY_SECONDS * (2 ** attempt); logger.info(f"ChatID: {chat_id} | Reanalyze: Ожидание {wait_time:.1f} сек..."); await asyncio.sleep(wait_time); continue
-             # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<< ИСПРАВЛЕНО: if после ; <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
              else:
                  logger.error(f"ChatID: {chat_id} | Reanalyze: Не удалось после {attempt + 1} попыток. Ошибка: {e}", exc_info=True)
                  if reply is None:
                      reply = f"❌ Ошибка Reanalyze после {attempt + 1} попыток."
                  break
-             # ===================================================================================
     chat_history = context.chat_data.setdefault("history", []); history_entry_user = {"role": "user", "parts": [{"text": user_question}]}; chat_history.append(history_entry_user)
-    if reply: chat_history.append({"role": "model", "parts": [{"text": reply}]}); await send_reply(update.message, reply, context)
-    else: final_error_msg = "🤖 Не удалось повторно проанализировать изображение."; chat_history.append({"role": "model", "parts": [{"text": final_error_msg}]}); logger.error(f"ChatID: {chat_id} | Reanalyze: нет ответа."); try: await update.message.reply_text(final_error_msg) except Exception as e_final_fail: logger.error(f"ChatID: {chat_id} | Reanalyze: не удалось отправить ошибку: {e_final_fail}")
-# =======================================================
+
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<< ИСПРАВЛЕНИЕ: Разделение строк else <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+    if reply:
+        chat_history.append({"role": "model", "parts": [{"text": reply}]})
+        await send_reply(update.message, reply, context)
+    else:
+        final_error_msg = "🤖 Не удалось повторно проанализировать изображение."
+        chat_history.append({"role": "model", "parts": [{"text": final_error_msg}]})
+        logger.error(f"ChatID: {chat_id} | Reanalyze: нет ответа.")
+        try:
+            await update.message.reply_text(final_error_msg)
+        except Exception as e_final_fail:
+            logger.error(f"ChatID: {chat_id} | Reanalyze: не удалось отправить ошибку: {e_final_fail}")
+    # ===================================================================================
 
 # ===== НОВАЯ ФУНКЦИЯ: Суммаризация текста =====
 async def summarize_text_with_gemini(text_to_summarize: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
