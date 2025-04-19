@@ -888,21 +888,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось выполнить генерацию после {attempt + 1} попыток. Последняя ошибка: {e}", exc_info=True if not is_retryable else False); reply = f"❌ Ошибка при обращении к модели после {attempt + 1} попыток."; break
 
     # --- Добавление ответа и отправка (если не YouTube) ---
-    if reply and not youtube_handled: history_entry_model = {"role": "model", "parts": [{"text": reply}]}; chat_history.append(history_entry_model)
     if reply and not youtube_handled:
-        if message: await send_reply(message, reply, context)
-        else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не найдено сообщение для ответа в update (не YouTube)."); try: await context.bot.send_message(chat_id=chat_id, text=reply)
-        except Exception as e_send_direct: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить ответ напрямую в чат (не YouTube): {e_send_direct}")
-    elif not youtube_handled:
+        history_entry_model = {"role": "model", "parts": [{"text": reply}]}
+        chat_history.append(history_entry_model)
+
+    if reply and not youtube_handled:
+        if message:
+            await send_reply(message, reply, context)
+        else:
+            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не найдено сообщение для ответа в update (не YouTube).")
+            # Помещаем try на новую строку
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=reply)
+            # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+            except Exception as e_send_direct:
+                # logger.error перенесен на новую строку
+                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить ответ напрямую в чат (не YouTube): {e_send_direct}")
+            # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+
+    elif not youtube_handled: # Если reply пустой и не YouTube
          logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Нет ответа для отправки пользователю после всех попыток (не YouTube).")
          try:
-             if reply != "🤖 Модель дала пустой ответ.": error_message_to_user = "🤖 К сожалению, не удалось получить ответ от модели после нескольких попыток."
-             if message: await message.reply_text(error_message_to_user)
-             else: await context.bot.send_message(chat_id=chat_id, text=error_message_to_user)
-         except Exception as e_final_fail: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение о финальной ошибке (не YouTube): {e_final_fail}")
+             if reply != "🤖 Модель дала пустой ответ.":
+                  error_message_to_user = "🤖 К сожалению, не удалось получить ответ от модели после нескольких попыток."
+                  # Исправляем здесь тоже на всякий случай (хотя здесь не было try)
+                  if message:
+                      await message.reply_text(error_message_to_user)
+                  else:
+                      await context.bot.send_message(chat_id=chat_id, text=error_message_to_user)
+         # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+         except Exception as e_final_fail:
+             # logger.error перенесен на новую строку
+             logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение о финальной ошибке (не YouTube): {e_final_fail}")
+         # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
 
     # --- Ограничение истории ---
-    while len(chat_history) > MAX_HISTORY_MESSAGES: removed = chat_history.pop(0); logger.debug(f"ChatID: {chat_id} | Удалено старое сообщение из истории (лимит {MAX_HISTORY_MESSAGES}). Role: {removed.get('role')}")
+    while len(chat_history) > MAX_HISTORY_MESSAGES:
+        removed = chat_history.pop(0)
+        logger.debug(f"ChatID: {chat_id} | Удалено старое сообщение из истории (лимит {MAX_HISTORY_MESSAGES}). Role: {removed.get('role')}")
 # =============================================================
 
 # ===== Обработчик фото (обновлен для chat_data и User ID) =====
@@ -946,7 +969,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except RuntimeError as timeout_error:
             if "Tesseract process timeout" in str(timeout_error): logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | OCR таймаут: {timeout_error}"); await message.reply_text("⏳ Не удалось распознать текст (слишком долго). Анализирую как фото...")
             else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка выполнения OCR: {timeout_error}", exc_info=True); await message.reply_text("⚠️ Ошибка распознавания текста. Анализирую как фото...")
-        except Exception as e: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка OCR: {e}", exc_info=True); await message.reply_text("⚠️ Ошибка распознавания текста. Анализирую как фото...")
+        # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+        except Exception as e:
+             # logger.error перенесен на новую строку
+             logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка OCR: {e}", exc_info=True)
+             # Попытка отправить сообщение об ошибке OCR
+             try:
+                 await message.reply_text("⚠️ Ошибка распознавания текста. Анализирую как фото...")
+             except Exception as e_reply_ocr_err:
+                 logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке OCR: {e_reply_ocr_err}")
+        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+
 
     # --- Обработка как изображение (Vision) ---
     if not ocr_triggered:
@@ -954,7 +987,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         MAX_IMAGE_BYTES = 20 * 1024 * 1024
         if len(file_bytes) > MAX_IMAGE_BYTES: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Изображение ({len(file_bytes) / (1024*1024):.2f} MB) может быть большим для API.")
         try: b64_data = base64.b64encode(file_bytes).decode()
-        except Exception as e: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка Base64 кодирования: {e}", exc_info=True); await message.reply_text("❌ Ошибка обработки изображения."); return
+        # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+        except Exception as e:
+            # logger.error перенесен на новую строку
+            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка Base64 кодирования: {e}", exc_info=True)
+            try:
+                await message.reply_text("❌ Ошибка обработки изображения.")
+            except Exception as e_reply_b64_err:
+                 logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке Base64: {e_reply_b64_err}")
+            return
+        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+
         if user_caption: prompt_text_vision = f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id)}Пользователь прислал фото с подписью: \"{user_caption}\". Опиши, что видишь на изображении и как это соотносится с подписью (если применимо)."
         else: prompt_text_vision = f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id)}Пользователь прислал фото без подписи. Опиши, что видишь на изображении."
         mime_type = "image/jpeg";
@@ -1012,8 +1055,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         history_entry_model = {"role": "model", "parts": [{"text": model_reply_text_with_prefix}]}; chat_history.append(history_entry_model); logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлен model-ответ (Vision) в chat_history.")
         reply_to_send = reply if (reply and "❌" not in reply and "🤖" not in reply) else model_reply_text_with_prefix
         if reply_to_send: await send_reply(message, reply_to_send, context)
-        else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Нет ответа для отправки пользователю после всех попыток."); try: await message.reply_text("🤖 К сожалению, не удалось проанализировать изображение.")
-        except Exception as e_final_fail: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Не удалось отправить сообщение о финальной ошибке: {e_final_fail}")
+        else:
+            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Нет ответа для отправки пользователю после всех попыток.")
+            # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+            try:
+                await message.reply_text("🤖 К сожалению, не удалось проанализировать изображение.")
+            except Exception as e_final_fail:
+                 # logger.error перенесен на новую строку
+                 logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Не удалось отправить сообщение о финальной ошибке: {e_final_fail}")
+            # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+
         while len(chat_history) > MAX_HISTORY_MESSAGES: chat_history.pop(0)
 
 # ===== Обработчик документов (обновлен для chat_data через handle_message) =====
@@ -1034,7 +1085,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         doc_file = await doc.get_file(); file_bytes = await doc_file.download_as_bytearray()
         if not file_bytes: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Файл '{doc.file_name}' скачан, но пуст."); await update.message.reply_text(f"ℹ️ Файл '{doc.file_name}' пустой."); return
-    except Exception as e: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось скачать документ '{doc.file_name}': {e}", exc_info=True); await update.message.reply_text("❌ Не удалось загрузить файл."); return
+    # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+    except Exception as e:
+        # logger.error перенесен на новую строку
+        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось скачать документ '{doc.file_name}': {e}", exc_info=True)
+        try:
+            await update.message.reply_text("❌ Не удалось загрузить файл.")
+        except Exception as e_reply_dl_err:
+            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке скачивания документа: {e_reply_dl_err}")
+        return
+    # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     text = None; detected_encoding = None; encodings_to_try = ['utf-8-sig', 'utf-8', 'cp1251', 'latin-1', 'cp866', 'iso-8859-5']
     chardet_available = False; try: import chardet; chardet_available = True; except ImportError: logger.info("Библиотека chardet не найдена.")
@@ -1048,12 +1109,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       if potential_encoding == 'utf-8' and file_bytes.startswith(b'\xef\xbb\xbf'): logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обнаружен UTF-8 BOM, используем 'utf-8-sig'."); detected_encoding = 'utf-8-sig'; encodings_to_try.insert(0, 'utf-8-sig'); encodings_to_try = [e for e in encodings_to_try if e != 'utf-8'] # Убираем utf-8 если есть sig
                       else: detected_encoding = potential_encoding; encodings_to_try.insert(0, detected_encoding)
                  else: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Chardet не уверен ({detected.get('confidence', 0):.2f}) для '{doc.file_name}'.")
-        except Exception as e_chardet: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка при использовании chardet для '{doc.file_name}': {e_chardet}")
+        # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+        except Exception as e_chardet:
+            # logger.warning перенесен на новую строку
+            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка при использовании chardet для '{doc.file_name}': {e_chardet}")
+        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+
     unique_encodings = list(dict.fromkeys(encodings_to_try)); logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Попытки декодирования для '{doc.file_name}': {unique_encodings}")
     for encoding in unique_encodings:
         try: text = file_bytes.decode(encoding); detected_encoding = encoding; logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Файл '{doc.file_name}' успешно декодирован как {encoding}."); break
         except (UnicodeDecodeError, LookupError): logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Файл '{doc.file_name}' не в кодировке {encoding}.")
-        except Exception as e_decode: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка при декодировании '{doc.file_name}' как {encoding}: {e_decode}", exc_info=True)
+        # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+        except Exception as e_decode:
+             # logger.error перенесен на новую строку
+             logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка при декодировании '{doc.file_name}' как {encoding}: {e_decode}", exc_info=True)
+        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+
     if text is None: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось декодировать '{doc.file_name}' ни одной из кодировок: {unique_encodings}"); await update.message.reply_text(f"❌ Не удалось прочитать файл `{doc.file_name}`. Попробуйте UTF-8.", parse_mode=ParseMode.MARKDOWN); return
     if not text.strip() and len(file_bytes) > 0: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Файл '{doc.file_name}' дал пустой текст после декодирования ({detected_encoding})."); await update.message.reply_text(f"⚠️ Не удалось извлечь текст из файла `{doc.file_name}`.", parse_mode=ParseMode.MARKDOWN); return
     approx_max_tokens_for_file = MAX_OUTPUT_TOKENS * 2; MAX_FILE_CHARS = min(MAX_CONTEXT_CHARS // 2, approx_max_tokens_for_file * 4)
@@ -1090,14 +1161,27 @@ async def run_web_server(application: Application, stop_event: asyncio.Event):
         try: bot_info = await application.bot.get_me();
         if bot_info: logger.debug("Health check successful."); return aiohttp.web.Response(text=f"OK: Bot {bot_info.username} is running.")
         else: logger.warning("Health check: Bot info unavailable."); return aiohttp.web.Response(text="Error: Bot info unavailable", status=503)
-        except TelegramError as e_tg: logger.error(f"Health check failed (TelegramError): {e_tg}", exc_info=True); return aiohttp.web.Response(text=f"Error: Telegram API error ({type(e_tg).__name__})", status=503)
-        except Exception as e: logger.error(f"Health check failed (Exception): {e}", exc_info=True); return aiohttp.web.Response(text=f"Error: Health check failed ({type(e).__name__})", status=503)
+        # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+        except TelegramError as e_tg:
+            # logger.error перенесен на новую строку
+            logger.error(f"Health check failed (TelegramError): {e_tg}", exc_info=True)
+            return aiohttp.web.Response(text=f"Error: Telegram API error ({type(e_tg).__name__})", status=503)
+        except Exception as e:
+            # logger.error перенесен на новую строку
+            logger.error(f"Health check failed (Exception): {e}", exc_info=True)
+            return aiohttp.web.Response(text=f"Error: Health check failed ({type(e).__name__})", status=503)
+        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+
     app.router.add_get('/', health_check); app['bot_app'] = application; webhook_path = GEMINI_WEBHOOK_PATH.strip('/');
     if not webhook_path.startswith('/'): webhook_path = '/' + webhook_path
     app.router.add_post(webhook_path, handle_telegram_webhook); logger.info(f"Вебхук будет слушаться на пути: {webhook_path}"); runner = aiohttp.web.AppRunner(app); await runner.setup(); port = int(os.getenv("PORT", "10000")); host = os.getenv("HOST", "0.0.0.0"); site = aiohttp.web.TCPSite(runner, host, port)
     try: await site.start(); logger.info(f"Веб-сервер запущен на http://{host}:{port}"); await stop_event.wait()
     except asyncio.CancelledError: logger.info("Задача веб-сервера отменена.")
-    except Exception as e: logger.error(f"Ошибка при запуске или работе веб-сервера на {host}:{port}: {e}", exc_info=True)
+    # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+    except Exception as e:
+        # logger.error перенесен на новую строку
+        logger.error(f"Ошибка при запуске или работе веб-сервера на {host}:{port}: {e}", exc_info=True)
+    # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
     finally: logger.info("Начало остановки веб-сервера..."); await runner.cleanup(); logger.info("Веб-сервер успешно остановлен.")
 
 async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
@@ -1109,9 +1193,21 @@ async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.R
          header_token = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
          if header_token != secret_token: logger.warning(f"Неверный секретный токен в заголовке от {request.remote}. Ожидался: ...{secret_token[-4:]}, Получен: {header_token}"); return aiohttp.web.Response(status=403, text="Forbidden: Invalid secret token.")
     try: data = await request.json(); update = Update.de_json(data, application.bot); logger.debug(f"Получен Update ID: {update.update_id} от Telegram."); await application.process_update(update); return aiohttp.web.Response(text="OK", status=200)
-    except json.JSONDecodeError as e_json: body = await request.text(); logger.error(f"Ошибка декодирования JSON от Telegram: {e_json}. Тело запроса: {body[:500]}..."); return aiohttp.web.Response(text="Bad Request: JSON decode error", status=400)
-    except TelegramError as e_tg: logger.error(f"Ошибка Telegram при обработке вебхука: {e_tg}", exc_info=True); return aiohttp.web.Response(text=f"Internal Server Error: Telegram API Error ({type(e_tg).__name__})", status=500)
-    except Exception as e: logger.error(f"Критическая ошибка обработки вебхука: {e}", exc_info=True); return aiohttp.web.Response(text="Internal Server Error", status=500)
+    # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+    except json.JSONDecodeError as e_json:
+         body = await request.text()
+         # logger.error перенесен на новую строку
+         logger.error(f"Ошибка декодирования JSON от Telegram: {e_json}. Тело запроса: {body[:500]}...")
+         return aiohttp.web.Response(text="Bad Request: JSON decode error", status=400)
+    except TelegramError as e_tg:
+        # logger.error перенесен на новую строку
+        logger.error(f"Ошибка Telegram при обработке вебхука: {e_tg}", exc_info=True)
+        return aiohttp.web.Response(text=f"Internal Server Error: Telegram API Error ({type(e_tg).__name__})", status=500)
+    except Exception as e:
+        # logger.error перенесен на новую строку
+        logger.error(f"Критическая ошибка обработки вебхука: {e}", exc_info=True)
+        return aiohttp.web.Response(text="Internal Server Error", status=500)
+    # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
 
 async def main():
     log_level_str = os.getenv("LOG_LEVEL", "INFO").upper(); log_level = getattr(logging, log_level_str, logging.INFO)
@@ -1124,23 +1220,58 @@ async def main():
         else: logger.warning("Повторный сигнал остановки получен, процесс уже завершается.")
     for sig in (signal.SIGINT, signal.SIGTERM):
         try: loop.add_signal_handler(sig, signal_handler)
-        except NotImplementedError: logger.warning(f"Не удалось установить обработчик сигнала {sig} через loop. Использую signal.signal()."); try: signal.signal(sig, lambda s, f: signal_handler())
-        except Exception as e_signal: logger.error(f"Не удалось установить обработчик сигнала {sig} через signal.signal(): {e_signal}")
+        except NotImplementedError:
+             logger.warning(f"Не удалось установить обработчик сигнала {sig} через loop. Использую signal.signal().")
+             # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+             try:
+                 signal.signal(sig, lambda s, f: signal_handler())
+             except Exception as e_signal:
+                 # logger.error перенесен на новую строку
+                 logger.error(f"Не удалось установить обработчик сигнала {sig} через signal.signal(): {e_signal}")
+             # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+
     application = None; web_server_task = None; aiohttp_session_main = None
     try:
         logger.info(f"--- Запуск приложения Gemini Telegram Bot ---"); application, web_server_coro = await setup_bot_and_server(stop_event); web_server_task = asyncio.create_task(web_server_coro, name="WebServerTask"); aiohttp_session_main = application.bot_data.get('aiohttp_session'); logger.info("Приложение настроено, веб-сервер запущен. Ожидание сигнала остановки (Ctrl+C)..."); await stop_event.wait()
     except asyncio.CancelledError: logger.info("Главная задача main() была отменена.")
-    except Exception as e: logger.critical("Критическая ошибка во время запуска или ожидания.", exc_info=True)
+    # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+    except Exception as e:
+        # logger.critical перенесен на новую строку
+        logger.critical("Критическая ошибка во время запуска или ожидания.", exc_info=True)
+    # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
     finally:
         logger.info("--- Начало процесса штатной остановки приложения ---");
         if not stop_event.is_set(): stop_event.set()
         if web_server_task and not web_server_task.done():
              logger.info("Остановка веб-сервера (через stop_event)...")
              try: await asyncio.wait_for(web_server_task, timeout=15.0); logger.info("Веб-сервер успешно завершен.")
-             except asyncio.TimeoutError: logger.warning("Веб-сервер не завершился за 15 секунд, принудительная отмена..."); web_server_task.cancel(); try: await web_server_task; except asyncio.CancelledError: logger.info("Задача веб-сервера успешно отменена."); except Exception as e_cancel_ws: logger.error(f"Ошибка при ожидании отмененной задачи веб-сервера: {e_cancel_ws}", exc_info=True)
+             except asyncio.TimeoutError:
+                 logger.warning("Веб-сервер не завершился за 15 секунд, принудительная отмена..."); web_server_task.cancel()
+                 # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+                 try:
+                     await web_server_task
+                 except asyncio.CancelledError:
+                     logger.info("Задача веб-сервера успешно отменена.")
+                 except Exception as e_cancel_ws:
+                     # logger.error перенесен на новую строку
+                     logger.error(f"Ошибка при ожидании отмененной задачи веб-сервера: {e_cancel_ws}", exc_info=True)
+                 # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
              except asyncio.CancelledError: logger.info("Ожидание веб-сервера было отменено.")
-             except Exception as e_wait_ws: logger.error(f"Ошибка при ожидании завершения веб-сервера: {e_wait_ws}", exc_info=True)
-        if application: logger.info("Остановка приложения Telegram бота (application.shutdown)..."); try: await application.shutdown(); logger.info("Приложение Telegram бота успешно остановлено."); except Exception as e_shutdown: logger.error(f"Ошибка во время application.shutdown(): {e_shutdown}", exc_info=True)
+             # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+             except Exception as e_wait_ws:
+                 # logger.error перенесен на новую строку
+                 logger.error(f"Ошибка при ожидании завершения веб-сервера: {e_wait_ws}", exc_info=True)
+             # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+        if application:
+            logger.info("Остановка приложения Telegram бота (application.shutdown)...")
+            # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+            try:
+                await application.shutdown()
+                logger.info("Приложение Telegram бота успешно остановлено.")
+            except Exception as e_shutdown:
+                # logger.error перенесен на новую строку
+                logger.error(f"Ошибка во время application.shutdown(): {e_shutdown}", exc_info=True)
+            # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
         if aiohttp_session_main and not aiohttp_session_main.closed: logger.info("Закрытие основной сессии aiohttp..."); await aiohttp_session_main.close(); await asyncio.sleep(0.5); logger.info("Основная сессия aiohttp закрыта.")
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         if tasks:
@@ -1156,6 +1287,10 @@ async def main():
 if __name__ == '__main__':
     try: asyncio.run(main())
     except KeyboardInterrupt: logger.info("Приложение прервано пользователем (KeyboardInterrupt в main).")
-    except Exception as e_top: logger.critical("Неперехваченная ошибка на верхнем уровне asyncio.run(main).", exc_info=True)
+    # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+    except Exception as e_top:
+        # logger.critical перенесен на новую строку
+        logger.critical("Неперехваченная ошибка на верхнем уровне asyncio.run(main).", exc_info=True)
+    # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
 
 # --- END OF FILE main.py ---
