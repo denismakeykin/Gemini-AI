@@ -572,8 +572,14 @@ async def reanalyze_video(update: Update, context: ContextTypes.DEFAULT_TYPE, vi
                 new_model_name = AVAILABLE_MODELS.get(model_id, model_id); logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Модель {original_model_name} не video. Временно использую {new_model_name}.")
             else:
                 logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Нет доступных video моделей."); await update.message.reply_text("❌ Нет доступных моделей для ответа на вопрос по видео.")
-                if video_file: try: logger.debug(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Удаление файла {video_file.name}..."); await asyncio.to_thread(genai.delete_file, name=video_file.name)
-                except Exception as e_del_vf: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Ошибка при удалении файла {video_file.name}: {e_del_vf}", exc_info=True)
+                # --- ИСПРАВЛЕНИЕ СИНТАКСИСА ---
+                if video_file:
+                    try:
+                        logger.debug(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Удаление файла {video_file.name} из-за отсутствия видео модели.")
+                        await asyncio.to_thread(genai.delete_file, name=video_file.name)
+                    except Exception as e_del_vf:
+                        logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Ошибка при удалении файла {video_file.name} после ошибки модели: {e_del_vf}", exc_info=True)
+                # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
                 return
 
         logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Модель: {model_id}, Темп: {temperature}")
@@ -604,14 +610,10 @@ async def reanalyze_video(update: Update, context: ContextTypes.DEFAULT_TYPE, vi
                     break
                 if reply and "не смогла ответить" not in reply and "Не могу ответить" not in reply: logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Успешный анализ на попытке {attempt + 1}."); break
             except (BlockedPromptException, StopCandidateException) as e_block_stop:
-                 # --- ИСПРАВЛЕНИЕ СИНТАКСИСА ---
                  reason_str = "неизвестна"
                  try:
-                     if hasattr(e_block_stop, 'args') and e_block_stop.args:
-                         reason_str = str(e_block_stop.args[0])
-                 except Exception:
-                     pass
-                 # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+                     if hasattr(e_block_stop, 'args') and e_block_stop.args: reason_str = str(e_block_stop.args[0])
+                 except Exception: pass
                  logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Анализ заблокирован/остановлен (попытка {attempt + 1}): {e_block_stop} (Причина: {reason_str})")
                  reply = f"❌ Не удалось ответить по видео (ограничение модели)."
                  break
@@ -646,7 +648,7 @@ async def reanalyze_video(update: Update, context: ContextTypes.DEFAULT_TYPE, vi
         if video_file and video_file.name:
             try: logger.debug(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Удаление файла {video_file.name}..."); await asyncio.to_thread(genai.delete_file, name=video_file.name); logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Файл {video_file.name} успешно удален.")
             except Exception as e_delete: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Не удалось удалить файл {video_file.name}: {e_delete}", exc_info=True)
-# =============================================================
+# =======================================================
 
 # ===== Основной обработчик сообщений (использует chat_data, добавляет User ID) =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
