@@ -495,7 +495,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"ChatID: {chat_id} | Попытка {attempt + 1}/{RETRY_ATTEMPTS} запроса к {model_id}...")
             generation_config=genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS); model = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, generation_config=generation_config, system_instruction=system_instruction_text)
             response = await asyncio.to_thread(model.generate_content, history_for_model)
-            if hasattr(response, 'text'): reply = response.text; else: reply = None
+            if hasattr(response, 'text'):
+                reply = response.text
+            else:
+                reply = None
             if not reply: reply = "🤖 Модель дала пустой ответ."; generation_successful = True; logger.warning(f"ChatID: {chat_id} | Пустой ответ ({attempt+1}).")
             if reply and reply != "🤖 Модель дала пустой ответ.": generation_successful = True
             if generation_successful: logger.info(f"ChatID: {chat_id} | Успех ({attempt + 1})."); break
