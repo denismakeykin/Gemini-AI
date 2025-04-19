@@ -864,8 +864,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if reply: generation_successful = True
             if generation_successful: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Успешная генерация на попытке {attempt + 1}."); break
         except (BlockedPromptException, StopCandidateException) as e_block_stop:
-            reason_str = "неизвестна"; try: reason_str = str(e_block_stop.args[0]) if hasattr(e_block_stop, 'args') and e_block_stop.args else "N/A"; except Exception: pass
-            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Запрос заблокирован/остановлен моделью (попытка {attempt + 1}): {e_block_stop} (Причина: {reason_str})"); reply = f"❌ Запрос заблокирован/остановлен моделью."; break
+            # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА (строка ~867) ---
+            reason_str = "неизвестна" # Инициализация
+            # Помещаем try на новую строку
+            try:
+                if hasattr(e_block_stop, 'args') and e_block_stop.args:
+                    reason_str = str(e_block_stop.args[0]) # Пытаемся получить причину
+            except Exception:
+                # Игнорируем ошибки при извлечении причины
+                pass
+            # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Запрос заблокирован/остановлен моделью (попытка {attempt + 1}): {e_block_stop} (Причина: {reason_str})")
+            reply = f"❌ Запрос заблокирован/остановлен моделью."
+            break # Выходим из цикла ретраев
         except Exception as e:
             last_exception = e; error_message = str(e); logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка генерации на попытке {attempt + 1}: {error_message[:200]}...")
             is_retryable = "500" in error_message or "503" in error_message
