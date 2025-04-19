@@ -931,23 +931,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== Обработчик фото (обновлен для chat_data и User ID) =====
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if not update.effective_user: logger.warning(f"ChatID: {chat_id} | handle_photo: Не удалось определить пользователя."); return
+    if not update.effective_user:
+        logger.warning(f"ChatID: {chat_id} | handle_photo: Не удалось определить пользователя.")
+        return
     user_id = update.effective_user.id
     message = update.message
-    if not message or not message.photo: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | В handle_photo не найдено фото."); return
+    if not message or not message.photo:
+        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | В handle_photo не найдено фото.")
+        return
 
-    photo_file_id = message.photo[-1].file_id; user_message_id = message.message_id
+    photo_file_id = message.photo[-1].file_id
+    user_message_id = message.message_id
     logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Получен photo file_id: ...{photo_file_id[-10:]}, message_id: {user_message_id}")
 
     tesseract_available = False
-    try: pytesseract.pytesseract.get_tesseract_version(); tesseract_available = True
-    except Exception: logger.info("Tesseract не найден или не настроен. OCR отключен.")
+    try:
+        pytesseract.pytesseract.get_tesseract_version()
+        tesseract_available = True
+    except Exception:
+        logger.info("Tesseract не найден или не настроен. OCR отключен.")
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
     try:
-        photo_file = await message.photo[-1].get_file(); file_bytes = await photo_file.download_as_bytearray()
-        if not file_bytes: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Скачанное фото (file_id: ...{photo_file_id[-10:]}) оказалось пустым."); await message.reply_text("❌ Не удалось загрузить изображение (файл пуст)."); return
-    except Exception as e: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось скачать фото (file_id: ...{photo_file_id[-10:]}): {e}", exc_info=True); await message.reply_text("❌ Не удалось загрузить изображение."); return
+        photo_file = await message.photo[-1].get_file()
+        file_bytes = await photo_file.download_as_bytearray()
+        if not file_bytes:
+            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Скачанное фото (file_id: ...{photo_file_id[-10:]}) оказалось пустым.")
+            await message.reply_text("❌ Не удалось загрузить изображение (файл пуст).")
+            return
+    except Exception as e:
+        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось скачать фото (file_id: ...{photo_file_id[-10:]}): {e}", exc_info=True)
+        await message.reply_text("❌ Не удалось загрузить изображение.")
+        return
 
     user_caption = message.caption if message.caption else ""
 
@@ -955,117 +970,192 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ocr_triggered = False
     if tesseract_available:
         try:
-            image = Image.open(io.BytesIO(file_bytes)); extracted_text = await asyncio.to_thread(pytesseract.image_to_string, image, lang='rus+eng', timeout=15)
+            image = Image.open(io.BytesIO(file_bytes))
+            extracted_text = await asyncio.to_thread(pytesseract.image_to_string, image, lang='rus+eng', timeout=15)
             if extracted_text and extracted_text.strip():
-                ocr_triggered = True; logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обнаружен текст на изображении (OCR).")
+                ocr_triggered = True
+                logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обнаружен текст на изображении (OCR).")
                 ocr_context = f"На изображении обнаружен следующий текст:\n```\n{extracted_text.strip()}\n```"
-                if user_caption: user_prompt_ocr = f"{user_caption}. {ocr_context}\nЧто можешь сказать об этом фото и тексте на нём?"
-                else: user_prompt_ocr = f"{ocr_context}\nЧто можешь сказать об этом фото и тексте на нём?"
-                message.image_file_id = photo_file_id; message.text = user_prompt_ocr
+                if user_caption:
+                    user_prompt_ocr = f"{user_caption}. {ocr_context}\nЧто можешь сказать об этом фото и тексте на нём?"
+                else:
+                    user_prompt_ocr = f"{ocr_context}\nЧто можешь сказать об этом фото и тексте на нём?"
+                message.image_file_id = photo_file_id
+                message.text = user_prompt_ocr
                 logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Передача управления в handle_message с OCR текстом и image_file_id.")
-                await handle_message(update, context); return
-            else: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | OCR не нашел текст на изображении.")
-        except pytesseract.TesseractNotFoundError: logger.error("Tesseract не найден! OCR отключен."); tesseract_available = False
+                await handle_message(update, context)
+                return
+            else:
+                logger.info(f"UserID: {user_id}, ChatID: {chat_id} | OCR не нашел текст на изображении.")
+        except pytesseract.TesseractNotFoundError:
+            logger.error("Tesseract не найден! OCR отключен.")
+            tesseract_available = False
         except RuntimeError as timeout_error:
-            if "Tesseract process timeout" in str(timeout_error): logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | OCR таймаут: {timeout_error}"); await message.reply_text("⏳ Не удалось распознать текст (слишком долго). Анализирую как фото...")
-            else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка выполнения OCR: {timeout_error}", exc_info=True); await message.reply_text("⚠️ Ошибка распознавания текста. Анализирую как фото...")
-        # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+            if "Tesseract process timeout" in str(timeout_error):
+                logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | OCR таймаут: {timeout_error}")
+                await message.reply_text("⏳ Не удалось распознать текст (слишком долго). Анализирую как фото...")
+            else:
+                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка выполнения OCR: {timeout_error}", exc_info=True)
+                await message.reply_text("⚠️ Ошибка распознавания текста. Анализирую как фото...")
         except Exception as e:
-             # logger.error перенесен на новую строку
-             logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка OCR: {e}", exc_info=True)
-             # Попытка отправить сообщение об ошибке OCR
-             try:
-                 await message.reply_text("⚠️ Ошибка распознавания текста. Анализирую как фото...")
-             except Exception as e_reply_ocr_err:
+            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка OCR: {e}", exc_info=True)
+            try:
+                await message.reply_text("⚠️ Ошибка распознавания текста. Анализирую как фото...")
+            except Exception as e_reply_ocr_err:
                  logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке OCR: {e_reply_ocr_err}")
-        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
 
 
     # --- Обработка как изображение (Vision) ---
     if not ocr_triggered:
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обработка фото как изображения (Vision)."); await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обработка фото как изображения (Vision).")
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
         MAX_IMAGE_BYTES = 20 * 1024 * 1024
-        if len(file_bytes) > MAX_IMAGE_BYTES: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Изображение ({len(file_bytes) / (1024*1024):.2f} MB) может быть большим для API.")
-        try: b64_data = base64.b64encode(file_bytes).decode()
-        # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
+        if len(file_bytes) > MAX_IMAGE_BYTES:
+            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Изображение ({len(file_bytes) / (1024*1024):.2f} MB) может быть большим для API.")
+
+        try:
+            b64_data = base64.b64encode(file_bytes).decode()
         except Exception as e:
-            # logger.error перенесен на новую строку
             logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка Base64 кодирования: {e}", exc_info=True)
             try:
                 await message.reply_text("❌ Ошибка обработки изображения.")
             except Exception as e_reply_b64_err:
                  logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке Base64: {e_reply_b64_err}")
             return
-        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
 
-        if user_caption: prompt_text_vision = f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id)}Пользователь прислал фото с подписью: \"{user_caption}\". Опиши, что видишь на изображении и как это соотносится с подписью (если применимо)."
-        else: prompt_text_vision = f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id)}Пользователь прислал фото без подписи. Опиши, что видишь на изображении."
-        mime_type = "image/jpeg";
+        if user_caption:
+            prompt_text_vision = f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id)}Пользователь прислал фото с подписью: \"{user_caption}\". Опиши, что видишь на изображении и как это соотносится с подписью (если применимо)."
+        else:
+            prompt_text_vision = f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id)}Пользователь прислал фото без подписи. Опиши, что видишь на изображении."
+
+        mime_type = "image/jpeg"
         if file_bytes.startswith(b'\x89PNG\r\n\x1a\n'): mime_type = "image/png"
         elif file_bytes.startswith(b'\xff\xd8\xff'): mime_type = "image/jpeg"
-        parts = [{"text": prompt_text_vision}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}]; content_for_vision = [{"role": "user", "parts": parts}]
-        model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL); temperature = get_user_setting(context, 'temperature', 1.0)
-        vision_capable_keywords = ['flash', 'pro', 'vision', 'ultra']; is_vision_model = any(keyword in model_id for keyword in vision_capable_keywords)
+
+        parts = [{"text": prompt_text_vision}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}]
+        content_for_vision = [{"role": "user", "parts": parts}]
+
+        model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
+        temperature = get_user_setting(context, 'temperature', 1.0)
+        vision_capable_keywords = ['flash', 'pro', 'vision', 'ultra']
+        is_vision_model = any(keyword in model_id for keyword in vision_capable_keywords)
+
         if not is_vision_model:
             vision_models = [m_id for m_id in AVAILABLE_MODELS if any(keyword in m_id for keyword in vision_capable_keywords)]
             if vision_models:
-                original_model_name = AVAILABLE_MODELS.get(model_id, model_id); fallback_model_id = next((m for m in vision_models if 'flash' in m or 'pro' in m), vision_models[0]); model_id = fallback_model_id
-                new_model_name = AVAILABLE_MODELS.get(model_id, model_id); logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Модель {original_model_name} не vision. Временно использую {new_model_name}.")
-            else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Нет доступных vision моделей."); await message.reply_text("❌ Нет доступных моделей для анализа изображений."); return
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Анализ изображения (Vision). Модель: {model_id}, Темп: {temperature}, MIME: {mime_type}"); reply = None; response_vision = None
-        # --- Вызов Vision ---
+                original_model_name = AVAILABLE_MODELS.get(model_id, model_id)
+                fallback_model_id = next((m for m in vision_models if 'flash' in m or 'pro' in m), vision_models[0])
+                model_id = fallback_model_id
+                new_model_name = AVAILABLE_MODELS.get(model_id, model_id)
+                logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Модель {original_model_name} не vision. Временно использую {new_model_name}.")
+            else:
+                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Нет доступных vision моделей.")
+                await message.reply_text("❌ Нет доступных моделей для анализа изображений.")
+                return
+
+        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Анализ изображения (Vision). Модель: {model_id}, Темп: {temperature}, MIME: {mime_type}")
+        reply = None
+        response_vision = None
+
+        # --- Вызов Vision модели с РЕТРАЯМИ ---
         for attempt in range(RETRY_ATTEMPTS):
             try:
                 logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Попытка {attempt + 1}/{RETRY_ATTEMPTS}...")
                 generation_config=genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
                 model = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, generation_config=generation_config, system_instruction=system_instruction_text)
                 response_vision = await asyncio.to_thread(model.generate_content, content_for_vision)
-                if hasattr(response_vision, 'text'): reply = response_vision.text
-                else: reply = None
-                if not reply:
+
+                if hasattr(response_vision, 'text'):
+                    reply = response_vision.text
+                else:
+                    reply = None
+
+                if not reply: # Обработка пустого ответа
                     block_reason_str, finish_reason_str = 'N/A', 'N/A'
                     try:
-                        if hasattr(response_vision, 'prompt_feedback') and response_vision.prompt_feedback and hasattr(response_vision.prompt_feedback, 'block_reason'): block_reason_enum = response_vision.prompt_feedback.block_reason; block_reason_str = block_reason_enum.name if hasattr(block_reason_enum, 'name') else str(block_reason_enum)
+                        if hasattr(response_vision, 'prompt_feedback') and response_vision.prompt_feedback and hasattr(response_vision.prompt_feedback, 'block_reason'):
+                            block_reason_enum = response_vision.prompt_feedback.block_reason
+                            block_reason_str = block_reason_enum.name if hasattr(block_reason_enum, 'name') else str(block_reason_enum)
                         if hasattr(response_vision, 'candidates') and response_vision.candidates and isinstance(response_vision.candidates, (list, tuple)) and len(response_vision.candidates) > 0:
                             first_candidate = response_vision.candidates[0]
-                            if hasattr(first_candidate, 'finish_reason'): finish_reason_enum = first_candidate.finish_reason; finish_reason_str = finish_reason_enum.name if hasattr(finish_reason_enum, 'name') else str(finish_reason_enum)
-                    except Exception as e_inner_reason: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Ошибка извлечения причины пустого ответа: {e_inner_reason}")
+                            if hasattr(first_candidate, 'finish_reason'):
+                                finish_reason_enum = first_candidate.finish_reason
+                                finish_reason_str = finish_reason_enum.name if hasattr(finish_reason_enum, 'name') else str(finish_reason_enum)
+                    except Exception as e_inner_reason:
+                        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Ошибка извлечения причины пустого ответа: {e_inner_reason}")
+
                     logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Пустой ответ (попытка {attempt + 1}). Block: {block_reason_str}, Finish: {finish_reason_str}")
-                    if block_reason_str not in ['UNSPECIFIED', 'N/A', 'BLOCK_REASON_UNSPECIFIED']: reply = f"🤖 Модель не смогла описать изображение. (Блокировка: {block_reason_str})"
-                    elif finish_reason_str not in ['STOP', 'N/A', 'FINISH_REASON_STOP']: reply = f"🤖 Модель не смогла описать изображение. (Причина: {finish_reason_str})"
-                    else: reply = "🤖 Не удалось понять, что на изображении (пустой ответ)."
-                    break
-                if reply and "Не удалось понять" not in reply and "не смогла описать" not in reply: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Успешный анализ на попытке {attempt + 1}."); break
+                    if block_reason_str not in ['UNSPECIFIED', 'N/A', 'BLOCK_REASON_UNSPECIFIED']:
+                        reply = f"🤖 Модель не смогла описать изображение. (Блокировка: {block_reason_str})"
+                    elif finish_reason_str not in ['STOP', 'N/A', 'FINISH_REASON_STOP']:
+                        reply = f"🤖 Модель не смогла описать изображение. (Причина: {finish_reason_str})"
+                    else:
+                        reply = "🤖 Не удалось понять, что на изображении (пустой ответ)."
+                    break # Выходим из цикла ретраев при пустом ответе
+
+                if reply and "Не удалось понять" not in reply and "не смогла описать" not in reply:
+                     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Успешный анализ на попытке {attempt + 1}.")
+                     break # Успех, выходим из цикла
+
             except (BlockedPromptException, StopCandidateException) as e_block_stop:
-                 reason_str = "неизвестна"; try: reason_str = str(e_block_stop.args[0]) if hasattr(e_block_stop, 'args') and e_block_stop.args else "N/A"; except Exception: pass
-                 logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Анализ заблокирован/остановлен (попытка {attempt + 1}): {e_block_stop} (Причина: {reason_str})"); reply = f"❌ Анализ изображения заблокирован/остановлен моделью."; break
+                 # --- ИСПРАВЛЕНО ЗДЕСЬ (строка ~1040) ---
+                 reason_str = "неизвестна"
+                 try:
+                     if hasattr(e_block_stop, 'args') and e_block_stop.args:
+                         reason_str = str(e_block_stop.args[0])
+                 except Exception:
+                     pass
+                 # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+                 logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Анализ заблокирован/остановлен (попытка {attempt + 1}): {e_block_stop} (Причина: {reason_str})")
+                 reply = f"❌ Анализ изображения заблокирован/остановлен моделью."
+                 break # Выходим из цикла ретраев
+
             except Exception as e:
-                 error_message = str(e); logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Ошибка на попытке {attempt + 1}: {error_message[:200]}...")
+                 error_message = str(e)
+                 logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Ошибка на попытке {attempt + 1}: {error_message[:200]}...")
                  is_retryable = "500" in error_message or "503" in error_message
-                 if "400" in error_message or "429" in error_message or "location is not supported" in error_message: reply = f"❌ Ошибка при анализе изображения ({error_message[:100]}...)."; break
+                 if "400" in error_message or "429" in error_message or "location is not supported" in error_message:
+                     reply = f"❌ Ошибка при анализе изображения ({error_message[:100]}...)."; break
                  elif is_retryable and attempt < RETRY_ATTEMPTS - 1:
-                     wait_time = RETRY_DELAY_SECONDS * (2 ** attempt); logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Ожидание {wait_time:.1f} сек..."); await asyncio.sleep(wait_time); continue
-                 else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Не удалось выполнить анализ после {attempt + 1} попыток. Ошибка: {e}", exc_info=True if not is_retryable else False); reply = f"❌ Ошибка при анализе изображения после {attempt + 1} попыток."; break
+                     wait_time = RETRY_DELAY_SECONDS * (2 ** attempt)
+                     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Ожидание {wait_time:.1f} сек...")
+                     await asyncio.sleep(wait_time)
+                     continue
+                 else:
+                     logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Не удалось выполнить анализ после {attempt + 1} попыток. Ошибка: {e}", exc_info=True if not is_retryable else False)
+                     if reply is None: reply = f"❌ Ошибка при анализе изображения после {attempt + 1} попыток."
+                     break # Выходим из цикла ретраев
+
         # --- Сохранение и отправка ---
         chat_history = context.chat_data.setdefault("history", [])
         user_text_for_history_vision = USER_ID_PREFIX_FORMAT.format(user_id=user_id) + (user_caption if user_caption else "Пользователь прислал фото.")
-        history_entry_user = { "role": "user", "parts": [{"text": user_text_for_history_vision}], "image_file_id": photo_file_id, "user_id": user_id, "message_id": user_message_id }; chat_history.append(history_entry_user); logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлено user-сообщение (Vision) в chat_history с image_file_id.")
-        if reply and "❌" not in reply and "🤖" not in reply: model_reply_text_with_prefix = f"{IMAGE_DESCRIPTION_PREFIX}{reply}"
-        else: model_reply_text_with_prefix = reply if reply else "🤖 Не удалось проанализировать изображение."
-        history_entry_model = {"role": "model", "parts": [{"text": model_reply_text_with_prefix}]}; chat_history.append(history_entry_model); logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлен model-ответ (Vision) в chat_history.")
+        history_entry_user = { "role": "user", "parts": [{"text": user_text_for_history_vision}], "image_file_id": photo_file_id, "user_id": user_id, "message_id": user_message_id }
+        chat_history.append(history_entry_user)
+        logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлено user-сообщение (Vision) в chat_history с image_file_id.")
+
+        if reply and "❌" not in reply and "🤖" not in reply:
+            model_reply_text_with_prefix = f"{IMAGE_DESCRIPTION_PREFIX}{reply}"
+        else:
+            model_reply_text_with_prefix = reply if reply else "🤖 Не удалось проанализировать изображение."
+
+        history_entry_model = {"role": "model", "parts": [{"text": model_reply_text_with_prefix}]}
+        chat_history.append(history_entry_model)
+        logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлен model-ответ (Vision) в chat_history.")
+
         reply_to_send = reply if (reply and "❌" not in reply and "🤖" not in reply) else model_reply_text_with_prefix
-        if reply_to_send: await send_reply(message, reply_to_send, context)
+        if reply_to_send:
+            await send_reply(message, reply_to_send, context)
         else:
             logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Нет ответа для отправки пользователю после всех попыток.")
-            # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА ---
             try:
                 await message.reply_text("🤖 К сожалению, не удалось проанализировать изображение.")
             except Exception as e_final_fail:
-                 # logger.error перенесен на новую строку
                  logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Не удалось отправить сообщение о финальной ошибке: {e_final_fail}")
-            # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
 
-        while len(chat_history) > MAX_HISTORY_MESSAGES: chat_history.pop(0)
+        # Ограничиваем историю
+        while len(chat_history) > MAX_HISTORY_MESSAGES:
+            chat_history.pop(0)
 
 # ===== Обработчик документов (обновлен для chat_data через handle_message) =====
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
