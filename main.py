@@ -710,16 +710,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          break
                      if reply and "не удалось создать конспект" not in reply.lower() and "не смогла создать конспект" not in reply.lower(): logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Успешный конспект на попытке {attempt + 1}."); break
                  except (BlockedPromptException, StopCandidateException) as e_block_stop:
-                      reason_str = "неизвестна"; try: reason_str = str(e_block_stop.args[0]) if hasattr(e_block_stop, 'args') and e_block_stop.args else "N/A"; except Exception: pass
-                      logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Конспект заблокирован/остановлен (попытка {attempt + 1}): {e_block_stop} (Причина: {reason_str})"); reply = f"❌ Не удалось создать конспект (ограничение модели)."; break
-                 except Exception as e:
-                     error_message = str(e); logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка на попытке {attempt + 1}: {error_message[:200]}...")
-                     is_retryable = "500" in error_message or "503" in error_message
-                     if "400" in error_message or "429" in error_message or "location is not supported" in error_message or "unsupported language" in error_message.lower(): reply = f"❌ Ошибка при создании конспекта ({error_message[:100]}...). Возможно, видео недоступно или на неподдерживаемом языке."; break
-                     elif is_retryable and attempt < RETRY_ATTEMPTS - 1:
-                         wait_time = RETRY_DELAY_SECONDS * (2 ** attempt); logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ожидание {wait_time:.1f} сек..."); await asyncio.sleep(wait_time); continue
-                     else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Не удалось создать конспект после {attempt + 1} попыток. Ошибка: {e}", exc_info=True if not is_retryable else False); reply = f"❌ Ошибка при создании конспекта после {attempt + 1} попыток."; break
-
+                      # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА (строка ~713) ---
+                      reason_str = "неизвестна" # Инициализация
+                      # Помещаем try на новую строку
+                      try:
+                          if hasattr(e_block_stop, 'args') and e_block_stop.args:
+                              reason_str = str(e_block_stop.args[0]) # Пытаемся получить причину
+                      except Exception:
+                          # Игнорируем ошибки при извлечении причины
+                          pass
+                      # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
+                      logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Конспект заблокирован/остановлен (попытка {attempt + 1}): {e_block_stop} (Причина: {reason_str})")
+                      reply = f"❌ Не удалось создать конспект (ограничение модели)."
+                      break # Выходим из цикла ретраев
+                     
             # --- Сохранение в историю и отправка ---
             history_entry_user = { "role": "user", "parts": [{"text": user_message_with_id}], "youtube_video_id": youtube_id, "user_id": user_id, "message_id": user_message_id }; chat_history.append(history_entry_user); logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлено user-сообщение (YouTube) в chat_history с youtube_video_id.")
             if reply and "❌" not in reply and "🤖" not in reply: model_reply_text_with_prefix = f"{YOUTUBE_SUMMARY_PREFIX}{reply}"
