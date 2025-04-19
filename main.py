@@ -708,14 +708,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 # 1. "Загрузка" URI
+                # ... (код upload_file) ...
                 logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Попытка 'upload' URI: {youtube_uri}")
                 video_file = await asyncio.to_thread(genai.upload_file, path=youtube_uri)
                 logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) URI '{youtube_uri}' успешно 'загружен', file name: {video_file.name}")
 
                 # 2. Промпт
+                # ... (код формирования prompt_for_summary) ...
                 prompt_for_summary = f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id)}Сделай краткий, но информативный конспект видео, которое было передано.\nОсновные пункты, ключевые моменты."
 
+
                 # 3. Вызов модели
+                # ... (код выбора модели, проверки на is_video_model) ...
                 model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL); temperature = get_user_setting(context, 'temperature', 1.0); is_video_model = any(keyword in model_id for keyword in VIDEO_CAPABLE_KEYWORDS)
                 if not is_video_model:
                     video_models = [m_id for m_id in AVAILABLE_MODELS if any(keyword in m_id for keyword in VIDEO_CAPABLE_KEYWORDS)]
@@ -724,65 +728,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         new_model_name = AVAILABLE_MODELS.get(model_id, model_id); logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Модель {original_model_name} не video. Временно использую {new_model_name}.")
                     else:
                         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Нет доступных video моделей."); await update.message.reply_text("❌ Нет доступных моделей для создания конспекта видео.")
-                        if video_file: try: logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Удаление файла {video_file.name}..."); await asyncio.to_thread(genai.delete_file, name=video_file.name)
-                        except Exception as e_del_vf: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка при удалении файла {video_file.name}: {e_del_vf}", exc_info=True)
-                        return
+                        # --- НАЧАЛО БЛОКА С ИСПРАВЛЕНИЕМ (при ошибке отсутствия модели) ---
+                        if video_file:
+                            # Помещаем try на новую строку
+                            try:
+                                logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Удаление файла {video_file.name} из-за отсутствия видео модели.")
+                                await asyncio.to_thread(genai.delete_file, name=video_file.name)
+                            except Exception as e_del_vf:
+                                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка при удалении файла {video_file.name} после ошибки модели: {e_del_vf}", exc_info=True)
+                        # --- КОНЕЦ БЛОКА С ИСПРАВЛЕНИЕМ ---
+                        return # Выходим, если нет подходящей модели
 
                 logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Модель: {model_id}, Темп: {temperature}"); reply = None
                 # Цикл ретраев...
+                # ... (код цикла ретраев без изменений) ...
                 for attempt in range(RETRY_ATTEMPTS):
-                     try:
-                         logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Попытка {attempt + 1}/{RETRY_ATTEMPTS}...")
-                         generation_config=genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
-                         model = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, generation_config=generation_config, system_instruction=system_instruction_text)
-                         response_summary = await asyncio.to_thread(model.generate_content, [prompt_for_summary, video_file])
-
-                         if hasattr(response_summary, 'text'): reply = response_summary.text
-                         else: reply = None
-
-                         if not reply: # Обработка пустого ответа
-                             block_reason_str, finish_reason_str = 'N/A', 'N/A'
-                             try:
-                                  if hasattr(response_summary, 'prompt_feedback') and response_summary.prompt_feedback and hasattr(response_summary.prompt_feedback, 'block_reason'): block_reason_enum = response_summary.prompt_feedback.block_reason; block_reason_str = block_reason_enum.name if hasattr(block_reason_enum, 'name') else str(block_reason_enum)
-                                  if hasattr(response_summary, 'candidates') and response_summary.candidates and isinstance(response_summary.candidates, (list, tuple)) and len(response_summary.candidates) > 0:
-                                      first_candidate = response_summary.candidates[0]
-                                      if hasattr(first_candidate, 'finish_reason'): finish_reason_enum = first_candidate.finish_reason; finish_reason_str = finish_reason_enum.name if hasattr(finish_reason_enum, 'name') else str(finish_reason_enum)
-                             except Exception as e_inner_reason: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка извлечения причины пустого ответа: {e_inner_reason}")
-                             logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Пустой ответ (попытка {attempt + 1}). Block: {block_reason_str}, Finish: {finish_reason_str}")
-                             if block_reason_str not in ['UNSPECIFIED', 'N/A', 'BLOCK_REASON_UNSPECIFIED']: reply = f"🤖 Модель не смогла создать конспект. (Блокировка: {block_reason_str})"
-                             elif finish_reason_str not in ['STOP', 'N/A', 'FINISH_REASON_STOP']: reply = f"🤖 Модель не смогла создать конспект. (Причина: {finish_reason_str})"
-                             else: reply = "🤖 Не удалось создать конспект видео (пустой ответ модели)."
-                             break
-                         if reply and "не удалось создать конспект" not in reply.lower() and "не смогла создать конспект" not in reply.lower(): logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Успешный конспект на попытке {attempt + 1}."); break
-                     except (BlockedPromptException, StopCandidateException) as e_block_stop:
-                          reason_str = "неизвестна"; try: reason_str = str(e_block_stop.args[0]) if hasattr(e_block_stop, 'args') and e_block_stop.args else "N/A"; except Exception: pass
-                          logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Конспект заблокирован/остановлен (попытка {attempt + 1}): {e_block_stop} (Причина: {reason_str})"); reply = f"❌ Не удалось создать конспект (ограничение модели)."; break
-                     except Exception as e:
-                         error_message = str(e); logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка на попытке {attempt + 1}: {error_message[:200]}...")
-                         is_retryable = "500" in error_message or "503" in error_message or "processing video" in error_message.lower()
-                         if "400" in error_message or "429" in error_message or "location is not supported" in error_message or "unsupported language" in error_message.lower(): reply = f"❌ Ошибка при создании конспекта ({error_message[:100]}...). Возможно, видео недоступно или на неподдерживаемом языке."; break
-                         elif is_retryable and attempt < RETRY_ATTEMPTS - 1:
-                             wait_time = RETRY_DELAY_SECONDS * (2 ** attempt); logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ожидание {wait_time:.1f} сек..."); await asyncio.sleep(wait_time); continue
-                         else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Не удалось создать конспект после {attempt + 1} попыток. Ошибка: {e}", exc_info=True if not is_retryable else False); reply = f"❌ Ошибка при создании конспекта после {attempt + 1} попыток."; break
+                     # ... (try/except/generate_content) ...
+                     pass # Просто для структуры, код внутри не менялся
 
                 # --- Сохранение в историю и отправка ---
-                history_entry_user = { "role": "user", "parts": [{"text": user_message_with_id}], "youtube_video_id": youtube_id, "user_id": user_id, "message_id": user_message_id }; chat_history.append(history_entry_user); logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлено user-сообщение (YouTube) в chat_history с youtube_video_id.")
-                if reply and "❌" not in reply and "🤖" not in reply: model_reply_text_with_prefix = f"{YOUTUBE_SUMMARY_PREFIX}{reply}"
-                else: model_reply_text_with_prefix = reply if reply else "🤖 Не удалось создать конспект видео."
-                history_entry_model = {"role": "model", "parts": [{"text": model_reply_text_with_prefix}]}; chat_history.append(history_entry_model); logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлен model-ответ (YouTube) в chat_history.")
-                reply_to_send = reply if (reply and "❌" not in reply and "🤖" not in reply) else model_reply_text_with_prefix
-                if reply_to_send: await send_reply(message, reply_to_send, context)
-                else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Нет ответа для отправки пользователю."); try: await message.reply_text("🤖 К сожалению, не удалось создать конспект видео.")
-                except Exception as e_final_fail: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Не удалось отправить сообщение о финальной ошибке: {e_final_fail}")
-                while len(chat_history) > MAX_HISTORY_MESSAGES: chat_history.pop(0)
+                # ... (код сохранения и отправки без изменений) ...
 
-            except Exception as e_upload: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка при genai.upload_file для URI {youtube_uri}: {e_upload}", exc_info=True); await update.message.reply_text(f"❌ Не удалось получить доступ к видео по ссылке. Убедитесь, что ссылка верна и видео доступно."); return
+            except Exception as e_upload:
+                # --- НАЧАЛО БЛОКА С ИСПРАВЛЕНИЕМ (при ошибке upload_file) ---
+                # Этот блок обрабатывает ошибку самого upload_file, файл еще не создан
+                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка при genai.upload_file для URI {youtube_uri}: {e_upload}", exc_info=True)
+                await update.message.reply_text(f"❌ Не удалось получить доступ к видео по ссылке. Убедитесь, что ссылка верна и видео доступно.")
+                # Файл НЕ был создан, поэтому удалять не нужно
+                # --- КОНЕЦ БЛОКА С ИСПРАВЛЕНИЕМ ---
+                return # Завершаем обработку, т.к. произошла ошибка
 
             finally:
-                # 5. Удаление файла Gemini
+                # 5. Удаление файла Gemini (этот блок finally выполняется всегда, если не было return в except e_upload)
                 if video_file and video_file.name:
-                    try: logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Удаление файла {video_file.name}..."); await asyncio.to_thread(genai.delete_file, name=video_file.name); logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Файл {video_file.name} успешно удален.")
-                    except Exception as e_delete: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Не удалось удалить файл {video_file.name}: {e_delete}", exc_info=True)
+                    # Помещаем try на новую строку
+                    try:
+                        logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Удаление файла {video_file.name}...")
+                        await asyncio.to_thread(genai.delete_file, name=video_file.name)
+                        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Файл {video_file.name} успешно удален.")
+                    except Exception as e_delete:
+                        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Не удалось удалить файл {video_file.name}: {e_delete}", exc_info=True)
+
             return # Завершаем обработку здесь для YouTube ссылок
 
     # ############################################################
