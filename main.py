@@ -189,12 +189,13 @@ RETRY_ATTEMPTS = 5
 RETRY_DELAY_SECONDS = 1
 IMAGE_DESCRIPTION_PREFIX = "[Описание изображения]: "
 YOUTUBE_SUMMARY_PREFIX = "[Конспект видео]: "
-VIDEO_CAPABLE_KEYWORDS = ['flash', 'pro', 'ultra', '1.5']
+VIDEO_CAPABLE_KEYWORDS = ['gemini-2.5-flash-preview-04-17']
 USER_ID_PREFIX_FORMAT = "[User {user_id}]: "
 TARGET_TIMEZONE = "Europe/Moscow" # <<<<<<<<<<<<<<<<<<<<<<<< НОВОЕ: Часовой пояс UTC+3
 
 system_instruction_text = (
 "**Текущая дата и время (в часовом поясе UTC+3/Москва) могут быть предоставлены в начале последнего сообщения пользователя или в отдельном сообщении перед ним (например, `(Текущая дата и время: ...)`). Используй эту информацию для ответов на вопросы, зависящие от времени ('сегодня', 'завтра', 'сейчас', погода, новости и т.д.), и для оценки актуальности информации из поиска.**"
+"Используй интернет-поиск для сверки с актуальной информацией (результаты будут предоставлены тебе)." 
 "Если используешь информацию из поиска, не нужны фразы на а-ля 'Судя по результатам поиска...', 'Я нашёл в сети...' и т.п. Интегрируй найденную информацию в свой ответ естественно, будто это часть твоих знаний."
 "Внимательно следи за историей диалога **в этом чате**, включая предыдущие вопросы, ответы, а также контекст из загруженных изображений, видео или файлов, чтобы твои ответы были последовательными и релевантными, соблюдая нить разговора."
 "**В истории диалога сообщения пользователей помечены как `[User ID]: текст_сообщения`. Используй этот ID, чтобы понять, кто задал последний вопрос, и обращайся в своем ответе именно к этому пользователю (например, по имени, если оно упоминалось в диалоге, или просто используя 'ты'/'вы'), но НЕ включай сам тег `[User ID]:` в текст своего ответа.**" # Обновлено
@@ -1103,27 +1104,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка поиска DuckDuckGo: {e_ddg}", exc_info=True)
                 search_log_msg += " (DDG: ошибка)"
 
-    # --- Формирование финального промпта с ВРЕМЕНЕМ ---
-    current_time_str = get_current_time_str() # <<<<<<<<<<<<<<<<<<<<<<<< НОВОЕ: Получаем время
+    # --- Формирование финального промпта с ВРЕМЕНЕМ и новой структурой поиска ---
+    current_time_str = get_current_time_str()
     time_context_str = f"(Текущая дата и время: {current_time_str})\n"
     base_user_prompt = user_message_with_id # Сообщение пользователя с его ID
-    final_user_prompt_text = time_context_str + base_user_prompt # Добавляем время ПЕРЕД сообщением пользователя
+
+    # Собираем финальный промпт
+    final_prompt_parts = [time_context_str, base_user_prompt] # Начинаем с времени и вопроса
 
     if search_context_snippets:
         search_context_lines = [f"- {s.strip()}" for s in search_context_snippets if s.strip()]
         if search_context_lines:
             search_context = "\n".join(search_context_lines)
-            # Добавляем контекст поиска ПОСЛЕ сообщения пользователя
-            final_user_prompt_text += (
-                f"\n\n(Возможно релевантная доп. информация из поиска, используй с осторожностью, учитывая текущее время, если подходит к вопросу пользователя {USER_ID_PREFIX_FORMAT.format(user_id=user_id)}, иначе игнорируй):\n{search_context}"
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<< ИЗМЕНЕНИЕ >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            # Добавляем четко выделенный блок с результатами поиска
+            search_block = (
+                f"\n\n==== РЕЗУЛЬТАТЫ ПОИСКА ({search_provider}) ДЛЯ ОТВЕТА НА ВОПРОС ====\n"
+                f"{search_context}\n"
+                f"===========================================================\n"
+                f"Используй эту информацию для ответа на вопрос пользователя {USER_ID_PREFIX_FORMAT.format(user_id=user_id)}, особенно если он касается текущих событий или погоды."
             )
+            final_prompt_parts.append(search_block)
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Добавлен контекст из {search_provider} ({len(search_context_lines)} непустых сниппетов).")
         else:
             logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Сниппеты из {search_provider} оказались пустыми, контекст не добавлен.")
             search_log_msg += " (пустые сниппеты)"
 
+    final_user_prompt_text = "\n".join(final_prompt_parts) # Собираем все части в один текст
+
     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | {search_log_msg}")
-    logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Финальный промпт для Gemini (длина {len(final_user_prompt_text)}):\n{final_user_prompt_text[:500]}...")
+    logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Финальный промпт для Gemini (длина {len(final_user_prompt_text)}):\n{final_user_prompt_text[:600]}...") # Увеличил лог для просмотра структуры
 
     # --- История и ее обрезка ---
     # Добавляем в историю оригинальное сообщение пользователя (с ID, но без времени и поиска)
