@@ -9,3 +9,4 @@ pillow>=11.2.1
 beautifulsoup4>=4.11.1
 duckduckgo_search>=8.0.0
 youtube-transcript-api
+pytz
