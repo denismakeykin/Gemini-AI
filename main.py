@@ -1530,14 +1530,26 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     reply = None
 
+                # Inside the 'if not reply:' block within handle_photo's retry loop
                 if not reply:
                     block_reason_str, finish_reason_str = 'N/A', 'N/A'
-                    try: # ... (извлечение причин - код опущен для краткости, он идентичен reanalyze_image) ...
-                        if hasattr(response_vision, 'prompt_feedback') and response_vision.prompt_feedback and hasattr(response_vision.prompt_feedback, 'block_reason'): block_reason_enum = response_vision.prompt_feedback.block_reason; block_reason_str = block_reason_enum.name if hasattr(block_reason_enum, 'name') else str(block_reason_enum)
-                        if hasattr(response_vision, 'candidates') and response_vision.candidates and len(response_vision.candidates) > 0: first_candidate = response_vision.candidates[0]; if hasattr(first_candidate, 'finish_reason'): finish_reason_enum = first_candidate.finish_reason; finish_reason_str = finish_reason_enum.name if hasattr(finish_reason_enum, 'name') else str(finish_reason_enum)
-                    except Exception as e_inner_reason: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Ошибка извлечения причины: {e_inner_reason}")
+                    try:
+                        # --- ИСПРАВЛЕНО: Разделение длинной строки ---
+                        if hasattr(response_vision, 'prompt_feedback') and response_vision.prompt_feedback and hasattr(response_vision.prompt_feedback, 'block_reason'):
+                            block_reason_enum = response_vision.prompt_feedback.block_reason
+                            block_reason_str = block_reason_enum.name if hasattr(block_reason_enum, 'name') else str(block_reason_enum)
+
+                        if hasattr(response_vision, 'candidates') and response_vision.candidates and len(response_vision.candidates) > 0:
+                            first_candidate = response_vision.candidates[0]
+                            if hasattr(first_candidate, 'finish_reason'):
+                                finish_reason_enum = first_candidate.finish_reason
+                                finish_reason_str = finish_reason_enum.name if hasattr(finish_reason_enum, 'name') else str(finish_reason_enum)
+                        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+                    except Exception as e_inner_reason:
+                        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Ошибка извлечения причины: {e_inner_reason}")
 
                     logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (Vision) Пустой ответ (попытка {attempt + 1}). Block: {block_reason_str}, Finish: {finish_reason_str}")
+                    # ... (rest of the 'if not reply' logic remains the same) ...
                     if block_reason_str not in ['UNSPECIFIED', 'N/A', 'BLOCK_REASON_UNSPECIFIED']:
                         reply = f"🤖 Не удалось описать изображение. (Блокировка: {block_reason_str})"
                         break # Фатальная ошибка
