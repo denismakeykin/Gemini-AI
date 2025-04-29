@@ -1140,38 +1140,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clean_entry = {"role": entry["role"], "parts": entry.get("parts", [])}
             history_clean_for_model.append(clean_entry)
 
-        # --- НАСТРОЙКА ИНСТРУМЕНТОВ ПОИСКА ---
+        # --- НАСТРОЙКА ИНСТРУМЕНТОВ ПОИСКА (для версии 0.8.x+) ---
         tools = []
-        tool_config = None
-        # Включаем поиск только для моделей 1.5 (flash или pro)
-        if any(keyword in model_id for keyword in ["1.5", "flash", "pro"]): # Расширим условие
+        tool_config = None # ToolConfig для режима поиска не используется с GoogleSearch
+
+        # Пытаемся использовать GoogleSearch, который должен быть в версии 0.8.5
+        try:
+            # Проверяем, импортировался ли GoogleSearch (или его заглушка)
+            # Используем try-except на случай, если даже заглушка не сработала
             try:
-                # Убедимся, что типы импортированы правильно
-                if GoogleSearchRetrieval == type('GoogleSearchRetrieval', (object,), {}):
-                     logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Тип GoogleSearchRetrieval не импортирован, поиск не будет настроен.")
-                else:
-                    search_tool_1_5 = Tool(google_search_retrieval=GoogleSearchRetrieval()) # Используем пустой конструктор по умолчанию
-                    tools.append(search_tool_1_5)
-                    # Настраиваем режим "всегда", если возможно
-                    if ToolConfig != type('ToolConfig', (object,), {}) and SEARCH_MODE_ALWAYS != "MODE_ENABLED": # Проверяем, что Enum загрузился
-                         tool_config = ToolConfig(
-                             google_search_retrieval_config=ToolConfig.GoogleSearchRetrievalConfig(
-                                 mode=SEARCH_MODE_ALWAYS # Используем импортированный Enum
-                             )
-                         )
-                         logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Настроен инструмент GoogleSearchRetrieval (режим: {SEARCH_MODE_ALWAYS.name}) для модели {model_id}.")
-                    else:
-                         # Если Enum не загрузился или режим ALWAYS не найден, не устанавливаем tool_config,
-                         # полагаясь на режим по умолчанию (AUTO)
-                         logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Настроен инструмент GoogleSearchRetrieval (режим: AUTO - по умолчанию) для модели {model_id}.")
+                # Пытаемся создать инструмент GoogleSearch
+                search_tool = Tool(google_search=GoogleSearch()) # Используем GoogleSearch
+                tools.append(search_tool)
+                logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Настроен инструмент GoogleSearch для модели {model_id}.")
+                # Режим поиска (ALWAYS/AUTO) для GoogleSearch не задается явно,
+                # модель решает сама + наша системная инструкция ей помогает.
+            except NameError: # Если GoogleSearch не был импортирован или является заглушкой
+                 logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Тип GoogleSearch не импортирован или не инициализирован. Встроенный поиск не будет настроен.")
+            except Exception as e_tool_create:
+                 logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка при создании инструмента GoogleSearch для {model_id}: {e_tool_create}")
 
-            except NameError:
-                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка NameError при настройке GoogleSearchRetrieval для {model_id}. Поиск не будет включен.")
-            except Exception as e_tool_setup:
-                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Неожиданная ошибка настройки GoogleSearchRetrieval для {model_id}: {e_tool_setup}")
-        else:
-            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Модель {model_id} не поддерживает встроенный поиск Google. Инструмент поиска не будет включен.")
-
+        except Exception as e_tool_setup: # Общий except на всякий случай
+            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Неожиданная ошибка настройки GoogleSearch для {model_id}: {e_tool_setup}")
+        # --- КОНЕЦ НАСТРОЙКИ ИНСТРУМЕНТОВ ПОИСКА ---
 
         # --- Вызов модели с инструментами (если они настроены) ---
         reply = None; response = None; last_exception = None; generation_successful = False
