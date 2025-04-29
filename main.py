@@ -39,11 +39,11 @@ import google.generativeai as genai
 
 # ===== Обработка импорта типов Gemini и SAFETY_SETTINGS =====
 try:
-    # --- ИЗМЕНЕНО: Убрали GoogleSearchRetrieval и Mode отсюда ---
+    # --- ИЗМЕНЕНО: Убрали ToolConfig ---
     from google.generativeai.types import (
-        Tool, GenerationConfig, ToolConfig, FunctionDeclaration, HarmCategory, HarmBlockThreshold,
+        Tool, GenerationConfig, FunctionDeclaration, HarmCategory, HarmBlockThreshold,
         BlockedPromptException, StopCandidateException, SafetyRating, BlockReason, FinishReason
-        # GoogleSearchRetrieval, GoogleSearchRetrievalMode - УБРАНЫ
+        # GoogleSearchRetrieval, GoogleSearchRetrievalMode, ToolConfig - УБРАНЫ
     )
     # --- КОНЕЦ ИЗМЕНЕНИЯ ---
     # Пытаемся импортировать GoogleSearch отдельно для совместимости
@@ -51,7 +51,7 @@ try:
         from google.generativeai.types import GoogleSearch
         logger.info("Типы google.generativeai.types (включая Tool, GoogleSearch) успешно импортированы.")
     except ImportError:
-        GoogleSearch = type('GoogleSearch', (object,), {}) # Заглушка, если GoogleSearch тоже нет (маловероятно для 0.8.x)
+        GoogleSearch = type('GoogleSearch', (object,), {}) # Заглушка, если GoogleSearch тоже нет
         logger.warning("Тип GoogleSearch не найден в google.generativeai.types, используется заглушка.")
         logger.info("Основные типы google.generativeai.types (Tool и др.) успешно импортированы.")
 
@@ -63,7 +63,7 @@ except ImportError as e_tool_import:
     GenerationConfig = genai.GenerationConfig # Используем стандартный, если типы не загрузились
     GoogleSearchRetrieval = type('GoogleSearchRetrieval', (object,), {}) # Оставляем заглушку на всякий случай
     GoogleSearch = type('GoogleSearch', (object,), {})
-    ToolConfig = type('ToolConfig', (object,), {})
+    ToolConfig = type('ToolConfig', (object,), {}) # Оставляем заглушку на всякий случай
     FunctionDeclaration = type('FunctionDeclaration', (object,), {})
     SEARCH_MODE_ALWAYS = "MODE_ENABLED" # Оставляем строку как fallback
     HarmCategory = type('HarmCategory', (object,), {})
@@ -1138,35 +1138,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clean_entry = {"role": entry["role"], "parts": entry.get("parts", [])}
             history_clean_for_model.append(clean_entry)
 
-        # --- НАСТРОЙКА ИНСТРУМЕНТОВ ПОИСКА (для версии 0.8.x+) ---
+# --- НАСТРОЙКА ИНСТРУМЕНТОВ ПОИСКА (для версии 0.8.x+) ---
         tools = []
-        tool_config = None # ToolConfig для режима поиска не используется с GoogleSearch
+        # --- ИЗМЕНЕНО: Убрали tool_config полностью ---
+        # tool_config = None
 
-        # Пытаемся использовать GoogleSearch, который должен быть в версии 0.8.5
+        # Пытаемся использовать GoogleSearch
         try:
             # Проверяем, импортировался ли GoogleSearch (или его заглушка)
-            # Используем try-except на случай, если даже заглушка не сработала
-            try:
-                # Пытаемся создать инструмент GoogleSearch
+            if GoogleSearch != type('GoogleSearch', (object,), {}):
                 search_tool = Tool(google_search=GoogleSearch()) # Используем GoogleSearch
                 tools.append(search_tool)
                 logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Настроен инструмент GoogleSearch для модели {model_id}.")
                 # Режим поиска (ALWAYS/AUTO) для GoogleSearch не задается явно,
                 # модель решает сама + наша системная инструкция ей помогает.
-            except NameError: # Если GoogleSearch не был импортирован или является заглушкой
-                 logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Тип GoogleSearch не импортирован или не инициализирован. Встроенный поиск не будет настроен.")
-            except Exception as e_tool_create:
-                 logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка при создании инструмента GoogleSearch для {model_id}: {e_tool_create}")
+            else:
+                 logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Тип GoogleSearch не импортирован. Встроенный поиск не будет настроен.")
 
-        except Exception as e_tool_setup: # Общий except на всякий случай
+        except NameError: # Если GoogleSearch даже как заглушка не определен
+             logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка NameError при настройке GoogleSearch для {model_id}. Поиск не будет включен.")
+        except Exception as e_tool_setup:
             logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Неожиданная ошибка настройки GoogleSearch для {model_id}: {e_tool_setup}")
         # --- КОНЕЦ НАСТРОЙКИ ИНСТРУМЕНТОВ ПОИСКА ---
 
-        # --- Вызов модели с инструментами (если они настроены) ---
+        # --- Вызов модели с инструментами ---
         reply = None; response = None; last_exception = None; generation_successful = False
         for attempt in range(RETRY_ATTEMPTS):
             try:
-                logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Попытка {attempt + 1}/{RETRY_ATTEMPTS} запроса к модели {model_id} (с tools: {bool(tools)}, tool_config: {bool(tool_config)})...")
+                # --- ИЗМЕНЕНО: Убрали tool_config из лога и вызова ---
+                logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Попытка {attempt + 1}/{RETRY_ATTEMPTS} запроса к модели {model_id} (с tools: {bool(tools)})...")
                 generation_config_obj = GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
                 model = genai.GenerativeModel(
                     model_id,
@@ -1174,10 +1174,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     generation_config=generation_config_obj,
                     system_instruction=system_instruction_text,
                     tools=tools if tools else None, # Передаем список инструментов
-                    tool_config=tool_config if tool_config else None # Передаем конфигурацию инструментов
+                    # tool_config=tool_config if tool_config else None # Убрали tool_config
                 )
-
-                # Используем очищенную историю для вызова
+                # --- КОНЕЦ ИЗМЕНЕНИЯ ---
                 response = await asyncio.to_thread(model.generate_content, history_clean_for_model)
 
                 if hasattr(response, 'text'):
