@@ -809,13 +809,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ############################################################
     youtube_handled = False
     # Проверяем только если это не ответ на спец.сообщение и не результат OCR
-    if not (message.reply_to_message and message.reply_to_message.text and (message.reply_to_message.text.startswith(IMAGE_DESCRIPTION_PREFIX) or message.reply_to_message.text.startswith(YOUTUBE_SUMMARY_PREFIX))) and not image_file_id_from_ocr:
+    if not (message.reply_to_message and message.reply_to_message.text and 
+            (message.reply_to_message.text.startswith(IMAGE_DESCRIPTION_PREFIX) or 
+             message.reply_to_message.text.startswith(YOUTUBE_SUMMARY_PREFIX))) and not image_file_id_from_ocr:
         youtube_id = extract_youtube_id(original_user_message_text)
         if youtube_id:
             youtube_handled = True
             first_name = update.effective_user.first_name
             user_mention = f"{first_name}" if first_name else f"User {user_id}"
             logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обнаружена ссылка YouTube (ID: {youtube_id}). Запрос конспекта для {user_mention}...")
+            
             try:
                 await update.message.reply_text(f"Окей, {user_mention}, сейчас гляну видео (ID: ...{youtube_id[-4:]}) и сделаю конспект...")
             except Exception as e_reply:
@@ -838,11 +841,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
             temperature = get_user_setting(context, 'temperature', 1.0)
             is_video_model = any(keyword in model_id for keyword in VIDEO_CAPABLE_KEYWORDS)
+            
             if not is_video_model:
                 video_models = [m_id for m_id in AVAILABLE_MODELS if any(keyword in m_id for keyword in VIDEO_CAPABLE_KEYWORDS)]
                 if video_models:
-                    original_model_name = AVAILABLE_MODELS.get(model_id, model_id); fallback_model_id = next((m for m in video_models if 'flash' in m), video_models[0]); model_id = fallback_model_id
-                    new_model_name = AVAILABLE_MODELS.get(model_id, model_id); logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Модель {original_model_name} не video. Временно использую {new_model_name}.")
+                    original_model_name = AVAILABLE_MODELS.get(model_id, model_id)
+                    fallback_model_id = next((m for m in video_models if 'flash' in m), video_models[0])
+                    model_id = fallback_model_id
+                    new_model_name = AVAILABLE_MODELS.get(model_id, model_id)
+                    logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Модель {original_model_name} не video. Временно использую {new_model_name}.")
                 else:
                     logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Нет доступных video моделей.")
                     await update.message.reply_text("❌ Нет доступных моделей для создания конспекта видео.")
@@ -850,12 +857,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Модель: {model_id}, Темп: {temperature}")
             reply = None
+            
             # Цикл ретраев...
             for attempt in range(RETRY_ATTEMPTS):
                 try:
                     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Попытка {attempt + 1}/{RETRY_ATTEMPTS}...")
-                    generation_config=genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
-                    model = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, generation_config=generation_config, system_instruction=system_instruction_text)
+                    generation_config = genai.GenerationConfig(
+                        temperature=temperature, 
+                        max_output_tokens=MAX_OUTPUT_TOKENS
+                    )
+                    model = genai.GenerativeModel(
+                        model_id,
+                        safety_settings=SAFETY_SETTINGS_BLOCK_NONE,
+                        generation_config=generation_config,
+                        system_instruction=system_instruction_text
+                    )
                     response_summary = await asyncio.to_thread(model.generate_content, content_for_summary)
 
                     if hasattr(response_summary, 'text'):
@@ -863,50 +879,115 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         reply = None
 
-                    if not reply: # Обработка пустого ответа
+                    if not reply:  # Обработка пустого ответа
                         block_reason_str, finish_reason_str = 'N/A', 'N/A'
                         try:
-                            if hasattr(response_summary, 'prompt_feedback') and response_summary.prompt_feedback and hasattr(response_summary.prompt_feedback, 'block_reason'): block_reason_enum = response_summary.prompt_feedback.block_reason; block_reason_str = block_reason_enum.name if hasattr(block_reason_enum, 'name') else str(block_reason_enum)
-                            if hasattr(response_summary, 'candidates') and response_summary.candidates and isinstance(response_summary.candidates, (list, tuple)) and len(response_summary.candidates) > 0:
+                            if (hasattr(response_summary, 'prompt_feedback') and 
+                               response_summary.prompt_feedback and 
+                               hasattr(response_summary.prompt_feedback, 'block_reason')):
+                                block_reason_enum = response_summary.prompt_feedback.block_reason
+                                block_reason_str = block_reason_enum.name if hasattr(block_reason_enum, 'name') else str(block_reason_enum)
+                            
+                            if (hasattr(response_summary, 'candidates') and 
+                               response_summary.candidates and 
+                               isinstance(response_summary.candidates, (list, tuple)) and 
+                               len(response_summary.candidates) > 0):
                                 first_candidate = response_summary.candidates[0]
-                                if hasattr(first_candidate, 'finish_reason'): finish_reason_enum = first_candidate.finish_reason; finish_reason_str = finish_reason_enum.name if hasattr(finish_reason_enum, 'name') else str(finish_reason_enum)
-                        except Exception as e_inner_reason: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка извлечения причины пустого ответа: {e_inner_reason}")
+                                if hasattr(first_candidate, 'finish_reason'):
+                                    finish_reason_enum = first_candidate.finish_reason
+                                    finish_reason_str = finish_reason_enum.name if hasattr(finish_reason_enum, 'name') else str(finish_reason_enum)
+                        except Exception as e_inner_reason:
+                            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка извлечения причины пустого ответа: {e_inner_reason}")
+                        
                         logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Пустой ответ (попытка {attempt + 1}). Block: {block_reason_str}, Finish: {finish_reason_str}")
-                        if block_reason_str not in ['UNSPECIFIED', 'N/A', 'BLOCK_REASON_UNSPECIFIED']: reply = f"🤖 Модель не смогла создать конспект. (Блокировка: {block_reason_str})"
-                        elif finish_reason_str not in ['STOP', 'N/A', 'FINISH_REASON_STOP']: reply = f"🤖 Модель не смогла создать конспект. (Причина: {finish_reason_str})"
-                        else: reply = "🤖 Не удалось создать конспект видео (пустой ответ модели)."
+                        
+                        if block_reason_str not in ['UNSPECIFIED', 'N/A', 'BLOCK_REASON_UNSPECIFIED']:
+                            reply = f"🤖 Модель не смогла создать конспект. (Блокировка: {block_reason_str})"
+                        elif finish_reason_str not in ['STOP', 'N/A', 'FINISH_REASON_STOP']:
+                            reply = f"🤖 Модель не смогла создать конспект. (Причина: {finish_reason_str})"
+                        else:
+                            reply = "🤖 Не удалось создать конспект видео (пустой ответ модели)."
                         break
-                    if reply and "не удалось создать конспект" not in reply.lower() and "не смогла создать конспект" not in reply.lower(): logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Успешный конспект на попытке {attempt + 1}."); break
+
+                    if (reply and 
+                        "не удалось создать конспект" not in reply.lower() and 
+                        "не смогла создать конспект" not in reply.lower()):
+                        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Успешный конспект на попытке {attempt + 1}.")
+                        break
+
                 except (BlockedPromptException, StopCandidateException) as e_block_stop:
                     reason_str = "неизвестна"
                     try:
                         if hasattr(e_block_stop, 'args') and e_block_stop.args:
                             reason_str = str(e_block_stop.args[0])
-                    except Exception: pass
+                    except Exception:
+                        pass
+                    
                     logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Конспект заблокирован/остановлен (попытка {attempt + 1}): {e_block_stop} (Причина: {reason_str})")
                     reply = f"❌ Не удалось создать конспект (ограничение модели)."
                     break
+
                 except Exception as e:
-                    error_message = str(e); logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка на попытке {attempt + 1}: {error_message[:200]}...")
+                    error_message = str(e)
+                    logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка на попытке {attempt + 1}: {error_message[:200]}...")
                     is_retryable = "500" in error_message or "503" in error_message
-                    if "400" in error_message or "429" in error_message or "location is not supported" in error_message or "unsupported language" in error_message.lower(): reply = f"❌ Ошибка при создании конспекта ({error_message[:100]}...)."; break
-                    elif is_retryable and attempt < RETRY_ATTEMPTS - 1: wait_time = RETRY_DELAY_SECONDS * (2 ** attempt); logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ожидание {wait_time:.1f} сек..."); await asyncio.sleep(wait_time); continue
-                    else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Не удалось создать конспект после {attempt + 1} попыток...", exc_info=True if not is_retryable else False); if reply is None: reply = f"❌ Ошибка при создании конспекта после {attempt + 1} попыток."; break
+                    
+                    if ("400" in error_message or 
+                        "429" in error_message or 
+                        "location is not supported" in error_message or 
+                        "unsupported language" in error_message.lower()):
+                        reply = f"❌ Ошибка при создании конспекта ({error_message[:100]}...)."
+                        break
+                    elif is_retryable and attempt < RETRY_ATTEMPTS - 1:
+                        wait_time = RETRY_DELAY_SECONDS * (2 ** attempt)
+                        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ожидание {wait_time:.1f} сек...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(
+                            f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Не удалось создать конспект после {attempt + 1} попыток...", 
+                            exc_info=True if not is_retryable else False
+                        )
+                        if reply is None:
+                            reply = f"❌ Ошибка при создании конспекта после {attempt + 1} попыток."
+                        break
 
             # --- Сохранение в историю и отправка ---
-            history_entry_user = { "role": "user", "parts": [{"text": user_message_with_id}], "youtube_video_id": youtube_id, "user_id": user_id, "message_id": user_message_id }
+            history_entry_user = {
+                "role": "user", 
+                "parts": [{"text": user_message_with_id}], 
+                "youtube_video_id": youtube_id, 
+                "user_id": user_id, 
+                "message_id": user_message_id
+            }
             chat_history.append(history_entry_user)
             logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлено user-сообщение (YouTube) в chat_history с youtube_video_id.")
-            if reply and "❌" not in reply and "🤖" not in reply: model_reply_text_with_prefix = f"{YOUTUBE_SUMMARY_PREFIX}{reply}"
-            else: model_reply_text_with_prefix = reply if reply else "🤖 Не удалось создать конспект видео."
-            history_entry_model = {"role": "model", "parts": [{"text": model_reply_text_with_prefix}]}; chat_history.append(history_entry_model); logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлен model-ответ (YouTube) в chat_history.")
+            
+            if reply and "❌" not in reply and "🤖" not in reply:
+                model_reply_text_with_prefix = f"{YOUTUBE_SUMMARY_PREFIX}{reply}"
+            else:
+                model_reply_text_with_prefix = reply if reply else "🤖 Не удалось создать конспект видео."
+            
+            history_entry_model = {
+                "role": "model", 
+                "parts": [{"text": model_reply_text_with_prefix}]
+            }
+            chat_history.append(history_entry_model)
+            logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлен model-ответ (YouTube) в chat_history.")
+            
             reply_to_send = reply if (reply and "❌" not in reply and "🤖" not in reply) else model_reply_text_with_prefix
-            if reply_to_send: await send_reply(message, reply_to_send, context)
+            
+            if reply_to_send:
+                await send_reply(message, reply_to_send, context)
             else:
                 logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Нет ответа для отправки пользователю.")
-                try: await message.reply_text("🤖 К сожалению, не удалось создать конспект видео.")
-                except Exception as e_final_fail: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Не удалось отправить сообщение о финальной ошибке: {e_final_fail}")
-            while len(chat_history) > MAX_HISTORY_MESSAGES: chat_history.pop(0)
+                try:
+                    await message.reply_text("🤖 К сожалению, не удалось создать конспект видео.")
+                except Exception as e_final_fail:
+                    logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Не удалось отправить сообщение о финальной ошибке: {e_final_fail}")
+            
+            while len(chat_history) > MAX_HISTORY_MESSAGES:
+                chat_history.pop(0)
             return
 
     # ############################################################
