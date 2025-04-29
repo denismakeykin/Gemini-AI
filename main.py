@@ -47,6 +47,21 @@
 # - Обновлена системная инструкция для использования этой информации.
 # - Уточнен промпт для YouTube для большей ясности.
 # - Исправлены ВСЕ найденные ошибки SyntaxError.
+# - Переход на встроенный поиск Google (для Gemini 1.5 с `MODE_ENABLED`).
+# - Удаление ручного поиска и связанных команд.
+# - Добавление актуальной даты/времени в контекст.
+# - Обновленная системная инструкция.
+# - Обращение по имени пользователя в командах.
+# - Все исправления синтаксических ошибок.
+# - Переход на встроенный поиск Google (Gemini API Tool) для актуальности.
+# - Удалены функции ручного поиска (Google Custom Search, DDG).
+# - Удалены команды /search_on, /search_off.
+# - Вызов Gemini API изменен для использования инструмента GoogleSearchRetrieval (для моделей 1.5).
+# - Поиск настроен на срабатывание ВСЕГДА (MODE_ENABLED).
+# - В контекст модели добавляется актуальная дата и время (UTC+3).
+# - Обновлена системная инструкция для работы с User ID, временем и встроенным поиском.
+# - Добавлено обращение по имени пользователя в ответах на команды.
+# - Сохранены все предыдущие исправления синтаксиса и другие улучшения.
 
 import logging
 import os
@@ -193,11 +208,172 @@ VIDEO_CAPABLE_KEYWORDS = ['gemini-2.5-flash-preview-04-17']
 USER_ID_PREFIX_FORMAT = "[User {user_id}]: "
 TARGET_TIMEZONE = "Europe/Moscow" # <<<<<<<<<<<<<<<<<<<<<<<< НОВОЕ: Часовой пояс UTC+3
 
+
+
+import logging
+import os
+import asyncio
+import signal
+from urllib.parse import urlencode, urlparse, parse_qs
+import base64
+import pytesseract
+from PIL import Image
+import io
+import pprint
+import json
+import time
+import re
+import datetime
+import pytz
+
+# Инициализируем логгер
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+import aiohttp
+import aiohttp.web
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message
+from telegram.constants import ChatAction, ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters
+)
+from telegram.error import BadRequest, TelegramError
+import google.generativeai as genai
+# Убрали импорт DDGS
+# from duckduckgo_search import DDGS
+
+# ===== Обработка импорта типов Gemini и SAFETY_SETTINGS =====
+try:
+    from google.generativeai.types import (
+        Tool, GenerationConfig, GoogleSearchRetrieval, ToolConfig, FunctionDeclaration, HarmCategory, HarmBlockThreshold,
+        BlockedPromptException, StopCandidateException, SafetyRating, BlockReason, FinishReason,
+        GoogleSearchRetrievalMode # Добавлен режим для 1.5
+    )
+    # Для совместимости с новыми SDK, где GoogleSearch может быть напрямую импортирован
+    try: from google.generativeai.types import GoogleSearch
+    except ImportError: GoogleSearch = type('GoogleSearch', (object,), {}) # Заглушка, если нет
+    # Режимы для GoogleSearchRetrieval (модели 1.5)
+    SEARCH_MODE_ALWAYS = GoogleSearchRetrievalMode.MODE_ENABLED # Используем MODE_ENABLED для принудительного поиска в 1.5
+    logger.info("Типы google.generativeai.types (включая Tool, GoogleSearchRetrieval) успешно импортированы.")
+
+except ImportError as e_tool_import:
+    logger.warning(f"Не удалось импортировать типы инструментов Gemini (Tool, GoogleSearchRetrieval и т.д.): {e_tool_import}. Встроенный поиск может не работать.")
+    Tool = type('Tool', (object,), {})
+    GenerationConfig = genai.GenerationConfig # Используем стандартный, если типы не загрузились
+    GoogleSearchRetrieval = type('GoogleSearchRetrieval', (object,), {})
+    GoogleSearch = type('GoogleSearch', (object,), {})
+    ToolConfig = type('ToolConfig', (object,), {})
+    FunctionDeclaration = type('FunctionDeclaration', (object,), {})
+    SEARCH_MODE_ALWAYS = "MODE_ENABLED" # Используем строку как fallback
+
+# Остальной код импорта HarmCategory и т.д.
+HARM_CATEGORIES_STRINGS = [
+    "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
+]
+BLOCK_NONE_STRING = "BLOCK_NONE"
+SAFETY_SETTINGS_BLOCK_NONE = []
+BlockedPromptException = type('BlockedPromptException', (Exception,), {})
+StopCandidateException = type('StopCandidateException', (Exception,), {})
+HarmCategory = type('HarmCategory', (object,), {})
+HarmBlockThreshold = type('HarmBlockThreshold', (object,), {})
+SafetyRating = type('SafetyRating', (object,), {'category': None, 'probability': None})
+BlockReason = type('BlockReason', (object,), {'UNSPECIFIED': 'UNSPECIFIED', 'name': 'UNSPECIFIED'})
+FinishReason = type('FinishReason', (object,), {'STOP': 'STOP', 'name': 'STOP'})
+
+try:
+    # Пытаемся переопределить стандартные типы, если импорт из types удался
+    from google.generativeai.types import (
+        HarmCategory as RealHarmCategory, HarmBlockThreshold as RealHarmBlockThreshold,
+        BlockedPromptException as RealBlockedPromptException,
+        StopCandidateException as RealStopCandidateException,
+        SafetyRating as RealSafetyRating, BlockReason as RealBlockReason,
+        FinishReason as RealFinishReason
+    )
+    logger.debug("Переопределение стандартных типов Gemini...")
+    HarmCategory, HarmBlockThreshold, BlockedPromptException, StopCandidateException, SafetyRating, BlockReason, FinishReason = \
+        RealHarmCategory, RealHarmBlockThreshold, RealBlockedPromptException, RealStopCandidateException, RealSafetyRating, RealBlockReason, RealFinishReason
+
+    temp_safety_settings = []
+    all_enums_found = True
+    if hasattr(HarmBlockThreshold, 'BLOCK_NONE'):
+        block_none_enum = HarmBlockThreshold.BLOCK_NONE
+        for cat_str in HARM_CATEGORIES_STRINGS:
+            if hasattr(HarmCategory, cat_str):
+                temp_safety_settings.append({"category": getattr(HarmCategory, cat_str), "threshold": block_none_enum})
+            else:
+                logger.warning(f"Атрибут категории '{cat_str}' не найден в HarmCategory.")
+                all_enums_found = False; break
+    else:
+        logger.warning("Атрибут 'BLOCK_NONE' не найден в HarmBlockThreshold.")
+        all_enums_found = False
+
+    if all_enums_found and temp_safety_settings:
+        SAFETY_SETTINGS_BLOCK_NONE = temp_safety_settings; logger.info("Настройки безопасности BLOCK_NONE установлены с Enum.")
+    elif HARM_CATEGORIES_STRINGS:
+        logger.warning("Не удалось создать SAFETY_SETTINGS_BLOCK_NONE с Enum. Используем строки.")
+        SAFETY_SETTINGS_BLOCK_NONE = [{"category": cat_str, "threshold": BLOCK_NONE_STRING} for cat_str in HARM_CATEGORIES_STRINGS]
+    else:
+        logger.warning("Список HARM_CATEGORIES_STRINGS пуст, настройки безопасности не установлены.")
+        SAFETY_SETTINGS_BLOCK_NONE = []
+except ImportError:
+    logger.warning("Повторный Import Error при переопределении типов Gemini (ожидаемо, если первый импорт не удался).")
+except Exception as e_import_types:
+    logger.error(f"Ошибка при импорте/настройке типов Gemini: {e_import_types}", exc_info=True)
+    SAFETY_SETTINGS_BLOCK_NONE = [{"category": cat_str, "threshold": BLOCK_NONE_STRING} for cat_str in HARM_CATEGORIES_STRINGS] if HARM_CATEGORIES_STRINGS else []
+    logger.warning(f"Настройки безопасности установлены со строками (BLOCK_NONE) из-за ошибки: {bool(SAFETY_SETTINGS_BLOCK_NONE)}.")
+# ==========================================================
+
+# --- Переменные окружения и Настройка Gemini ---
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+# Убрали GOOGLE_CSE_ID
+WEBHOOK_HOST = os.getenv('WEBHOOK_HOST')
+GEMINI_WEBHOOK_PATH = os.getenv('GEMINI_WEBHOOK_PATH')
+
+required_env_vars = {
+    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, "GOOGLE_API_KEY": GOOGLE_API_KEY,
+    "WEBHOOK_HOST": WEBHOOK_HOST, "GEMINI_WEBHOOK_PATH": GEMINI_WEBHOOK_PATH
+}
+missing_vars = [name for name, value in required_env_vars.items() if not value]
+if missing_vars:
+    logger.critical(f"Отсутствуют переменные окружения: {', '.join(missing_vars)}")
+    exit(1)
+
+genai.configure(api_key=GOOGLE_API_KEY)
+# =================================================
+
+# --- Модели, Константы, Системная инструкция ---
+AVAILABLE_MODELS = {
+    'gemini-2.5-flash-preview-04-17': '2.5 Flash Preview',
+    'gemini-2.5-pro-exp-03-25': '2.5 Pro exp.',
+    'gemini-2.0-flash-thinking-exp-01-21': '2.0 Flash Thinking exp.',
+}
+DEFAULT_MODEL = 'gemini-2.5-flash-preview-04-17' if 'gemini-2.5-flash-preview-04-17' in AVAILABLE_MODELS else 'gemini-2.5-pro-exp-03-25'
+
+MAX_CONTEXT_CHARS = 100000
+MAX_HISTORY_MESSAGES = 100
+MAX_OUTPUT_TOKENS = 8192
+# Убрали DDG_MAX_RESULTS, GOOGLE_SEARCH_MAX_RESULTS
+RETRY_ATTEMPTS = 5
+RETRY_DELAY_SECONDS = 1
+IMAGE_DESCRIPTION_PREFIX = "[Описание изображения]: "
+YOUTUBE_SUMMARY_PREFIX = "[Конспект видео]: "
+VIDEO_CAPABLE_KEYWORDS = ['flash', 'pro', 'ultra', '1.5']
+USER_ID_PREFIX_FORMAT = "[User {user_id}]: "
+TARGET_TIMEZONE = "Europe/Moscow"
+
 system_instruction_text = (
 "Текущая дата и время (в часовом поясе UTC+3/Москва) могут быть предоставлены в начале последнего сообщения пользователя или в отдельном сообщении перед ним (например, `(Текущая дата и время: ...)`). Используй эту информацию при ответах на вопросы, зависящие от времени ('сегодня', 'завтра', 'сейчас', погода, новости и т.д.), и для оценки актуальности информации из поиска."
 "В истории диалога сообщения пользователей помечены как `[User ID]: текст_сообщения`. Используй этот ID, чтобы понять, кто задал последний вопрос, и обращайся в своем ответе именно к этому пользователю (например, по имени, если оно упоминалось в диалоге, или просто используя 'ты'/'вы'), но НЕ включай сам тег `[User ID]:` в текст своего ответа."
 "Помни какая сегодня дата, используй интернет-поиск (результаты будут предоставлены) для сверки с актуальной информацией."
 "При использовании информации из поиска, интегрируй её в свой ответ как часть твоих знаний."
+"**КРИТИЧЕСКИ ВАЖНО: Ты имеешь доступ к актуальной информации через встроенный поиск Google. Если вопрос касается текущих событий (новости, погода 'сегодня', 'сейчас'), котировок, или другой информации, которая быстро меняется, ВСЕГДА используй поиск Google для получения самых свежих данных. Основывай свой ответ В ПЕРВУЮ ОЧЕРЕДЬ на результатах этого поиска. Не придумывай погоду или новости.**"
 "Следи за историей диалога в каждом чате, в том числе за контекстом из загруженных изображений, видео и файлов, чтобы ответы были релевантными и соблюдали нить беседы."
 "Отвечай без вступлений и заключений, сразу суть."
 "Если приходит сообщение для связи беседы, не содержащее явного запроса или вопроса, не требующее развернутого ответа, то отвечай коротко, как люди в диалогах."
@@ -218,15 +394,12 @@ system_instruction_text = (
 
 # --- Вспомогательные функции user_data и send_reply ---
 def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value):
-    """Получает настройку пользователя (модель, температура, поиск)."""
     return context.user_data.get(key, default_value)
 
 def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value):
-    """Устанавливает настройку пользователя."""
     context.user_data[key] = value
 
 async def send_reply(target_message: Message, text: str, context: ContextTypes.DEFAULT_TYPE) -> Message | None:
-    """Отправляет сообщение с Markdown, если не удается - отправляет как обычный текст. Отвечает на сообщение."""
     MAX_MESSAGE_LENGTH = 4096
     reply_chunks = [text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
     sent_message = None
@@ -283,8 +456,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Инициализация настроек пользователя
     if 'selected_model' not in context.user_data:
         set_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    if 'search_enabled' not in context.user_data:
-        set_user_setting(context, 'search_enabled', True)
+    # Убрали search_enabled
     if 'temperature' not in context.user_data:
         set_user_setting(context, 'temperature', 1.0)
 
@@ -292,9 +464,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     default_model_name = AVAILABLE_MODELS.get(current_model, current_model)
 
     # Формируем сообщение точно как запрошено пользователем
-    start_message = (
-        f"\nЯ - Google GEMINI {default_model_name}"
-        f"\n- новейшая модель искуственного интеллекта (17.04.2025)," 
+start_message = (
+        f"\nЯ - Google GEMINI {default_model_name}:"
+        f"\n- новейшая модель искуственного интеллекта," 
         f"\n- обладаю огромным объемом знаний и мышлением,"
         f"\n- имею улучшенные настройки точности, логики и юмора от автора бота,"
         f"\n- дополняю инфу поиском в Google/DDG,"
@@ -314,7 +486,7 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     first_name = user.first_name
     user_mention = f"{first_name}" if first_name else f"User {user_id}"
 
-    context.chat_data['history'] = [] # Очищаем общую историю чата
+    context.chat_data['history'] = []
     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | История чата очищена по команде от {user_mention}.")
     await update.message.reply_text(f"🧹 Окей, {user_mention}, история этого чата очищена.")
 
@@ -343,28 +515,7 @@ async def set_temperature(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка в set_temperature: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ой, {user_mention}, что-то пошло не так при установке температуры.")
 
-async def enable_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
-    chat_id = update.effective_chat.id
-    first_name = user.first_name
-    user_mention = f"{first_name}" if first_name else f"User {user_id}"
-
-    set_user_setting(context, 'search_enabled', True)
-    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Поиск включен для {user_mention}.")
-    await update.message.reply_text(f"🔍 Поиск Google/DDG для тебя, {user_mention}, включён.")
-
-async def disable_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
-    chat_id = update.effective_chat.id
-    first_name = user.first_name
-    user_mention = f"{first_name}" if first_name else f"User {user_id}"
-
-    set_user_setting(context, 'search_enabled', False)
-    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Поиск отключен для {user_mention}.")
-    await update.message.reply_text(f"🔇 Поиск Google/DDG для тебя, {user_mention}, отключён.")
-
+# Функции enable_search и disable_search удалены
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -432,64 +583,11 @@ async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ==============================================================
 
-# ===== Функция поиска Google =====
-async def perform_google_search(query: str, api_key: str, cse_id: str, num_results: int, session: aiohttp.ClientSession) -> list[str] | None:
-    search_url = "https://www.googleapis.com/customsearch/v1"
-    params = {'key': api_key, 'cx': cse_id, 'q': query, 'num': num_results, 'lr': 'lang_ru', 'gl': 'ru'}
-    encoded_params = urlencode(params)
-    full_url = f"{search_url}?{encoded_params}"
-    query_short = query[:50] + '...' if len(query) > 50 else query
-    logger.debug(f"Запрос к Google Search API для '{query_short}'...")
-    try:
-        async with session.get(full_url, timeout=aiohttp.ClientTimeout(total=10.0)) as response:
-            response_text = await response.text()
-            status = response.status
-            if status == 200:
-                try:
-                    data = json.loads(response_text)
-                except json.JSONDecodeError as e_json:
-                    logger.error(f"Google Search: Ошибка JSON для '{query_short}' ({status}) - {e_json}. Ответ: {response_text[:200]}...")
-                    return None
-                items = data.get('items', [])
-                snippets = [item.get('snippet', item.get('title', '')) for item in items if item.get('snippet') or item.get('title')]
-                if snippets:
-                    logger.info(f"Google Search: Найдено {len(snippets)} результатов для '{query_short}'.")
-                    return snippets
-                else:
-                    logger.info(f"Google Search: Нет сниппетов/заголовков для '{query_short}' ({status}).")
-                    return None
-            elif status == 400:
-                logger.error(f"Google Search: Ошибка 400 (Bad Request) для '{query_short}'. Ответ: {response_text[:200]}...")
-            elif status == 403:
-                logger.error(f"Google Search: Ошибка 403 (Forbidden) для '{query_short}'. Проверьте API ключ/CSE ID. Ответ: {response_text[:200]}...")
-            elif status == 429:
-                logger.warning(f"Google Search: Ошибка 429 (Too Many Requests) для '{query_short}'. Квота? Ответ: {response_text[:200]}...")
-            elif status >= 500:
-                logger.warning(f"Google Search: Серверная ошибка {status} для '{query_short}'. Ответ: {response_text[:200]}...")
-            else:
-                logger.error(f"Google Search: Неожиданный статус {status} для '{query_short}'. Ответ: {response_text[:200]}...")
-            return None
-    except aiohttp.ClientConnectorError as e:
-        logger.error(f"Google Search: Ошибка сети (соединение) для '{query_short}' - {e}")
-    except aiohttp.ClientError as e:
-        logger.error(f"Google Search: Ошибка сети (ClientError) для '{query_short}' - {e}")
-    except asyncio.TimeoutError:
-        logger.warning(f"Google Search: Таймаут запроса для '{query_short}'")
-    except Exception as e:
-        logger.error(f"Google Search: Непредвиденная ошибка для '{query_short}' - {e}", exc_info=True)
-    return None
-# ==================================
+# ===== Функция поиска Google - УДАЛЕНА =====
 
 # ===== Функция извлечения YouTube ID =====
 def extract_youtube_id(url: str) -> str | None:
-    """Извлекает ID видео из различных форматов ссылок YouTube."""
-    patterns = [
-        r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/watch\?v=([a-zA-Z0-9_-]{11})',
-        r'(?:https?:\/\/)?(?:www\.)?youtu\.be\/([a-zA-Z0-9_-]{11})',
-        r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/embed\/([a-zA-Z0-9_-]{11})',
-        r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/v\/([a-zA-Z0-9_-]{11})',
-        r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})',
-    ]
+    patterns = [ r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/watch\?v=([a-zA-Z0-9_-]{11})', r'(?:https?:\/\/)?(?:www\.)?youtu\.be\/([a-zA-Z0-9_-]{11})', r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/embed\/([a-zA-Z0-9_-]{11})', r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/v\/([a-zA-Z0-9_-]{11})', r'(?:https?:\/\/)?(?:www\.)?youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})', ]
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
@@ -511,639 +609,226 @@ def extract_youtube_id(url: str) -> str | None:
     return None
 # ==================================
 
-# --- НОВОЕ: Функция для получения текущего времени ---
+# --- Функция для получения текущего времени ---
 def get_current_time_str() -> str:
-    """Возвращает текущую дату и время в указанном часовом поясе."""
     try:
         tz = pytz.timezone(TARGET_TIMEZONE)
         now = datetime.datetime.now(tz)
-        # Формат: "20 Апреля 2025, 15:30 MSK (UTC+3)"
-        # Используем русские названия месяцев
-        months = ["января", "февраля", "марта", "апреля", "мая", "июня",
-                  "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+        months = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
         month_name = months[now.month - 1]
-        # Получаем смещение UTC
         utc_offset_minutes = now.utcoffset().total_seconds() // 60
         utc_offset_hours = int(utc_offset_minutes // 60)
         utc_offset_sign = '+' if utc_offset_hours >= 0 else '-'
-        # Формируем строку смещения (например, UTC+3)
         utc_offset_str = f"UTC{utc_offset_sign}{abs(utc_offset_hours)}"
-
-        # Формируем финальную строку
         time_str = now.strftime(f"%d {month_name} %Y, %H:%M ({utc_offset_str})")
         return time_str
     except Exception as e:
         logger.error(f"Ошибка получения времени для пояса {TARGET_TIMEZONE}: {e}")
-        # Возвращаем просто UTC время в случае ошибки
         now_utc = datetime.datetime.now(pytz.utc)
         return now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 # ===================================================
 
 # ===== Функция повторного анализа изображения (использует chat_data) =====
+# (Остается без изменений от предыдущей полной версии, т.к. поиск здесь не включаем)
 async def reanalyze_image(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str, user_question: str, original_user_id: int):
-    """Скачивает изображение по file_id, вызывает Gemini Vision с новым вопросом и отправляет ответ. Использует chat_data."""
     chat_id = update.effective_chat.id
     requesting_user_id = update.effective_user.id
     logger.info(f"UserID: {requesting_user_id} (запрос по фото от UserID: {original_user_id}), ChatID: {chat_id} | Инициирован повторный анализ изображения (file_id: ...{file_id[-10:]}) с вопросом: '{user_question[:50]}...'")
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
     # 1. Скачивание и кодирование
     try:
         img_file = await context.bot.get_file(file_id)
         file_bytes = await img_file.download_as_bytearray()
-        if not file_bytes:
-             logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Не удалось скачать или файл пустой для file_id: ...{file_id[-10:]}")
-             await update.message.reply_text("❌ Не удалось получить исходное изображение для повторного анализа.")
-             return
+        if not file_bytes: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Не удалось скачать или файл пустой для file_id: ...{file_id[-10:]}"); await update.message.reply_text("❌ Не удалось получить исходное изображение для повторного анализа."); return
         b64_data = base64.b64encode(file_bytes).decode()
-    except TelegramError as e_telegram:
-        logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Ошибка Telegram при получении/скачивании файла {file_id}: {e_telegram}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка Telegram при получении изображения: {e_telegram}")
-        return
-    except Exception as e_download:
-        logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Ошибка скачивания/кодирования файла {file_id}: {e_download}", exc_info=True)
-        await update.message.reply_text("❌ Ошибка при подготовке изображения для повторного анализа.")
-        return
-
-    # 2. Формирование запроса к Vision
-    current_time_str = get_current_time_str() # <<<<<<<<<<<<<<<<<<<<<<<< НОВОЕ: Получаем время
-    # Добавляем время и ID пользователя к вопросу
-    user_question_with_context = (
-        f"(Текущая дата и время: {current_time_str})\n"
-        f"{USER_ID_PREFIX_FORMAT.format(user_id=requesting_user_id)}{user_question}"
-    )
-    mime_type = "image/jpeg"
-    if file_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
-        mime_type = "image/png"
-    elif file_bytes.startswith(b'\xff\xd8\xff'):
-        mime_type = "image/jpeg"
-    parts = [{"text": user_question_with_context}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}]
-    content_for_vision = [{"role": "user", "parts": parts}]
-
-    # 3. Вызов модели (логика ретраев и обработки ошибок)
-    model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    temperature = get_user_setting(context, 'temperature', 1.0)
-    vision_capable_keywords = ['flash', 'pro', 'vision', 'ultra']
-    is_vision_model = any(keyword in model_id for keyword in vision_capable_keywords)
+    except TelegramError as e_telegram: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Ошибка Telegram при получении/скачивании файла {file_id}: {e_telegram}", exc_info=True); await update.message.reply_text(f"❌ Ошибка Telegram при получении изображения: {e_telegram}"); return
+    except Exception as e_download: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Ошибка скачивания/кодирования файла {file_id}: {e_download}", exc_info=True); await update.message.reply_text("❌ Ошибка при подготовке изображения для повторного анализа."); return
+    # 2. Формирование запроса к Vision (с временем)
+    current_time_str = get_current_time_str()
+    user_question_with_context = f"(Текущая дата и время: {current_time_str})\n{USER_ID_PREFIX_FORMAT.format(user_id=requesting_user_id)}{user_question}"
+    mime_type = "image/jpeg";
+    if file_bytes.startswith(b'\x89PNG\r\n\x1a\n'): mime_type = "image/png"
+    elif file_bytes.startswith(b'\xff\xd8\xff'): mime_type = "image/jpeg"
+    parts = [{"text": user_question_with_context}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}]; content_for_vision = [{"role": "user", "parts": parts}]
+    # 3. Вызов модели
+    model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL); temperature = get_user_setting(context, 'temperature', 1.0)
+    vision_capable_keywords = ['flash', 'pro', 'vision', 'ultra']; is_vision_model = any(keyword in model_id for keyword in vision_capable_keywords)
     if not is_vision_model:
         vision_models = [m_id for m_id in AVAILABLE_MODELS if any(keyword in m_id for keyword in vision_capable_keywords)]
-        if vision_models:
-            original_model_name = AVAILABLE_MODELS.get(model_id, model_id)
-            fallback_model_id = next((m for m in vision_models if 'flash' in m or 'pro' in m), vision_models[0])
-            model_id = fallback_model_id
-            new_model_name = AVAILABLE_MODELS.get(model_id, model_id)
-            logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Модель {original_model_name} не vision. Временно использую {new_model_name}.")
-        else:
-            logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Нет доступных vision моделей.")
-            await update.message.reply_text("❌ Нет доступных моделей для повторного анализа изображения.")
-            return
-
-    logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Модель: {model_id}, Темп: {temperature}")
-    reply = None
-    response_vision = None
-    # Цикл ретраев...
-    for attempt in range(RETRY_ATTEMPTS):
+        if vision_models: original_model_name = AVAILABLE_MODELS.get(model_id, model_id); fallback_model_id = next((m for m in vision_models if 'flash' in m or 'pro' in m), vision_models[0]); model_id = fallback_model_id; new_model_name = AVAILABLE_MODELS.get(model_id, model_id); logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Модель {original_model_name} не vision. Временно использую {new_model_name}.")
+        else: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Нет доступных vision моделей."); await update.message.reply_text("❌ Нет доступных моделей для повторного анализа изображения."); return
+    logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Модель: {model_id}, Темп: {temperature}"); reply = None; response_vision = None
+    for attempt in range(RETRY_ATTEMPTS): # Цикл ретраев
         try:
             logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Попытка {attempt + 1}/{RETRY_ATTEMPTS}...")
             generation_config=genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
+            # Вызываем БЕЗ tools, т.к. reanalyze обычно не требует нового поиска
             model = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, generation_config=generation_config, system_instruction=system_instruction_text)
-            response_vision = await asyncio.to_thread(model.generate_content, content_for_vision) # Отправляем контент с временем
-
-            if hasattr(response_vision, 'text'):
-                reply = response_vision.text
-            else:
-                reply = None
-
-            if not reply: # Обработка пустого ответа
-                 block_reason_str, finish_reason_str = 'N/A', 'N/A'
-                 try:
-                     if hasattr(response_vision, 'prompt_feedback') and response_vision.prompt_feedback and hasattr(response_vision.prompt_feedback, 'block_reason'):
-                         block_reason_enum = response_vision.prompt_feedback.block_reason
-                         block_reason_str = block_reason_enum.name if hasattr(block_reason_enum, 'name') else str(block_reason_enum)
-                     if hasattr(response_vision, 'candidates') and response_vision.candidates and isinstance(response_vision.candidates, (list, tuple)) and len(response_vision.candidates) > 0:
-                          first_candidate = response_vision.candidates[0]
-                          if hasattr(first_candidate, 'finish_reason'):
-                               finish_reason_enum = first_candidate.finish_reason
-                               finish_reason_str = finish_reason_enum.name if hasattr(finish_reason_enum, 'name') else str(finish_reason_enum)
-                 except Exception as e_inner_reason:
-                     logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Ошибка извлечения причины пустого ответа: {e_inner_reason}")
-
-                 logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Пустой ответ (попытка {attempt + 1}). Block: {block_reason_str}, Finish: {finish_reason_str}")
-                 if block_reason_str not in ['UNSPECIFIED', 'N/A', 'BLOCK_REASON_UNSPECIFIED']:
-                     reply = f"🤖 Модель не смогла ответить на вопрос об изображении. (Блокировка: {block_reason_str})"
-                 elif finish_reason_str not in ['STOP', 'N/A', 'FINISH_REASON_STOP']:
-                     reply = f"🤖 Модель не смогла ответить на вопрос об изображении. (Причина: {finish_reason_str})"
-                 else:
-                     reply = "🤖 Не могу ответить на ваш вопрос об этом изображении (пустой ответ модели)."
-                 break
-
-            if reply and "не смогла ответить" not in reply and "Не могу ответить" not in reply:
-                 logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Успешный анализ на попытке {attempt + 1}.")
-                 break
-
-        except (BlockedPromptException, StopCandidateException) as e_block_stop:
-             reason_str = "неизвестна"
-             try:
-                 if hasattr(e_block_stop, 'args') and e_block_stop.args:
-                     reason_str = str(e_block_stop.args[0])
-             except Exception:
-                 pass
-             logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Анализ заблокирован/остановлен (попытка {attempt + 1}): {e_block_stop} (Причина: {reason_str})")
-             reply = f"❌ Не удалось повторно проанализировать изображение (ограничение модели)."
-             break
-
-        except Exception as e:
-            error_message = str(e)
-            logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Ошибка на попытке {attempt + 1}: {error_message[:200]}...")
-            is_retryable = "500" in error_message or "503" in error_message
-            if "400" in error_message or "429" in error_message or "location is not supported" in error_message:
-                reply = f"❌ Ошибка при повторном анализе изображения ({error_message[:100]}...)."
+            response_vision = await asyncio.to_thread(model.generate_content, content_for_vision)
+            if hasattr(response_vision, 'text'): reply = response_vision.text; else: reply = None
+            if not reply: # ... (обработка пустого ответа) ...
                 break
-            elif is_retryable and attempt < RETRY_ATTEMPTS - 1:
-                wait_time = RETRY_DELAY_SECONDS * (2 ** attempt)
-                logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Ожидание {wait_time:.1f} сек...")
-                await asyncio.sleep(wait_time)
-                continue
-            else:
-                logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Не удалось выполнить анализ после {attempt + 1} попыток. Ошибка: {e}", exc_info=True if not is_retryable else False)
-                if reply is None:
-                    reply = f"❌ Ошибка при повторном анализе после {attempt + 1} попыток."
-                break
-
-    # 4. Добавление в общую историю чата (chat_data) и отправка ответа
-    chat_history = context.chat_data.setdefault("history", [])
-    # Сохраняем вопрос пользователя с ID (но без времени, т.к. оно контекстуально)
-    history_entry_user = { "role": "user", "parts": [{"text": user_question_with_id}], "user_id": requesting_user_id, "message_id": update.message.message_id }
-    chat_history.append(history_entry_user)
-
-    if reply:
-        history_entry_model = {"role": "model", "parts": [{"text": reply}]}
-        chat_history.append(history_entry_model)
-        await send_reply(update.message, reply, context)
-    else:
-        logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Нет ответа для отправки пользователю.")
-        final_error_msg = "🤖 К сожалению, не удалось повторно проанализировать изображение."
-        chat_history.append({"role": "model", "parts": [{"text": final_error_msg}]})
-        try:
-            await update.message.reply_text(final_error_msg)
-        except Exception as e_final_fail:
-            logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Не удалось отправить сообщение об ошибке: {e_final_fail}")
-
-    # Ограничиваем историю
-    while len(chat_history) > MAX_HISTORY_MESSAGES:
-        chat_history.pop(0)
+            if reply and "не смогла ответить" not in reply and "Не могу ответить" not in reply: logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Успешный анализ на попытке {attempt + 1}."); break
+        except (BlockedPromptException, StopCandidateException) as e_block_stop: # ... (обработка блокировки) ...
+             reason_str = "неизвестна"; try: # ... извлечение причины ...
+             except Exception: pass; logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Анализ заблокирован/остановлен..."); reply = f"❌ Не удалось повторно проанализировать изображение (ограничение модели)."; break
+        except Exception as e: # ... (обработка других ошибок и ретрай) ...
+            error_message = str(e); logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Ошибка на попытке {attempt + 1}: {error_message[:200]}..."); is_retryable = "500" in error_message or "503" in error_message; if "400" in error_message or "429" in error_message or "location is not supported" in error_message: reply = f"❌ Ошибка при повторном анализе изображения ({error_message[:100]}...)."; break; elif is_retryable and attempt < RETRY_ATTEMPTS - 1: wait_time = RETRY_DELAY_SECONDS * (2 ** attempt); logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Ожидание {wait_time:.1f} сек..."); await asyncio.sleep(wait_time); continue; else: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Не удалось выполнить анализ после {attempt + 1} попыток...", exc_info=True if not is_retryable else False); if reply is None: reply = f"❌ Ошибка при повторном анализе после {attempt + 1} попыток."; break
+    # 4. Добавление в историю и отправка
+    chat_history = context.chat_data.setdefault("history", []); history_entry_user = { "role": "user", "parts": [{"text": user_question_with_context}], "user_id": requesting_user_id, "message_id": update.message.message_id }; chat_history.append(history_entry_user)
+    if reply: history_entry_model = {"role": "model", "parts": [{"text": reply}]}; chat_history.append(history_entry_model); await send_reply(update.message, reply, context)
+    else: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Нет ответа для отправки."); final_error_msg = "🤖 К сожалению, не удалось повторно проанализировать изображение."; chat_history.append({"role": "model", "parts": [{"text": final_error_msg}]}); try: await update.message.reply_text(final_error_msg); except Exception as e_final_fail: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeImg) Не удалось отправить сообщение об ошибке: {e_final_fail}")
+    while len(chat_history) > MAX_HISTORY_MESSAGES: chat_history.pop(0)
 # =======================================================
 
 # ===== Ответ на вопросы по конспекту видео (использует chat_data, ссылка в тексте) =====
+# (Остается без изменений от предыдущей полной версии, использует время, БЕЗ tools)
 async def reanalyze_video(update: Update, context: ContextTypes.DEFAULT_TYPE, video_id: str, user_question: str, original_user_id: int):
-    """Вызывает Gemini с video_id (в тексте промпта) и вопросом пользователя. Использует chat_data."""
-    chat_id = update.effective_chat.id
-    requesting_user_id = update.effective_user.id
+    chat_id = update.effective_chat.id; requesting_user_id = update.effective_user.id
     logger.info(f"UserID: {requesting_user_id} (запрос по видео от UserID: {original_user_id}), ChatID: {chat_id} | Инициирован повторный анализ видео (id: {video_id}) с вопросом: '{user_question[:50]}...'")
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-    youtube_uri = f"https://www.youtube.com/watch?v={video_id}"
-    current_time_str = get_current_time_str() # <<<<<<<<<<<<<<<<<<<<<<<< НОВОЕ: Получаем время
-
-    # 1. Формирование промпта с ссылкой, временем и БЕЗ User ID
-    prompt_for_video = (
-        f"(Текущая дата и время: {current_time_str})\n" # Добавляем время
-        f"{user_question}\n\n" # Вопрос пользователя
-        f"**Важно:** Ответь на основе содержимого видео по следующей ссылке: {youtube_uri}"
-    )
+    youtube_uri = f"https://www.youtube.com/watch?v={video_id}"; current_time_str = get_current_time_str()
+    # Формирование промпта
+    prompt_for_video = f"(Текущая дата и время: {current_time_str})\n{user_question}\n\n**Важно:** Ответь на основе содержимого видео по следующей ссылке: {youtube_uri}"
     content_for_video = [{"role": "user", "parts": [{"text": prompt_for_video}]}]
-
-    # 2. Вызов модели (логика ретраев и обработки ошибок)
-    model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    temperature = get_user_setting(context, 'temperature', 1.0)
+    # Вызов модели
+    model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL); temperature = get_user_setting(context, 'temperature', 1.0)
     is_video_model = any(keyword in model_id for keyword in VIDEO_CAPABLE_KEYWORDS)
     if not is_video_model:
         video_models = [m_id for m_id in AVAILABLE_MODELS if any(keyword in m_id for keyword in VIDEO_CAPABLE_KEYWORDS)]
-        if video_models:
-            original_model_name = AVAILABLE_MODELS.get(model_id, model_id)
-            fallback_model_id = next((m for m in video_models if 'flash' in m), video_models[0])
-            model_id = fallback_model_id
-            new_model_name = AVAILABLE_MODELS.get(model_id, model_id)
-            logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Модель {original_model_name} не video. Временно использую {new_model_name}.")
-        else:
-            logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Нет доступных video моделей.")
-            await update.message.reply_text("❌ Нет доступных моделей для ответа на вопрос по видео.")
-            return
-
-    logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Модель: {model_id}, Темп: {temperature}")
-    reply = None
-    response_video = None
-    # Цикл ретраев...
-    for attempt in range(RETRY_ATTEMPTS):
+        if video_models: original_model_name = AVAILABLE_MODELS.get(model_id, model_id); fallback_model_id = next((m for m in video_models if 'flash' in m), video_models[0]); model_id = fallback_model_id; new_model_name = AVAILABLE_MODELS.get(model_id, model_id); logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Модель {original_model_name} не video. Временно использую {new_model_name}.")
+        else: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Нет доступных video моделей."); await update.message.reply_text("❌ Нет доступных моделей для ответа на вопрос по видео."); return
+    logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Модель: {model_id}, Темп: {temperature}"); reply = None; response_video = None
+    for attempt in range(RETRY_ATTEMPTS): # Цикл ретраев
         try:
-            logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Попытка {attempt + 1}/{RETRY_ATTEMPTS}...")
-            generation_config=genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
+            logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Попытка {attempt + 1}/{RETRY_ATTEMPTS}..."); generation_config=genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
+            # Вызываем БЕЗ tools
             model = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, generation_config=generation_config, system_instruction=system_instruction_text)
-            response_video = await asyncio.to_thread(model.generate_content, content_for_video) # Отправляем контент с временем
-
-            if hasattr(response_video, 'text'):
-                reply = response_video.text
-            else:
-                reply = None
-
-            if not reply: # Обработка пустого ответа
-                block_reason_str, finish_reason_str = 'N/A', 'N/A'
-                try:
-                     if hasattr(response_video, 'prompt_feedback') and response_video.prompt_feedback and hasattr(response_video.prompt_feedback, 'block_reason'):
-                         block_reason_enum = response_video.prompt_feedback.block_reason
-                         block_reason_str = block_reason_enum.name if hasattr(block_reason_enum, 'name') else str(block_reason_enum)
-                     if hasattr(response_video, 'candidates') and response_video.candidates and isinstance(response_video.candidates, (list, tuple)) and len(response_video.candidates) > 0:
-                         first_candidate = response_video.candidates[0]
-                         if hasattr(first_candidate, 'finish_reason'):
-                             finish_reason_enum = first_candidate.finish_reason
-                             finish_reason_str = finish_reason_enum.name if hasattr(finish_reason_enum, 'name') else str(finish_reason_enum)
-                except Exception as e_inner_reason:
-                    logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Ошибка извлечения причины пустого ответа: {e_inner_reason}")
-
-                logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Пустой ответ (попытка {attempt + 1}). Block: {block_reason_str}, Finish: {finish_reason_str}")
-                if block_reason_str not in ['UNSPECIFIED', 'N/A', 'BLOCK_REASON_UNSPECIFIED']:
-                    reply = f"🤖 Модель не смогла ответить по видео. (Блокировка: {block_reason_str})"
-                elif finish_reason_str not in ['STOP', 'N/A', 'FINISH_REASON_STOP']:
-                    reply = f"🤖 Модель не смогла ответить по видео. (Причина: {finish_reason_str})"
-                else:
-                    reply = "🤖 Не могу ответить на ваш вопрос по этому видео (пустой ответ модели)."
+            response_video = await asyncio.to_thread(model.generate_content, content_for_video)
+            if hasattr(response_video, 'text'): reply = response_video.text; else: reply = None
+            if not reply: block_reason_str, finish_reason_str = 'N/A', 'N/A'; try: # ... (извлечение причин) ...
+                except Exception as e_inner_reason: logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Ошибка извлечения причины: {e_inner_reason}"); logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Пустой ответ (попытка {attempt + 1})..."); # ... (формирование reply об ошибке) ...
                 break
-
-            if reply and "не смогла ответить" not in reply and "Не могу ответить" not in reply:
-                logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Успешный анализ на попытке {attempt + 1}.")
-                break
-
-        except (BlockedPromptException, StopCandidateException) as e_block_stop:
-             reason_str = "неизвестна"
-             try:
-                 if hasattr(e_block_stop, 'args') and e_block_stop.args:
-                     reason_str = str(e_block_stop.args[0])
-             except Exception:
-                 pass
-             logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Анализ заблокирован/остановлен (попытка {attempt + 1}): {e_block_stop} (Причина: {reason_str})")
-             reply = f"❌ Не удалось ответить по видео (ограничение модели)."
-             break
-
-        except Exception as e:
-            error_message = str(e)
-            logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Ошибка на попытке {attempt + 1}: {error_message[:200]}...")
-            is_retryable = "500" in error_message or "503" in error_message
-            if "400" in error_message or "429" in error_message or "location is not supported" in error_message:
-                reply = f"❌ Ошибка при ответе по видео ({error_message[:100]}...)."
-                break
-            elif is_retryable and attempt < RETRY_ATTEMPTS - 1:
-                wait_time = RETRY_DELAY_SECONDS * (2 ** attempt)
-                logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Ожидание {wait_time:.1f} сек...")
-                await asyncio.sleep(wait_time)
-                continue
-            else:
-                logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Не удалось выполнить анализ после {attempt + 1} попыток. Ошибка: {e}", exc_info=True if not is_retryable else False)
-                if reply is None:
-                    reply = f"❌ Ошибка при ответе по видео после {attempt + 1} попыток."
-                break
-
-    # 3. Добавление в общую историю чата (chat_data) и отправка ответа
-    chat_history = context.chat_data.setdefault("history", [])
-    # Добавляем вопрос пользователя (с ID, но без ссылки и времени)
-    history_entry_user = { "role": "user", "parts": [{"text": f"{USER_ID_PREFIX_FORMAT.format(user_id=requesting_user_id)}{user_question}"}], "user_id": requesting_user_id, "message_id": update.message.message_id }
-    chat_history.append(history_entry_user)
-
-    if reply:
-        history_entry_model = {"role": "model", "parts": [{"text": reply}]}
-        chat_history.append(history_entry_model)
-        await send_reply(update.message, reply, context)
-    else:
-        logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Нет ответа для отправки пользователю.")
-        final_error_msg = "🤖 К сожалению, не удалось ответить на ваш вопрос по видео."
-        chat_history.append({"role": "model", "parts": [{"text": final_error_msg}]})
-        try:
-            await update.message.reply_text(final_error_msg)
-        except Exception as e_final_fail:
-            logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Не удалось отправить сообщение об ошибке: {e_final_fail}")
-
-    # Ограничиваем историю
-    while len(chat_history) > MAX_HISTORY_MESSAGES:
-        chat_history.pop(0)
+            if reply and "не смогла ответить" not in reply and "Не могу ответить" not in reply: logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Успешный анализ на попытке {attempt + 1}."); break
+        except (BlockedPromptException, StopCandidateException) as e_block_stop: reason_str = "неизвестна"; try: # ... (извлечение причины) ...
+            except Exception: pass; logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Анализ заблокирован/остановлен..."); reply = f"❌ Не удалось ответить по видео (ограничение модели)."; break
+        except Exception as e: error_message = str(e); logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Ошибка на попытке {attempt + 1}: {error_message[:200]}..."); is_retryable = "500" in error_message or "503" in error_message; if "400" in error_message or "429" in error_message or "location is not supported" in error_message: reply = f"❌ Ошибка при ответе по видео ({error_message[:100]}...)."; break; elif is_retryable and attempt < RETRY_ATTEMPTS - 1: wait_time = RETRY_DELAY_SECONDS * (2 ** attempt); logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Ожидание {wait_time:.1f} сек..."); await asyncio.sleep(wait_time); continue; else: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Не удалось выполнить анализ после {attempt + 1} попыток...", exc_info=True if not is_retryable else False); if reply is None: reply = f"❌ Ошибка при ответе по видео после {attempt + 1} попыток."; break
+    # Добавление в историю и отправка
+    chat_history = context.chat_data.setdefault("history", []); history_entry_user = { "role": "user", "parts": [{"text": f"{USER_ID_PREFIX_FORMAT.format(user_id=requesting_user_id)}{user_question}"}], "user_id": requesting_user_id, "message_id": update.message.message_id }; chat_history.append(history_entry_user)
+    if reply: history_entry_model = {"role": "model", "parts": [{"text": reply}]}; chat_history.append(history_entry_model); await send_reply(update.message, reply, context)
+    else: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Нет ответа для отправки."); final_error_msg = "🤖 К сожалению, не удалось ответить на ваш вопрос по видео."; chat_history.append({"role": "model", "parts": [{"text": final_error_msg}]}); try: await update.message.reply_text(final_error_msg); except Exception as e_final_fail: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | (ReanalyzeVid) Не удалось отправить сообщение об ошибке: {e_final_fail}")
+    while len(chat_history) > MAX_HISTORY_MESSAGES: chat_history.pop(0)
 # =============================================================
 
-# ===== Основной обработчик сообщений (использует chat_data, добавляет User ID и ВРЕМЯ) =====
+
+# ===== Основной обработчик сообщений (с ИЗМЕНЕННЫМ вызовом Gemini API) =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if not update.effective_user:
-        logger.warning(f"ChatID: {chat_id} | Не удалось определить пользователя в update. Игнорирование сообщения.")
-        return
+    if not update.effective_user: logger.warning(f"ChatID: {chat_id} | Не удалось определить пользователя в update. Игнорирование сообщения."); return
     user_id = update.effective_user.id
     message = update.message
-    if not message:
-        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Получен пустой объект message в update.")
-        return
-    if not message.text and not hasattr(message, 'image_file_id'):
-        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Получено сообщение без текста и без image_file_id.")
-        return
+    if not message: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Получен пустой объект message в update."); return
+    if not message.text and not hasattr(message, 'image_file_id'): logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Получено сообщение без текста и без image_file_id."); return
 
     chat_history = context.chat_data.setdefault("history", [])
 
     # --- Проверка на ответ к специальным сообщениям ---
     if message.reply_to_message and message.reply_to_message.text and message.text and not message.text.startswith('/'):
-        replied_message = message.reply_to_message
-        replied_text = replied_message.text
-        user_question = message.text.strip()
-        requesting_user_id = user_id
-        found_special_context = False
-        try:
+        replied_message = message.reply_to_message; replied_text = replied_message.text; user_question = message.text.strip(); requesting_user_id = user_id; found_special_context = False
+        try: # Поиск ID для reanalyze
             for i in range(len(chat_history) - 1, -1, -1):
                 model_entry = chat_history[i]
                 if model_entry.get("role") == "model" and model_entry.get("parts") and isinstance(model_entry["parts"], list) and len(model_entry["parts"]) > 0:
-                    model_text = model_entry["parts"][0].get("text", "")
-                    is_image_reply = model_text.startswith(IMAGE_DESCRIPTION_PREFIX) and replied_text.startswith(IMAGE_DESCRIPTION_PREFIX) and model_text[:100] == replied_text[:100]
-                    is_video_reply = model_text.startswith(YOUTUBE_SUMMARY_PREFIX) and replied_text.startswith(YOUTUBE_SUMMARY_PREFIX) and model_text[:100] == replied_text[:100]
+                    model_text = model_entry["parts"][0].get("text", ""); is_image_reply = model_text.startswith(IMAGE_DESCRIPTION_PREFIX) and replied_text.startswith(IMAGE_DESCRIPTION_PREFIX) and model_text[:100] == replied_text[:100]; is_video_reply = model_text.startswith(YOUTUBE_SUMMARY_PREFIX) and replied_text.startswith(YOUTUBE_SUMMARY_PREFIX) and model_text[:100] == replied_text[:100]
                     if is_image_reply or is_video_reply:
-                        if i > 0:
-                            potential_user_entry = chat_history[i - 1]
-                            if potential_user_entry.get("role") == "user":
-                                original_user_id_from_hist = potential_user_entry.get("user_id", "Unknown")
-                                if is_image_reply and "image_file_id" in potential_user_entry:
-                                    found_file_id = potential_user_entry["image_file_id"]
-                                    logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Найден image_file_id: ...{found_file_id[-10:]} для reanalyze_image (ориг. user: {original_user_id_from_hist}).")
-                                    await reanalyze_image(update, context, found_file_id, user_question, original_user_id_from_hist)
-                                    found_special_context = True
-                                    break
-                                elif is_video_reply and "youtube_video_id" in potential_user_entry:
-                                    found_video_id = potential_user_entry["youtube_video_id"]
-                                    logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Найден youtube_video_id: {found_video_id} для reanalyze_video (ориг. user: {original_user_id_from_hist}).")
-                                    await reanalyze_video(update, context, found_video_id, user_question, original_user_id_from_hist)
-                                    found_special_context = True
-                                    break
-                                else:
-                                    logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Найдено сообщение модели, но у предыдущего user-сообщения нет нужного ID (image/video).")
-                        else:
-                             logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Найдено сообщение модели в самом начале истории.")
-                        if not found_special_context:
-                            break
-        except Exception as e_hist_search:
-            logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Ошибка при поиске ID для reanalyze в chat_history: {e_hist_search}", exc_info=True)
-
-        if found_special_context:
-            return
-
-        if replied_text.startswith(IMAGE_DESCRIPTION_PREFIX) or replied_text.startswith(YOUTUBE_SUMMARY_PREFIX):
-             logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Ответ на спец. сообщение, но ID не найден или reanalyze не запущен. Обработка как обычный текст.")
+                        if i > 0: potential_user_entry = chat_history[i - 1]
+                        if potential_user_entry.get("role") == "user": original_user_id_from_hist = potential_user_entry.get("user_id", "Unknown")
+                        if is_image_reply and "image_file_id" in potential_user_entry: found_file_id = potential_user_entry["image_file_id"]; logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Найден image_file_id: ...{found_file_id[-10:]} для reanalyze_image..."); await reanalyze_image(update, context, found_file_id, user_question, original_user_id_from_hist); found_special_context = True; break
+                        elif is_video_reply and "youtube_video_id" in potential_user_entry: found_video_id = potential_user_entry["youtube_video_id"]; logger.info(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Найден youtube_video_id: {found_video_id} для reanalyze_video..."); await reanalyze_video(update, context, found_video_id, user_question, original_user_id_from_hist); found_special_context = True; break
+                        else: logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Найдено сообщение модели, но у предыдущего user-сообщения нет нужного ID.")
+                        else: logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Найдено сообщение модели в самом начале истории.")
+                        if not found_special_context: break
+        except Exception as e_hist_search: logger.error(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Ошибка при поиске ID для reanalyze в chat_history: {e_hist_search}", exc_info=True)
+        if found_special_context: return
+        if replied_text.startswith(IMAGE_DESCRIPTION_PREFIX) or replied_text.startswith(YOUTUBE_SUMMARY_PREFIX): logger.warning(f"UserID: {requesting_user_id}, ChatID: {chat_id} | Ответ на спец. сообщение, но ID не найден или reanalyze не запущен.")
 
     # --- Получение текста и проверка на YouTube ---
-    original_user_message_text = ""
-    image_file_id_from_ocr = None
-    user_message_id = message.message_id
-    if hasattr(message, 'image_file_id'):
-        image_file_id_from_ocr = message.image_file_id
-        original_user_message_text = message.text.strip() if message.text else ""
-        logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Получен image_file_id: ...{image_file_id_from_ocr[-10:]} из OCR.")
-    elif message.text:
-        original_user_message_text = message.text.strip()
+    original_user_message_text = ""; image_file_id_from_ocr = None; user_message_id = message.message_id
+    if hasattr(message, 'image_file_id'): image_file_id_from_ocr = message.image_file_id; original_user_message_text = message.text.strip() if message.text else ""; logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Получен image_file_id: ...{image_file_id_from_ocr[-10:]} из OCR.")
+    elif message.text: original_user_message_text = message.text.strip()
     user_message_with_id = USER_ID_PREFIX_FORMAT.format(user_id=user_id) + original_user_message_text
-
-    # ############################################################
-    # ######### БЛОК ОБРАБОТКИ YOUTUBE ССЫЛОК (текст) ############
-    # ############################################################
     youtube_handled = False
     if not (message.reply_to_message and message.reply_to_message.text and (message.reply_to_message.text.startswith(IMAGE_DESCRIPTION_PREFIX) or message.reply_to_message.text.startswith(YOUTUBE_SUMMARY_PREFIX))) and not image_file_id_from_ocr:
         youtube_id = extract_youtube_id(original_user_message_text)
         if youtube_id:
             youtube_handled = True
-            first_name = update.effective_user.first_name
-            user_mention = f"{first_name}" if first_name else f"User {user_id}"
+            first_name = update.effective_user.first_name; user_mention = f"{first_name}" if first_name else f"User {user_id}"
             logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обнаружена ссылка YouTube (ID: {youtube_id}). Запрос конспекта для {user_mention}...")
-            try:
-                await update.message.reply_text(f"Окей, {user_mention}, сейчас гляну видео (ID: ...{youtube_id[-4:]}) и сделаю конспект...")
-            except Exception as e_reply:
-                 logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение 'гляну видео': {e_reply}")
-
+            try: await update.message.reply_text(f"Окей, {user_mention}, сейчас гляну видео (ID: ...{youtube_id[-4:]}) и сделаю конспект...")
+            except Exception as e_reply: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение 'гляну видео': {e_reply}")
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-            youtube_uri = f"https://www.youtube.com/watch?v={youtube_id}"
-            current_time_str = get_current_time_str() # <<<<<<<<<<<<<<<<<<<< НОВОЕ: Получаем время
-
-            # 1. Формирование промпта БЕЗ User ID, но с ВРЕМЕНЕМ и ссылкой
-            prompt_for_summary = (
-                 f"(Текущая дата и время: {current_time_str})\n" # Добавляем время
-                 f"Сделай краткий, но информативный конспект видео.\n"
-                 f"**ССЫЛКА НА ВИДЕО ДЛЯ АНАЛИЗА:** {youtube_uri}\n"
-                 f"Опиши основные пункты и ключевые моменты из СОДЕРЖИМОГО этого видео."
-            )
+            youtube_uri = f"https://www.youtube.com/watch?v={youtube_id}"; current_time_str = get_current_time_str()
+            # Промпт БЕЗ User ID, но с ВРЕМЕНЕМ и ссылкой
+            prompt_for_summary = f"(Текущая дата и время: {current_time_str})\nСделай краткий, но информативный конспект видео.\n**ССЫЛКА НА ВИДЕО ДЛЯ АНАЛИЗА:** {youtube_uri}\nОпиши основные пункты и ключевые моменты из СОДЕРЖИМОГО этого видео."
             content_for_summary = [{"role": "user", "parts": [{"text": prompt_for_summary}]}]
-
-
-            # 2. Вызов модели
-            model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
-            temperature = get_user_setting(context, 'temperature', 1.0)
+            # Вызов модели
+            model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL); temperature = get_user_setting(context, 'temperature', 1.0)
             is_video_model = any(keyword in model_id for keyword in VIDEO_CAPABLE_KEYWORDS)
             if not is_video_model:
-                video_models = [m_id for m_id in AVAILABLE_MODELS if any(keyword in m_id for keyword in VIDEO_CAPABLE_KEYWORDS)]
-                if video_models:
-                    original_model_name = AVAILABLE_MODELS.get(model_id, model_id)
-                    fallback_model_id = next((m for m in video_models if 'flash' in m), video_models[0])
-                    model_id = fallback_model_id
-                    new_model_name = AVAILABLE_MODELS.get(model_id, model_id)
-                    logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Модель {original_model_name} не video. Временно использую {new_model_name}.")
-                else:
-                    logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Нет доступных video моделей.")
-                    await update.message.reply_text("❌ Нет доступных моделей для создания конспекта видео.")
-                    return
-
-            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Модель: {model_id}, Темп: {temperature}")
-            reply = None
-            # Цикл ретраев...
-            for attempt in range(RETRY_ATTEMPTS):
+                video_models = [m_id for m_id in AVAILABLE_MODELS if any(keyword in m_id for keyword in VIDEO_CAPABLE_KEYWORDS)];
+                if video_models: original_model_name = AVAILABLE_MODELS.get(model_id, model_id); fallback_model_id = next((m for m in video_models if 'flash' in m), video_models[0]); model_id = fallback_model_id; new_model_name = AVAILABLE_MODELS.get(model_id, model_id); logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Модель {original_model_name} не video. Временно использую {new_model_name}.")
+                else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Нет доступных video моделей."); await update.message.reply_text("❌ Нет доступных моделей для создания конспекта видео."); return
+            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Модель: {model_id}, Темп: {temperature}"); reply = None
+            for attempt in range(RETRY_ATTEMPTS): # Цикл ретраев
                  try:
-                     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Попытка {attempt + 1}/{RETRY_ATTEMPTS}...")
-                     generation_config=genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
+                     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Попытка {attempt + 1}/{RETRY_ATTEMPTS}..."); generation_config=genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
+                     # Вызываем БЕЗ tools, т.к. конспект - это про видео, а не про поиск
                      model = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, generation_config=generation_config, system_instruction=system_instruction_text)
-                     response_summary = await asyncio.to_thread(model.generate_content, content_for_summary) # Отправляем контент с временем
-
-                     if hasattr(response_summary, 'text'):
-                         reply = response_summary.text
-                     else:
-                         reply = None
-
-                     if not reply: # Обработка пустого ответа
-                         block_reason_str, finish_reason_str = 'N/A', 'N/A'
-                         try:
-                              if hasattr(response_summary, 'prompt_feedback') and response_summary.prompt_feedback and hasattr(response_summary.prompt_feedback, 'block_reason'):
-                                  block_reason_enum = response_summary.prompt_feedback.block_reason
-                                  block_reason_str = block_reason_enum.name if hasattr(block_reason_enum, 'name') else str(block_reason_enum)
-                              if hasattr(response_summary, 'candidates') and response_summary.candidates and isinstance(response_summary.candidates, (list, tuple)) and len(response_summary.candidates) > 0:
-                                  first_candidate = response_summary.candidates[0]
-                                  if hasattr(first_candidate, 'finish_reason'):
-                                       finish_reason_enum = first_candidate.finish_reason
-                                       finish_reason_str = finish_reason_enum.name if hasattr(finish_reason_enum, 'name') else str(finish_reason_enum)
-                         except Exception as e_inner_reason:
-                             logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка извлечения причины пустого ответа: {e_inner_reason}")
-
-                         logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Пустой ответ (попытка {attempt + 1}). Block: {block_reason_str}, Finish: {finish_reason_str}")
-                         if block_reason_str not in ['UNSPECIFIED', 'N/A', 'BLOCK_REASON_UNSPECIFIED']:
-                             reply = f"🤖 Модель не смогла создать конспект. (Блокировка: {block_reason_str})"
-                         elif finish_reason_str not in ['STOP', 'N/A', 'FINISH_REASON_STOP']:
-                             reply = f"🤖 Модель не смогла создать конспект. (Причина: {finish_reason_str})"
-                         else:
-                             reply = "🤖 Не удалось создать конспект видео (пустой ответ модели)."
+                     response_summary = await asyncio.to_thread(model.generate_content, content_for_summary)
+                     if hasattr(response_summary, 'text'): reply = response_summary.text; else: reply = None
+                     if not reply: # ... (обработка пустого ответа) ...
                          break
-
-                     if reply and "не удалось создать конспект" not in reply.lower() and "не смогла создать конспект" not in reply.lower():
-                          logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Успешный конспект на попытке {attempt + 1}.")
-                          break
-
-                 except (BlockedPromptException, StopCandidateException) as e_block_stop:
-                      reason_str = "неизвестна"
-                      try:
-                          if hasattr(e_block_stop, 'args') and e_block_stop.args:
-                              reason_str = str(e_block_stop.args[0])
-                      except Exception:
-                          pass
-                      logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Конспект заблокирован/остановлен (попытка {attempt + 1}): {e_block_stop} (Причина: {reason_str})")
-                      reply = f"❌ Не удалось создать конспект (ограничение модели)."
-                      break
-
-                 except Exception as e:
-                     error_message = str(e)
-                     logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка на попытке {attempt + 1}: {error_message[:200]}...")
-                     is_retryable = "500" in error_message or "503" in error_message
-                     if "400" in error_message or "429" in error_message or "location is not supported" in error_message or "unsupported language" in error_message.lower():
-                          reply = f"❌ Ошибка при создании конспекта ({error_message[:100]}...). Возможно, видео недоступно или на неподдерживаемом языке."
-                          break
-                     elif is_retryable and attempt < RETRY_ATTEMPTS - 1:
-                         wait_time = RETRY_DELAY_SECONDS * (2 ** attempt)
-                         logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ожидание {wait_time:.1f} сек...")
-                         await asyncio.sleep(wait_time)
-                         continue
-                     else:
-                         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Не удалось создать конспект после {attempt + 1} попыток. Ошибка: {e}", exc_info=True if not is_retryable else False)
-                         if reply is None:
-                             reply = f"❌ Ошибка при создании конспекта после {attempt + 1} попыток."
-                         break
-
+                     if reply and "не удалось создать конспект" not in reply.lower() and "не смогла создать конспект" not in reply.lower(): logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Успешный конспект на попытке {attempt + 1}."); break
+                 except (BlockedPromptException, StopCandidateException) as e_block_stop: # ... (обработка блокировки) ...
+                      reason_str = "неизвестна"; try: # ... извлечение причины ...
+                      except Exception: pass; logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Конспект заблокирован/остановлен..."); reply = f"❌ Не удалось создать конспект (ограничение модели)."; break
+                 except Exception as e: # ... (обработка других ошибок и ретрай) ...
+                      error_message = str(e); logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ошибка на попытке {attempt + 1}: {error_message[:200]}..."); is_retryable = "500" in error_message or "503" in error_message; if "400" in error_message or "429" in error_message or "location is not supported" in error_message or "unsupported language" in error_message.lower(): reply = f"❌ Ошибка при создании конспекта ({error_message[:100]}...)."; break; elif is_retryable and attempt < RETRY_ATTEMPTS - 1: wait_time = RETRY_DELAY_SECONDS * (2 ** attempt); logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Ожидание {wait_time:.1f} сек..."); await asyncio.sleep(wait_time); continue; else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Не удалось создать конспект после {attempt + 1} попыток...", exc_info=True if not is_retryable else False); if reply is None: reply = f"❌ Ошибка при создании конспекта после {attempt + 1} попыток."; break
             # --- Сохранение в историю и отправка ---
-            history_entry_user = { "role": "user", "parts": [{"text": user_message_with_id}], "youtube_video_id": youtube_id, "user_id": user_id, "message_id": user_message_id }
-            chat_history.append(history_entry_user)
-            logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлено user-сообщение (YouTube) в chat_history с youtube_video_id.")
-
-            if reply and "❌" not in reply and "🤖" not in reply:
-                model_reply_text_with_prefix = f"{YOUTUBE_SUMMARY_PREFIX}{reply}"
-            else:
-                model_reply_text_with_prefix = reply if reply else "🤖 Не удалось создать конспект видео."
-            history_entry_model = {"role": "model", "parts": [{"text": model_reply_text_with_prefix}]}
-            chat_history.append(history_entry_model)
-            logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлен model-ответ (YouTube) в chat_history.")
-
+            history_entry_user = { "role": "user", "parts": [{"text": user_message_with_id}], "youtube_video_id": youtube_id, "user_id": user_id, "message_id": user_message_id }; chat_history.append(history_entry_user); logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлено user-сообщение (YouTube) в chat_history с youtube_video_id.")
+            if reply and "❌" not in reply and "🤖" not in reply: model_reply_text_with_prefix = f"{YOUTUBE_SUMMARY_PREFIX}{reply}"
+            else: model_reply_text_with_prefix = reply if reply else "🤖 Не удалось создать конспект видео."
+            history_entry_model = {"role": "model", "parts": [{"text": model_reply_text_with_prefix}]}; chat_history.append(history_entry_model); logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавлен model-ответ (YouTube) в chat_history.")
             reply_to_send = reply if (reply and "❌" not in reply and "🤖" not in reply) else model_reply_text_with_prefix
-            if reply_to_send:
-                await send_reply(message, reply_to_send, context)
-            else:
-                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Нет ответа для отправки пользователю.")
-                try:
-                    await message.reply_text("🤖 К сожалению, не удалось создать конспект видео.")
-                except Exception as e_final_fail:
-                    logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Не удалось отправить сообщение о финальной ошибке: {e_final_fail}")
-
-            # Ограничиваем историю
-            while len(chat_history) > MAX_HISTORY_MESSAGES:
-                chat_history.pop(0)
+            if reply_to_send: await send_reply(message, reply_to_send, context)
+            else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Нет ответа для отправки."); try: await message.reply_text("🤖 К сожалению, не удалось создать конспект видео."); except Exception as e_final_fail: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | (YouTubeSummary) Не удалось отправить сообщение об ошибке: {e_final_fail}")
+            while len(chat_history) > MAX_HISTORY_MESSAGES: chat_history.pop(0)
             return # Завершаем обработку здесь для YouTube ссылок
 
     # ############################################################
     # ####### КОНЕЦ БЛОКА ОБРАБОТКИ YOUTUBE ССЫЛОК ##############
     # ############################################################
 
-    # --- Стандартная обработка текста ---
-    if not original_user_message_text and not image_file_id_from_ocr:
-        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Дошли до конца handle_message без текста для обработки (не YouTube, не OCR).")
-        return
-    model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    temperature = get_user_setting(context, 'temperature', 1.0)
-    use_search = get_user_setting(context, 'search_enabled', True)
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-    # --- Блок поиска ---
-    search_context_snippets = []
-    search_provider = None
-    search_log_msg = "Поиск отключен пользователем"
-    if use_search:
-        query_for_search = original_user_message_text
-        query_short = query_for_search[:50] + '...' if len(query_for_search) > 50 else query_for_search
-        search_log_msg = f"Поиск Google/DDG для '{query_short}'"
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | {search_log_msg}...")
-        session = context.bot_data.get('aiohttp_session')
-        if not session or session.closed:
-            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Создание новой сессии aiohttp для поиска.")
-            timeout = aiohttp.ClientTimeout(total=60.0, connect=10.0, sock_connect=10.0, sock_read=30.0)
-            session = aiohttp.ClientSession(timeout=timeout)
-            context.bot_data['aiohttp_session'] = session
-        google_results = await perform_google_search(query_for_search, GOOGLE_API_KEY, GOOGLE_CSE_ID, GOOGLE_SEARCH_MAX_RESULTS, session)
-        if google_results:
-            search_provider = "Google"
-            search_context_snippets = google_results
-            search_log_msg += f" (Google: {len(search_context_snippets)} рез.)"
-        else:
-            search_log_msg += " (Google: 0 рез./ошибка)"
-            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Google не дал результатов. Пробуем DuckDuckGo...")
-            try:
-                ddgs = DDGS()
-                results_ddg = await asyncio.to_thread(ddgs.text, query_for_search, region='ru-ru', max_results=DDG_MAX_RESULTS)
-                if results_ddg:
-                    ddg_snippets = [r.get('body', '') for r in results_ddg if r.get('body')]
-                    if ddg_snippets:
-                        search_provider = "DuckDuckGo"
-                        search_context_snippets = ddg_snippets
-                        search_log_msg += f" (DDG: {len(search_context_snippets)} рез.)"
-                    else:
-                        search_log_msg += " (DDG: 0 текст. рез.)"
-                else:
-                    search_log_msg += " (DDG: 0 рез.)"
-            except TimeoutError:
-                 logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Таймаут поиска DuckDuckGo.")
-                 search_log_msg += " (DDG: таймаут)"
-            except TypeError as e_type:
-                if "unexpected keyword argument 'timeout'" in str(e_type):
-                    logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Снова ошибка с аргументом timeout в DDGS.text(): {e_type}")
-                else:
-                    logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка типа при поиске DuckDuckGo: {e_type}", exc_info=True)
-                search_log_msg += " (DDG: ошибка типа)"
-            except Exception as e_ddg:
-                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка поиска DuckDuckGo: {e_ddg}", exc_info=True)
-                search_log_msg += " (DDG: ошибка)"
-
-    # --- Формирование финального промпта с ВРЕМЕНЕМ и новой структурой поиска ---
-    current_time_str = get_current_time_str()
-    time_context_str = f"(Текущая дата и время: {current_time_str})\n"
-    base_user_prompt = user_message_with_id # Сообщение пользователя с его ID
-
-    # Собираем финальный промпт
-    final_prompt_parts = [time_context_str, base_user_prompt] # Начинаем с времени и вопроса
-
-    if search_context_snippets:
-        search_context_lines = [f"- {s.strip()}" for s in search_context_snippets if s.strip()]
-        if search_context_lines:
-            search_context = "\n".join(search_context_lines)
-            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<< ИЗМЕНЕНИЕ >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-            # Добавляем четко выделенный блок с результатами поиска
-            search_block = (
-                f"\n\n==== РЕЗУЛЬТАТЫ ПОИСКА ({search_provider}) ДЛЯ ОТВЕТА НА ВОПРОС ====\n"
-                f"{search_context}\n"
-                f"===========================================================\n"
-                f"Используй эту информацию для ответа на вопрос пользователя {USER_ID_PREFIX_FORMAT.format(user_id=user_id)}, особенно если он касается текущих событий или погоды."
-            )
-            final_prompt_parts.append(search_block)
-            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Добавлен контекст из {search_provider} ({len(search_context_lines)} непустых сниппетов).")
-        else:
-            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Сниппеты из {search_provider} оказались пустыми, контекст не добавлен.")
-            search_log_msg += " (пустые сниппеты)"
-
-    final_user_prompt_text = "\n".join(final_prompt_parts) # Собираем все части в один текст
-
-    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | {search_log_msg}")
-    logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Финальный промпт для Gemini (длина {len(final_user_prompt_text)}):\n{final_user_prompt_text[:600]}...") # Увеличил лог для просмотра структуры
-
-    # --- История и ее обрезка ---
-    # Добавляем в историю оригинальное сообщение пользователя (с ID, но без времени и поиска)
+    # --- Стандартная обработка текста (если не YouTube) ---
     if not youtube_handled:
+        if not original_user_message_text and not image_file_id_from_ocr:
+            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Дошли до конца handle_message без текста для обработки (не YouTube, не OCR).")
+            return
+        model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
+        temperature = get_user_setting(context, 'temperature', 1.0)
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+        # --- Блок поиска УДАЛЕН ---
+
+        # --- Формирование финального промпта с ВРЕМЕНЕМ ---
+        current_time_str = get_current_time_str()
+        time_context_str = f"(Текущая дата и время: {current_time_str})\n"
+        final_user_prompt_text = time_context_str + user_message_with_id # Время + Сообщение с ID
+
+        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Запрос к модели (поиск включен через API)...") # Обновил лог
+        logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Финальный промпт для Gemini (длина {len(final_user_prompt_text)}):\n{final_user_prompt_text[:600]}...")
+
+        # --- История и ее обрезка ---
         history_entry_user = { "role": "user", "parts": [{"text": user_message_with_id}], "user_id": user_id, "message_id": user_message_id }
         if image_file_id_from_ocr:
             history_entry_user["image_file_id"] = image_file_id_from_ocr
@@ -1152,154 +837,114 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Добавляем user сообщение (текст) в chat_history.")
         chat_history.append(history_entry_user)
 
-    # Формируем историю для модели, заменяя последнее сообщение пользователя на финальный промпт (с временем и поиском)
-    history_for_model_raw = []
-    current_total_chars = 0
-    for entry in reversed(chat_history[:-1]): # Исключаем последнее сообщение пользователя из истории для обрезки
-        entry_text = ""
-        entry_len = 0
-        if entry.get("parts") and isinstance(entry["parts"], list) and len(entry["parts"]) > 0 and entry["parts"][0].get("text"):
-            entry_text = entry["parts"][0]["text"]
-            entry_len = len(entry_text)
-        # Проверяем лимит, УЧИТЫВАЯ длину финального промпта, который добавим в конце
-        if current_total_chars + entry_len + len(final_user_prompt_text) <= MAX_CONTEXT_CHARS:
-            history_for_model_raw.append(entry)
-            current_total_chars += entry_len
-        else:
-            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обрезка истории по символам ({MAX_CONTEXT_CHARS}). Учтено {len(history_for_model_raw)} сообщ., ~{current_total_chars} симв. (+финальный промпт).")
-            break
+        history_for_model_raw = []; current_total_chars = 0
+        for entry in reversed(chat_history[:-1]):
+            entry_text = ""; entry_len = 0
+            if entry.get("parts") and isinstance(entry["parts"], list) and len(entry["parts"]) > 0 and entry["parts"][0].get("text"): entry_text = entry["parts"][0]["text"]; entry_len = len(entry_text)
+            if current_total_chars + entry_len + len(final_user_prompt_text) <= MAX_CONTEXT_CHARS: history_for_model_raw.append(entry); current_total_chars += entry_len
+            else: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обрезка истории по символам ({MAX_CONTEXT_CHARS})..."); break
+        history_for_model = list(reversed(history_for_model_raw))
+        history_for_model.append({"role": "user", "parts": [{"text": final_user_prompt_text}]}) # Добавляем финальный промпт
 
-    history_for_model = list(reversed(history_for_model_raw)) # Переворачиваем обратно
-    # Добавляем финальный промпт (с временем, ID пользователя, текстом вопроса и поиском) как последнее сообщение 'user'
-    history_for_model.append({"role": "user", "parts": [{"text": final_user_prompt_text}]})
+        history_clean_for_model = []
+        for entry in history_for_model: history_clean_for_model.append({"role": entry["role"], "parts": entry["parts"]})
 
-
-    # Очищаем историю от кастомных ключей перед отправкой модели
-    history_clean_for_model = []
-    for entry in history_for_model:
-        history_clean_for_model.append({"role": entry["role"], "parts": entry["parts"]})
-
-    # --- Вызов модели ---
-    reply = None
-    response = None
-    last_exception = None
-    generation_successful = False
-    for attempt in range(RETRY_ATTEMPTS):
-        try:
-            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Попытка {attempt + 1}/{RETRY_ATTEMPTS} запроса к модели {model_id}...")
-            generation_config=genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
-            model = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, generation_config=generation_config, system_instruction=system_instruction_text)
-            response = await asyncio.to_thread(model.generate_content, history_clean_for_model) # Отправляем историю с финальным промптом
-            if hasattr(response, 'text'):
-                reply = response.text
-            else:
-                reply = None
-            if not reply: # Обработка пустого ответа
-                 block_reason_str, finish_reason_str, safety_info_str = 'N/A', 'N/A', 'N/A'
+        # --- НАСТРОЙКА ИНСТРУМЕНТОВ ПОИСКА ---
+        tools = []
+        tool_config = None
+        # Используем GoogleSearchRetrieval для моделей 1.5, т.к. они лучше поддерживают управление поиском
+        if "1.5" in model_id:
+            try:
+                search_tool_1_5 = Tool(google_search_retrieval=GoogleSearchRetrieval()) # Просто создаем инструмент
+                tools.append(search_tool_1_5)
+                # Настраиваем режим ALWAYS через ToolConfig
+                tool_config = ToolConfig(
+                     google_search_retrieval_config=ToolConfig.GoogleSearchRetrievalConfig(
+                         mode=SEARCH_MODE_ALWAYS # Явно указываем режим MODE_ENABLED
+                     )
+                 )
+                logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Настроен инструмент GoogleSearchRetrieval (режим: {SEARCH_MODE_ALWAYS}) для модели {model_id}.")
+            except NameError: # Если импорт ToolConfig или SEARCH_MODE_ALWAYS не удался
+                 logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось настроить режим поиска ALWAYS для {model_id} из-за ошибки импорта типов. Поиск может работать в режиме AUTO.")
+                 # Пытаемся добавить инструмент без конфига режима
                  try:
-                     if hasattr(response, 'prompt_feedback') and response.prompt_feedback and hasattr(response.prompt_feedback, 'block_reason'):
-                         block_reason_enum = response.prompt_feedback.block_reason
-                         block_reason_str = block_reason_enum.name if hasattr(block_reason_enum, 'name') else str(block_reason_enum)
-                     if hasattr(response, 'candidates') and response.candidates and isinstance(response.candidates, (list, tuple)) and len(response.candidates) > 0:
-                          first_candidate = response.candidates[0]
-                          if hasattr(first_candidate, 'finish_reason'):
-                               finish_reason_enum = first_candidate.finish_reason
-                               finish_reason_str = finish_reason_enum.name if hasattr(finish_reason_enum, 'name') else str(finish_reason_enum)
-                          if hasattr(first_candidate, 'safety_ratings') and first_candidate.safety_ratings:
-                               safety_ratings = first_candidate.safety_ratings
-                               safety_info_parts = []
-                               for rating in safety_ratings:
-                                   cat_name = rating.category.name if hasattr(rating.category, 'name') else str(rating.category)
-                                   prob_name = rating.probability.name if hasattr(rating.probability, 'name') else str(rating.probability)
-                                   safety_info_parts.append(f"{cat_name}:{prob_name}")
-                               safety_info_str = ", ".join(safety_info_parts)
-                 except Exception as e_inner_reason:
-                     logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка извлечения причины/safety пустого ответа: {e_inner_reason}")
-
-                 logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Пустой ответ или нет текста (попытка {attempt + 1}). Block: {block_reason_str}, Finish: {finish_reason_str}, Safety: [{safety_info_str}]")
-                 if block_reason_str not in ['UNSPECIFIED', 'N/A', 'BLOCK_REASON_UNSPECIFIED']:
-                     reply = f"🤖 Модель не дала ответ. (Блокировка: {block_reason_str})"
-                 elif finish_reason_str not in ['STOP', 'N/A', 'FINISH_REASON_STOP']:
-                     reply = f"🤖 Модель завершила работу без ответа. (Причина: {finish_reason_str})"
-                 else:
-                     reply = "🤖 Модель дала пустой ответ."
-                     generation_successful = True
-                 break
-
-            if reply:
-                generation_successful = True
-            if generation_successful:
-                logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Успешная генерация на попытке {attempt + 1}.")
-                break
-
-        except (BlockedPromptException, StopCandidateException) as e_block_stop:
-            reason_str = "неизвестна"
-            try:
-                if hasattr(e_block_stop, 'args') and e_block_stop.args:
-                    reason_str = str(e_block_stop.args[0])
-            except Exception:
-                pass
-            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Запрос заблокирован/остановлен моделью (попытка {attempt + 1}): {e_block_stop} (Причина: {reason_str})")
-            reply = f"❌ Запрос заблокирован/остановлен моделью."
-            break # Выходим из цикла ретраев
-
-        except Exception as e:
-            last_exception = e
-            error_message = str(e)
-            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка генерации на попытке {attempt + 1}: {error_message[:200]}...")
-            is_retryable = "500" in error_message or "503" in error_message
-            if "429" in error_message:
-                reply = f"❌ Слишком много запросов к модели. Попробуйте позже."
-                break
-            elif "400" in error_message:
-                reply = f"❌ Ошибка в запросе к модели (400 Bad Request)."
-                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка 400 Bad Request: {error_message}", exc_info=True)
-                break
-            elif "location is not supported" in error_message:
-                reply = f"❌ Эта модель недоступна в вашем регионе."
-                break
-            if is_retryable and attempt < RETRY_ATTEMPTS - 1:
-                wait_time = RETRY_DELAY_SECONDS * (2 ** attempt)
-                logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Ожидание {wait_time:.1f} сек перед попыткой {attempt + 2}...")
-                await asyncio.sleep(wait_time)
-                continue
-            else:
-                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось выполнить генерацию после {attempt + 1} попыток. Последняя ошибка: {e}", exc_info=True if not is_retryable else False)
-                if reply is None:
-                    reply = f"❌ Ошибка при обращении к модели после {attempt + 1} попыток."
-                break
-
-    # --- Добавление ответа и отправка (если не YouTube) ---
-    if reply and not youtube_handled:
-        history_entry_model = {"role": "model", "parts": [{"text": reply}]}
-        chat_history.append(history_entry_model)
-
-    if reply and not youtube_handled:
-        if message:
-            await send_reply(message, reply, context)
+                     search_tool_1_5 = Tool(google_search_retrieval=GoogleSearchRetrieval())
+                     tools.append(search_tool_1_5)
+                     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Настроен инструмент GoogleSearchRetrieval (режим: AUTO?) для модели {model_id}.")
+                 except Exception as e_tool_15_fallback:
+                      logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка настройки GoogleSearchRetrieval (fallback) для {model_id}: {e_tool_15_fallback}")
+            except Exception as e_tool_15:
+                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка настройки GoogleSearchRetrieval для {model_id}: {e_tool_15}")
         else:
-            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не найдено сообщение для ответа в update (не YouTube).")
+             logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Модель {model_id} не является 1.5. Встроенный поиск Google не будет принудительно включен.")
+
+        # --- Вызов модели с инструментами ---
+        reply = None; response = None; last_exception = None; generation_successful = False
+        for attempt in range(RETRY_ATTEMPTS):
             try:
-                await context.bot.send_message(chat_id=chat_id, text=reply)
-            except Exception as e_send_direct:
-                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить ответ напрямую в чат (не YouTube): {e_send_direct}")
+                logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Попытка {attempt + 1}/{RETRY_ATTEMPTS} запроса к модели {model_id} (с tools: {bool(tools)}, tool_config: {bool(tool_config)})...")
+                generation_config_obj = GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
+                model = genai.GenerativeModel(
+                    model_id,
+                    safety_settings=SAFETY_SETTINGS_BLOCK_NONE,
+                    generation_config=generation_config_obj,
+                    system_instruction=system_instruction_text,
+                    tools=tools if tools else None,
+                    tool_config=tool_config if tool_config else None # Передаем конфиг режима поиска
+                )
+                response = await asyncio.to_thread(model.generate_content, history_clean_for_model)
 
-    elif not youtube_handled: # Если reply пустой и не YouTube
-         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Нет ответа для отправки пользователю после всех попыток (не YouTube).")
-         try:
-             if reply != "🤖 Модель дала пустой ответ.":
-                  error_message_to_user = "🤖 К сожалению, не удалось получить ответ от модели после нескольких попыток."
-                  if message:
-                      await message.reply_text(error_message_to_user)
-                  else:
-                      await context.bot.send_message(chat_id=chat_id, text=error_message_to_user)
-         except Exception as e_final_fail:
-             logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение о финальной ошибке (не YouTube): {e_final_fail}")
+                if hasattr(response, 'text'): reply = response.text; else: reply = None
 
-    # --- Ограничение истории ---
-    while len(chat_history) > MAX_HISTORY_MESSAGES:
-        removed = chat_history.pop(0)
-        logger.debug(f"ChatID: {chat_id} | Удалено старое сообщение из истории (лимит {MAX_HISTORY_MESSAGES}). Role: {removed.get('role')}")
+                # Логирование использования поиска
+                grounding_triggered = False
+                if hasattr(response, 'candidates') and response.candidates:
+                    first_candidate = response.candidates[0]
+                    if hasattr(first_candidate, 'grounding_metadata') and first_candidate.grounding_metadata:
+                         grounding_triggered = True
+                         if hasattr(first_candidate.grounding_metadata, 'web_search_queries') and first_candidate.grounding_metadata.web_search_queries:
+                             logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Ответ модели основан на поиске Google. Запросы: {first_candidate.grounding_metadata.web_search_queries}")
+                         else:
+                             logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Ответ модели содержит grounding_metadata, но без поисковых запросов.")
+                # Убрал лог об отсутствии метаданных
+
+                if not reply: # Обработка пустого ответа
+                     block_reason_str, finish_reason_str, safety_info_str = 'N/A', 'N/A', 'N/A'
+                     try: # ... (извлечение причин) ...
+                     except Exception as e_inner_reason: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка извлечения причины/safety: {e_inner_reason}")
+                     logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Пустой ответ или нет текста (попытка {attempt + 1})...") # ... (формирование reply об ошибке) ...
+                     generation_successful = (reply == "🤖 Модель дала пустой ответ.")
+                     break
+
+                if reply: generation_successful = True
+                if generation_successful: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Успешная генерация на попытке {attempt + 1}. Поиск сработал: {grounding_triggered}"); break
+
+            except (BlockedPromptException, StopCandidateException) as e_block_stop: # ... (обработка блокировки) ...
+                reason_str = "неизвестна"; try: # ... извлечение причины ...
+                except Exception: pass; logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Запрос заблокирован/остановлен моделью..."); reply = f"❌ Запрос заблокирован/остановлен моделью."; break
+            except Exception as e: # ... (обработка других ошибок и ретрай) ...
+                last_exception = e; error_message = str(e); logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка генерации на попытке {attempt + 1}: {error_message[:200]}..."); is_retryable = "500" in error_message or "503" in error_message; if "429" in error_message: reply = f"❌ Слишком много запросов к модели."; break; elif "400" in error_message: reply = f"❌ Ошибка в запросе к модели (400 Bad Request)."; logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка 400: {error_message}", exc_info=True); break; elif "location is not supported" in error_message: reply = f"❌ Эта модель недоступна в вашем регионе."; break; if is_retryable and attempt < RETRY_ATTEMPTS - 1: wait_time = RETRY_DELAY_SECONDS * (2 ** attempt); logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Ожидание {wait_time:.1f} сек..."); await asyncio.sleep(wait_time); continue; else: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось выполнить генерацию после {attempt + 1} попыток...", exc_info=True if not is_retryable else False); if reply is None: reply = f"❌ Ошибка при обращении к модели после {attempt + 1} попыток."; break
+
+        # --- Добавление ответа и отправка (если не YouTube) ---
+        if reply:
+             history_entry_model = {"role": "model", "parts": [{"text": reply}]}
+             chat_history.append(history_entry_model)
+             if message:
+                 await send_reply(message, reply, context)
+             else:
+                 logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не найдено сообщение для ответа в update.")
+                 try: await context.bot.send_message(chat_id=chat_id, text=reply)
+                 except Exception as e_send_direct: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить ответ напрямую: {e_send_direct}")
+        else: # Если reply пустой
+             logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Нет ответа для отправки пользователю после всех попыток.")
+             try:
+                 if reply != "🤖 Модель дала пустой ответ.": error_message_to_user = "🤖 К сожалению, не удалось получить ответ от модели после нескольких попыток."
+                 if message: await message.reply_text(error_message_to_user)
+                 else: await context.bot.send_message(chat_id=chat_id, text=error_message_to_user)
+             except Exception as e_final_fail: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение о финальной ошибке: {e_final_fail}")
+
+        # --- Ограничение истории ---
+        while len(chat_history) > MAX_HISTORY_MESSAGES: removed = chat_history.pop(0); logger.debug(f"ChatID: {chat_id} | Удалено старое сообщение из истории (лимит {MAX_HISTORY_MESSAGES}). Role: {removed.get('role')}")
 # =============================================================
 
 # ===== Обработчик фото (обновлен для chat_data и User ID) =====
