@@ -39,42 +39,40 @@ import google.generativeai as genai
 
 # ===== Обработка импорта типов Gemini и SAFETY_SETTINGS =====
 try:
+    # --- ИЗМЕНЕНО: Убрали GoogleSearchRetrieval и Mode отсюда ---
     from google.generativeai.types import (
-        Tool, GenerationConfig, GoogleSearchRetrieval, ToolConfig, FunctionDeclaration, HarmCategory, HarmBlockThreshold,
-        BlockedPromptException, StopCandidateException, SafetyRating, BlockReason, FinishReason,
-        GoogleSearchRetrievalMode # Добавлен режим для 1.5
+        Tool, GenerationConfig, ToolConfig, FunctionDeclaration, HarmCategory, HarmBlockThreshold,
+        BlockedPromptException, StopCandidateException, SafetyRating, BlockReason, FinishReason
+        # GoogleSearchRetrieval, GoogleSearchRetrievalMode - УБРАНЫ
     )
-    # Для совместимости с новыми SDK, где GoogleSearch может быть напрямую импортирован
-    try: from google.generativeai.types import GoogleSearch
-    except ImportError: GoogleSearch = type('GoogleSearch', (object,), {}) # Заглушка, если нет
-    # Режимы для GoogleSearchRetrieval (модели 1.5)
-    SEARCH_MODE_ALWAYS = GoogleSearchRetrievalMode.MODE_ENABLED # Используем MODE_ENABLED для принудительного поиска в 1.5
-    logger.info("Типы google.generativeai.types (включая Tool, GoogleSearchRetrieval) успешно импортированы.")
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+    # Пытаемся импортировать GoogleSearch отдельно для совместимости
+    try:
+        from google.generativeai.types import GoogleSearch
+        logger.info("Типы google.generativeai.types (включая Tool, GoogleSearch) успешно импортированы.")
+    except ImportError:
+        GoogleSearch = type('GoogleSearch', (object,), {}) # Заглушка, если GoogleSearch тоже нет (маловероятно для 0.8.x)
+        logger.warning("Тип GoogleSearch не найден в google.generativeai.types, используется заглушка.")
+        logger.info("Основные типы google.generativeai.types (Tool и др.) успешно импортированы.")
 
 except ImportError as e_tool_import:
-    logger.warning(f"Не удалось импортировать типы инструментов Gemini (Tool, GoogleSearchRetrieval и т.д.): {e_tool_import}. Встроенный поиск может не работать.")
+    # Этот except сработает, если даже базовые типы (Tool, HarmCategory и т.д.) не импортируются
+    logger.warning(f"Не удалось импортировать основные типы Gemini (Tool, HarmCategory и т.д.): {e_tool_import}. Функциональность может быть нарушена.")
+    # Определяем заглушки для всего необходимого
     Tool = type('Tool', (object,), {})
     GenerationConfig = genai.GenerationConfig # Используем стандартный, если типы не загрузились
-    GoogleSearchRetrieval = type('GoogleSearchRetrieval', (object,), {})
+    GoogleSearchRetrieval = type('GoogleSearchRetrieval', (object,), {}) # Оставляем заглушку на всякий случай
     GoogleSearch = type('GoogleSearch', (object,), {})
     ToolConfig = type('ToolConfig', (object,), {})
     FunctionDeclaration = type('FunctionDeclaration', (object,), {})
-    SEARCH_MODE_ALWAYS = "MODE_ENABLED" # Используем строку как fallback
-
-# Остальной код импорта HarmCategory и т.д.
-HARM_CATEGORIES_STRINGS = [
-    "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
-    "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
-]
-BLOCK_NONE_STRING = "BLOCK_NONE"
-SAFETY_SETTINGS_BLOCK_NONE = []
-BlockedPromptException = type('BlockedPromptException', (Exception,), {})
-StopCandidateException = type('StopCandidateException', (Exception,), {})
-HarmCategory = type('HarmCategory', (object,), {})
-HarmBlockThreshold = type('HarmBlockThreshold', (object,), {})
-SafetyRating = type('SafetyRating', (object,), {'category': None, 'probability': None})
-BlockReason = type('BlockReason', (object,), {'UNSPECIFIED': 'UNSPECIFIED', 'name': 'UNSPECIFIED'})
-FinishReason = type('FinishReason', (object,), {'STOP': 'STOP', 'name': 'STOP'})
+    SEARCH_MODE_ALWAYS = "MODE_ENABLED" # Оставляем строку как fallback
+    HarmCategory = type('HarmCategory', (object,), {})
+    HarmBlockThreshold = type('HarmBlockThreshold', (object,), {})
+    BlockedPromptException = type('BlockedPromptException', (Exception,), {})
+    StopCandidateException = type('StopCandidateException', (Exception,), {})
+    SafetyRating = type('SafetyRating', (object,), {'category': None, 'probability': None})
+    BlockReason = type('BlockReason', (object,), {'UNSPECIFIED': 'UNSPECIFIED', 'name': 'UNSPECIFIED'})
+    FinishReason = type('FinishReason', (object,), {'STOP': 'STOP', 'name': 'STOP'})
 
 try:
     # Пытаемся переопределить стандартные типы, если импорт из types удался
