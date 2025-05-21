@@ -314,69 +314,19 @@ import re # Убедитесь, что re импортирован в начал
 # --- Команды (/start, /clear, /temp, /search_on/off, /model) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # user_id = user.id
-    # chat_id = update.effective_chat.id
 
-    # Инициализация настроек пользователя
-    if 'selected_model' not in context.user_data:
-        set_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    if 'search_enabled' not in context.user_data:
-        set_user_setting(context, 'search_enabled', True)
-    if 'temperature' not in context.user_data:
-        set_user_setting(context, 'temperature', 1.0)
-    if 'detailed_reasoning_enabled' not in context.user_data:
-        set_user_setting(context, 'detailed_reasoning_enabled', True) 
+    # Простейшая функция экранирования для теста
+    def escape_md_v2(text: str) -> str:
+        escape_chars = r'_*[]()~`>#+-=|{}.!'
+        return re.sub(r'([%s])' % re.escape(escape_chars), r'\\\1', str(text))
 
-    bot_core_model_key = DEFAULT_MODEL
-    # Используем УПРОЩЕННЫЕ имена моделей из AVAILABLE_MODELS (без скобок)
-    raw_bot_core_model_display_name = AVAILABLE_MODELS.get(bot_core_model_key, bot_core_model_key)
+    test_model_name = escape_md_v2("Test Model 1.2-beta (Test)")
+    test_status = escape_md_v2("Вкл (Test)")
 
-    current_model_key = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    raw_current_model_display_name = AVAILABLE_MODELS.get(current_model_key, current_model_key)
-
-    def escape_markdown_v2_special_chars(text: str) -> str:
-        """
-        Корректно экранирует специальные символы для Telegram MarkdownV2.
-        """
-        text = str(text)
-        # Символы, которые ДОЛЖНЫ быть экранированы в MarkdownV2 согласно документации Telegram:
-        # _, *, [, ], (, ), ~, `, >, #, +, -, =, |, {, }, ., !
-        # Важно: этот набор должен содержать ТОЛЬКО эти символы.
-        escape_chars_string = r'_*[]()~`>#+-=|{}.!'
-        
-        # Создаем паттерн для re.sub, который найдет любой из этих символов.
-        # re.escape(escape_chars_string) экранирует символы из escape_chars_string,
-        # которые имеют специальное значение в regex-паттернах (например, '[', ']', '-', '.').
-        # Это нужно, чтобы они правильно интерпретировались как часть символьного класса.
-        pattern = r'([%s])' % re.escape(escape_chars_string)
-        
-        return re.sub(pattern, r'\\\1', text)
-
-    safe_bot_core_model_display_name = escape_markdown_v2_special_chars(raw_bot_core_model_display_name)
-    safe_current_model_display_name = escape_markdown_v2_special_chars(raw_current_model_display_name)
+    # Очень простое сообщение
+    start_message = f"Привет от {escape_md_v2(user.first_name)}\!\nМодель: {test_model_name}\nСтатус: {test_status}"
     
-    search_status = "Вкл" if get_user_setting(context, 'search_enabled', True) else "Выкл"
-    reasoning_status = "Вкл" if get_user_setting(context, 'detailed_reasoning_enabled', True) else "Выкл" 
-
-    author_mention = "@Denis_Leo777" 
-    author_channel_link = "https://t.me/denisobovsyom" 
-
-    # Собираем сообщение. Обратите внимание на экранирование литеральных спецсимволов V2.
-    # Дефисы в начале строк для списков, точки в конце предложений, скобки и т.д.
-    start_message = (
-        f"\nЯ \\- Женя, работаю на Google GEMINI {safe_bot_core_model_display_name}:\n"
-        f"\\- обладаю огромным объемом знаний до янв\\.2025 и поиском Google,\n"
-        f"\\- использую рассуждения и улучшенные настройки от автора бота {author_mention},\n"
-        f"\\- умею читать и понимать изображения и документы, а также контент YouTube и веб\\-страниц по ссылкам\\.\n"
-        f"Пишите мне сюда и добавляйте в группы, я запоминаю контекст чата и пользователей\\.\n"
-        f"Канал автора: {author_channel_link}\n" # URL-адреса обрабатываются автоматически
-        f"/model — сменить модель \\(сейчас: {safe_current_model_display_name}\\)\n"
-        f"/search_on / /search_off — вкл/выкл поиск Google \\(сейчас: {search_status}\\)\n"
-        f"/reasoning_on / /reasoning_off — вкл/выкл подробные рассуждения \\(сейчас: {reasoning_status}\\)\n"
-        f"/clear — очистить историю этого чата"
-    )
-    
-    logger.debug(f"Attempting to send start_message (Markdown V2):\n{start_message}")
+    logger.debug(f"Attempting to send EXTREMELY simplified start_message (Markdown V2):\n{start_message}")
 
     try:
         await update.message.reply_text(
@@ -384,30 +334,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN_V2,
             disable_web_page_preview=True
         )
-        logger.info("Successfully sent start_message with MARKDOWN_V2.") # Лог при успехе
+        logger.info("Successfully sent EXTREMELY simplified start_message with MARKDOWN_V2.")
     except BadRequest as e:
-        logger.error(f"BadRequest when sending start_message with MARKDOWN_V2: {e}. Message content was:\n{start_message}", exc_info=True)
+        logger.error(f"BadRequest with EXTREMELY simplified start_message (MARKDOWN_V2): {e}. Message content was:\n{start_message}", exc_info=True)
         try:
-            # Формируем сообщение для простого текста без какого-либо Markdown экранирования
-            plain_start_message = (
-                f"\nЯ - Женя, работаю на Google GEMINI {raw_bot_core_model_display_name}:\n"
-                f"- обладаю огромным объемом знаний до янв.2025 и поиском Google,\n"
-                f"- использую рассуждения и улучшенные настройки от автора бота {author_mention},\n"
-                f"- умею читать и понимать изображения, документы, а также содержание веб-страниц по ссылкам.\n"
-                f"Пишите мне сюда и добавляйте в группы, я запоминаю контекст чата и пользователей.\n"
-                f"Канал автора: {author_channel_link}\n"
-                f"/model — сменить модель (сейчас: {raw_current_model_display_name})\n"
-                f"/search_on / /search_off — вкл/выкл поиск Google (сейчас: {search_status})\n"
-                f"/reasoning_on / /reasoning_off — вкл/выкл подробные рассуждения (сейчас: {reasoning_status})\n"
-                f"/clear — очистить историю этого чата"
-            )
-            await update.message.reply_text(
-                plain_start_message,
-                disable_web_page_preview=True
-            )
-            logger.info("Successfully sent start_message as plain text after Markdown V2 failure.")
+            # Fallback
+            plain_message = f"Привет от {user.first_name}!\nМодель: Test Model 1.2-beta (Test)\nСтатус: Вкл (Test)"
+            await update.message.reply_text(plain_message, disable_web_page_preview=True)
+            logger.info("Successfully sent EXTREMELY simplified message as plain text after V2 failure.")
         except Exception as e_plain:
-            logger.error(f"Failed to send start_message even as plain text: {e_plain}", exc_info=True)
+            logger.error(f"Failed to send even EXTREMELY simplified plain text: {e_plain}", exc_info=True)
     
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
