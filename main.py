@@ -312,8 +312,10 @@ def _strip_thoughts_from_text(text_content: str | None) -> str:
 # --- Команды (/start, /clear, /temp, /search_on/off, /model) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    user_id = user.id
-    chat_id = update.effective_chat.id
+    user_id = user.id # Added for completeness, though not used in this snippet directly
+    # chat_id = update.effective_chat.id # Added for completeness
+
+    # Инициализация настроек пользователя (если они еще не установлены)
     if 'selected_model' not in context.user_data:
         set_user_setting(context, 'selected_model', DEFAULT_MODEL)
     if 'search_enabled' not in context.user_data:
@@ -321,28 +323,53 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'temperature' not in context.user_data:
         set_user_setting(context, 'temperature', 1.0)
     if 'detailed_reasoning_enabled' not in context.user_data:
-        set_user_setting(context, 'detailed_reasoning_enabled', True) 
+        set_user_setting(context, 'detailed_reasoning_enabled', True)
 
-    current_model = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    default_model_name = AVAILABLE_MODELS.get(current_model, current_model)
+    # Получаем отображаемые имена моделей
+    bot_core_model_key = DEFAULT_MODEL
+    raw_bot_core_model_display_name = AVAILABLE_MODELS.get(bot_core_model_key, bot_core_model_key)
+
+    current_model_key = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
+    raw_current_model_display_name = AVAILABLE_MODELS.get(current_model_key, current_model_key)
+
+    # Функция для экранирования специальных символов в именах моделей для Markdown V1
+    def escape_model_name_md_v1(name: str) -> str:
+        # Экранируем символы, которые могут вызывать проблемы в Markdown V1, особенно в именах моделей
+        name = name.replace('.', r'\.')
+        name = name.replace('(', r'\(')
+        name = name.replace(')', r'\)')
+        name = name.replace('-', r'\-')
+        # Дополнительно можно экранировать _ * ` [ если они могут появиться в именах
+        # name = name.replace('_', r'\_')
+        # name = name.replace('*', r'\*')
+        # name = name.replace('`', r'\`')
+        # name = name.replace('[', r'\[')
+        return name
+
+    safe_bot_core_model_display_name = escape_model_name_md_v1(raw_bot_core_model_display_name)
+    safe_current_model_display_name = escape_model_name_md_v1(raw_current_model_display_name)
+    
     search_status = "Вкл" if get_user_setting(context, 'search_enabled', True) else "Выкл"
     reasoning_status = "Вкл" if get_user_setting(context, 'detailed_reasoning_enabled', True) else "Выкл" 
 
     start_message = (
-        f"\nЯ - Женя, работаю на Google GEMINI ({AVAILABLE_MODELS.get(DEFAULT_MODEL, DEFAULT_MODEL)}):"
+        # Убраны внешние скобки вокруг имени основной модели бота для упрощения и безопасности
+        f"\nЯ - Женя, работаю на Google GEMINI {safe_bot_core_model_display_name}:"
         f"\n- обладаю огромным объемом знаний до янв.2025 и поиском Google,"
         f"\n- использую рассуждения и улучшенные настройки от автора бота @Denis_Leo777,"
         f"\n- умею читать и понимать изображения и документы, а также контент YouTube и веб-страниц по ссылкам."
-        f"\nПишите мне сюда и добавляйте в группы, я запоминаю контекст чата и пользователей."
+        f"\nПишите мне сюда, добавляйте меня в группы, я запоминаю контекст чата и пользователей."
         f"\nКанал автора: https://t.me/denisobovsyom"
-        f"\n/model — сменить модель (сейчас: {default_model_name})"
+        f"\n/model — сменить модель (сейчас: {safe_current_model_display_name})"
         f"\n/search_on / /search_off — вкл/выкл поиск Google (сейчас: {search_status})"
-        f"\n/reasoning_on / /reasoning_off — вкл/выкл подробные рассуждения (сейчас: {reasoning_status})"
+        f"\n/reasoning_on / /reasoning_off — вкл/выкл рассуждения (сейчас: {reasoning_status})"
         f"\n/clear — очистить историю этого чата"
-        )
+    )
+    # Для отладки можно распечатать сообщение:
+    # logger.debug(f"Отформатированное start_message для Markdown V1:\n{start_message}")
 
     await update.message.reply_text(start_message, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-
+    
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
