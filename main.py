@@ -311,8 +311,6 @@ def _strip_thoughts_from_text(text_content: str | None) -> str:
 
 import re # Убедитесь, что re импортирован в начале вашего файла
 
-import re # Убедитесь, что re импортирован в начале вашего файла
-
 # --- Команды (/start, /clear, /temp, /search_on/off, /model) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -336,62 +334,54 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     search_status_raw = "Вкл" if get_user_setting(context, 'search_enabled', True) else "Выкл"
     reasoning_status_raw = "Вкл" if get_user_setting(context, 'detailed_reasoning_enabled', True) else "Выкл"
     
-    author_mention_raw = "@Denis_Leo777" 
-    author_channel_link_raw = "https://t.me/denisobovsyom" # URL не требует экранирования для MarkdownV2
+    # ИЗМЕНЕНИЕ 1: Упрощаем упоминание автора для теста
+    author_mention_raw = "DenisLeo777" # Без @ и точки
+    author_channel_link_raw = "https://t.me/denisobovsyom"
 
     def escape_md_v2(text: str) -> str:
-        text = str(text) # Гарантируем, что это строка
-        # Основные символы, требующие экранирования в MarkdownV2
-        # _ * [ ] ( ) ~ ` > # + - = | { } . !
-        # Важно: Этот список должен содержать ТОЛЬКО эти символы.
+        text = str(text)
         escape_chars = r'_*[]()~`>#+-=|{}.!'
-        
-        # Создаем паттерн для re.sub
         pattern = r'([%s])' % re.escape(escape_chars)
-        
         return re.sub(pattern, r'\\\1', text)
 
-    # Экранируем все динамические части
     safe_bot_core_model_display_name = escape_md_v2(raw_bot_core_model_display_name)
     safe_current_model_display_name = escape_md_v2(raw_current_model_display_name)
     safe_search_status = escape_md_v2(search_status_raw)
     safe_reasoning_status = escape_md_v2(reasoning_status_raw)
-    safe_author_mention = escape_md_v2(author_mention_raw) # Экранируем @ и . в упоминании
+    safe_author_mention = escape_md_v2(author_mention_raw) # Теперь экранирует "DenisLeo777" (не должно ничего делать)
 
-    # Собираем сообщение с тщательным экранированием литералов
+    # Текст "янв.2025" будет содержать экранированную точку
+    static_date_text = "янв\\.2025"
+
     start_message = (
-        # Обратите внимание на экранирование: \n обрабатывается f-строкой, потом литералы.
-        # Имена переменных уже экранированы функцией escape_md_v2.
-        # Точки в конце предложений, дефисы в начале списков, скобки - всё экранировано.
-        f"\nЯ \\- Женя, работаю на Google GEMINI {safe_bot_core_model_display_name}\\:\n" # Двоеточие тоже экранируем на всякий случай
-        f"\\- обладаю огромным объемом знаний и поиском Google,\n"
-        f"\\- использую рассуждения и улучшенные настройки от автора бота {safe_author_mention},\n" # safe_author_mention уже обработан
+        f"\nЯ \\- Женя, работаю на Google GEMINI {safe_bot_core_model_display_name}:\n"  # ИЗМЕНЕНИЕ 3: Убрано экранирование двоеточия
+        f"\\- обладаю огромным объемом знаний до {static_date_text} и поиском Google,\n" # ИЗМЕНЕНИЕ 2: Используем явно экранированную дату
+        f"\\- использую рассуждения и улучшенные настройки от автора бота {safe_author_mention},\n"
         f"\\- умею читать и понимать изображения и документы, а также контент YouTube и веб\\-страниц по ссылкам\\.\n"
         f"Пишите мне сюда и добавляйте в группы, я запоминаю контекст чата и пользователей\\.\n"
-        f"Канал автора: {author_channel_link_raw}\n" # URL обычно безопасны и не требуют экранирования
+        f"Канал автора: {author_channel_link_raw}\n"
         f"/model — сменить модель \\(сейчас: {safe_current_model_display_name}\\)\n"
         f"/search_on / /search_off — вкл/выкл поиск Google \\(сейчас: {safe_search_status}\\)\n"
         f"/reasoning_on / /reasoning_off — вкл/выкл подробные рассуждения \\(сейчас: {safe_reasoning_status}\\)\n"
-        f"/clear — очистить историю этого чата" # Эта строка не содержит спецсимволов, требующих экранирования
+        f"/clear — очистить историю этого чата"
     )
     
-    logger.debug(f"Attempting to send start_message (Markdown V2 - Full Attempt):\n{start_message}")
+    logger.debug(f"Attempting to send start_message (Markdown V2 - Targeted Fix Attempt):\n{start_message}")
 
     try:
         await update.message.reply_text(
             start_message, 
             parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True # Рекомендуется True, чтобы URL не генерировали превью, если не нужно
+            disable_web_page_preview=True
         )
-        logger.info("Successfully sent start_message with MARKDOWN_V2 (Full Attempt).")
+        logger.info("Successfully sent start_message with MARKDOWN_V2 (Targeted Fix Attempt).")
     except BadRequest as e:
-        logger.error(f"BadRequest with start_message (MARKDOWN_V2 - Full Attempt): {e}. Message content was:\n{start_message}", exc_info=True)
+        logger.error(f"BadRequest with start_message (MARKDOWN_V2 - Targeted Fix Attempt): {e}. Message content was:\n{start_message}", exc_info=True)
         try:
-            # Fallback на plain text, используя НЕЭКРАНИРОВАННЫЕ версии переменных
             plain_start_message = (
                 f"\nЯ - Женя, работаю на Google GEMINI {raw_bot_core_model_display_name}:\n"
-                f"- обладаю огромным объемом знаний и поиском Google,\n"
-                f"- использую рассуждения и улучшенные настройки от автора бота {author_mention_raw},\n"
+                f"- обладаю огромным объемом знаний до янв.2025 и поиском Google,\n" # Возвращаем оригинальный текст для plain
+                f"- использую рассуждения и улучшенные настройки от автора бота @Denis_Leo777,\n" # Оригинальное упоминание для plain
                 f"- умею читать и понимать изображения и документы, а также контент YouTube и веб-страниц по ссылкам.\n"
                 f"Пишите мне сюда и добавляйте в группы, я запоминаю контекст чата и пользователей.\n"
                 f"Канал автора: {author_channel_link_raw}\n"
@@ -404,9 +394,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 plain_start_message,
                 disable_web_page_preview=True
             )
-            logger.info("Successfully sent start_message as plain text after MARKDOWN_V2 failure (Full Attempt).")
+            logger.info("Successfully sent start_message as plain text after MARKDOWN_V2 failure (Targeted Fix Attempt).")
         except Exception as e_plain:
-            logger.error(f"Failed to send plain text start_message (Full Attempt): {e_plain}", exc_info=True)
+            logger.error(f"Failed to send plain text start_message (Targeted Fix Attempt): {e_plain}", exc_info=True)
     
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
