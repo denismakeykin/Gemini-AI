@@ -190,11 +190,9 @@ genai.configure(api_key=GOOGLE_API_KEY)
 # --- Модели, Константы, Системная инструкция ---
 AVAILABLE_MODELS = {
     'gemini-2.5-flash-preview-05-20': '2.5 Flash - 20.05',  # Changed (20.05) to - 20.05
-    'gemini-2.5-pro-preview-05-06': '2.5 Pro - 06.05',    # Changed (06.05) to - 06.05
-    'gemini-2.5-pro-exp-03-25': '2.5 Pro exp - 25.03', # Changed (25.03) to - 25.03
     'gemini-2.0-flash': '2.0 Flash', # Already simple
 }
-DEFAULT_MODEL = 'gemini-2.5-flash-preview-05-20' if 'gemini-2.5-flash-preview-05-20' in AVAILABLE_MODELS else 'gemini-2.5-pro-exp-03-25'
+DEFAULT_MODEL = 'gemini-2.5-flash-preview-05-20' if 'gemini-2.5-flash-preview-05-20' in AVAILABLE_MODELS else 'gemini-2.0-flash'
 
 MAX_CONTEXT_CHARS = 200000
 MAX_HISTORY_MESSAGES = 100
