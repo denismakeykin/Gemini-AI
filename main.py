@@ -1354,109 +1354,148 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== Обработчик документов (обновлен для chat_data через handle_message) =====
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if not update.effective_user: logger.warning(f"ChatID: {chat_id} | handle_document: Не удалось определить пользователя."); return
+    if not update.effective_user: 
+        logger.warning(f"ChatID: {chat_id} | handle_document: Не удалось определить пользователя."); return
     user_id = update.effective_user.id
     message = update.message
-    if not message or not message.document: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | В handle_document нет документа."); return
+    if not message or not message.document: 
+        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | В handle_document нет документа."); return
+    
     doc = message.document
     allowed_mime_prefixes = ('text/', 'application/json', 'application/xml', 'application/csv', 'application/x-python', 'application/x-sh', 'application/javascript', 'application/x-yaml', 'application/x-tex', 'application/rtf', 'application/sql')
     allowed_mime_types = ('application/octet-stream',) 
     mime_type = doc.mime_type or "application/octet-stream"
     is_allowed_prefix = any(mime_type.startswith(prefix) for prefix in allowed_mime_prefixes)
     is_allowed_type = mime_type in allowed_mime_types
+
     if not (is_allowed_prefix or is_allowed_type):
         await update.message.reply_text(f"⚠️ Пока могу читать только текстовые файлы... Ваш тип: `{mime_type}`", parse_mode=ParseMode.MARKDOWN)
         logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Неподдерживаемый файл: {doc.file_name} (MIME: {mime_type})"); return
+
     MAX_FILE_SIZE_MB = 15
     file_size_bytes = doc.file_size or 0
-    if file_size_bytes == 0 and doc.file_name: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Пустой файл '{doc.file_name}'."); await update.message.reply_text(f"ℹ️ Файл '{doc.file_name}' пустой."); return
-    elif file_size_bytes == 0 and not doc.file_name: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Получен пустой документ без имени."); return
+    if file_size_bytes == 0 and doc.file_name: 
+        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Пустой файл '{doc.file_name}'.")
+        await update.message.reply_text(f"ℹ️ Файл '{doc.file_name}' пустой."); return
+    elif file_size_bytes == 0 and not doc.file_name: 
+        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Получен пустой документ без имени."); return
+    
     if file_size_bytes > MAX_FILE_SIZE_MB * 1024 * 1024:
         await update.message.reply_text(f"❌ Файл `{doc.file_name}` слишком большой (> {MAX_FILE_SIZE_MB} MB).", parse_mode=ParseMode.MARKDOWN)
         logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Слишком большой файл: {doc.file_name} ({file_size_bytes / (1024*1024):.2f} MB)"); return
+
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
     try:
         doc_file = await doc.get_file()
         file_bytes = await doc_file.download_as_bytearray()
-        if not file_bytes: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Файл '{doc.file_name}' скачан, но пуст."); await update.message.reply_text(f"ℹ️ Файл '{doc.file_name}' пустой."); return
+        if not file_bytes: 
+            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Файл '{doc.file_name}' скачан, но пуст.")
+            await update.message.reply_text(f"ℹ️ Файл '{doc.file_name}' пустой."); return
     except Exception as e:
         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось скачать документ '{doc.file_name}': {e}", exc_info=True)
         try: await update.message.reply_text("❌ Не удалось загрузить файл.")
-        except Exception as e_reply_dl_err: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке скачивания документа: {e_reply_dl_err}")
+        except Exception as e_reply_dl_err: 
+            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке скачивания документа: {e_reply_dl_err}")
         return
+
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     text = None; detected_encoding = None
     encodings_to_try = ['utf-8-sig', 'utf-8', 'cp1251', 'latin-1', 'cp866', 'iso-8859-5']
     chardet_available = False
-    try: import chardet; chardet_available = True
-    except ImportError: logger.info("Библиотека chardet не найдена. Автоопределение кодировки будет ограничено.")
+    try: 
+        import chardet
+        chardet_available = True
+    except ImportError: 
+        logger.info("Библиотека chardet не найдена. Автоопределение кодировки будет ограничено.")
+
     if chardet_available:
         try:
-            chardet_limit = min(len(file_bytes), 50 * 1024)
+            chardet_limit = min(len(file_bytes), 50 * 1024) # Analyze first 50KB for chardet
             if chardet_limit > 0:
                  detected = chardet.detect(file_bytes[:chardet_limit])
                  if detected and detected['encoding'] and detected['confidence'] > 0.7:
                       potential_encoding = detected['encoding'].lower()
                       logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Chardet определил: {potential_encoding} ({detected['confidence']:.2f}) для '{doc.file_name}'")
-                      if potential_encoding == 'utf-8' and file_bytes.startswith(b'\xef\xbb\xbf'):
+                      if potential_encoding == 'utf-8' and file_bytes.startswith(b'\xef\xbb\xbf'): # UTF-8 BOM
                            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обнаружен UTF-8 BOM, используем 'utf-8-sig'.")
                            detected_encoding = 'utf-8-sig'
-                           if 'utf-8-sig' not in encodings_to_try: encodings_to_try.insert(0, 'utf-8-sig')
+                           if 'utf-8-sig' not in encodings_to_try: 
+                               encodings_to_try.insert(0, 'utf-8-sig')
                            if 'utf-8' in encodings_to_try: 
                                try: 
                                    encodings_to_try.remove('utf-8')
                                except ValueError: 
-                                   pass # ИСПРАВЛЕНО: SyntaxError, try должен быть на новой строке
+                                   pass 
                       else:
                            detected_encoding = potential_encoding
-                           if detected_encoding in encodings_to_try: encodings_to_try.remove(detected_encoding)
+                           if detected_encoding in encodings_to_try: 
+                               encodings_to_try.remove(detected_encoding)
                            encodings_to_try.insert(0, detected_encoding)
-                 else: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Chardet не уверен ({detected.get('confidence', 0):.2f}) для '{doc.file_name}'.")
-        except Exception as e_chardet: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка при использовании chardet для '{doc.file_name}': {e_chardet}")
-    unique_encodings = list(dict.fromkeys(encodings_to_try))
+                 else: 
+                     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Chardet не уверен ({detected.get('confidence', 0):.2f}) для '{doc.file_name}'.")
+        except Exception as e_chardet: 
+            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка при использовании chardet для '{doc.file_name}': {e_chardet}")
+    
+    unique_encodings = list(dict.fromkeys(encodings_to_try)) # Remove duplicates while preserving order
     logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Попытки декодирования для '{doc.file_name}': {unique_encodings}")
+
     for encoding in unique_encodings:
-        try: text = file_bytes.decode(encoding); detected_encoding = encoding; logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Файл '{doc.file_name}' успешно декодирован как {encoding}."); break
-        except (UnicodeDecodeError, LookupError): logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Файл '{doc.file_name}' не в кодировке {encoding}.")
-        except Exception as e_decode: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка при декодировании '{doc.file_name}' как {encoding}: {e_decode}", exc_info=True)
+        try: 
+            text = file_bytes.decode(encoding)
+            detected_encoding = encoding
+            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Файл '{doc.file_name}' успешно декодирован как {encoding}.")
+            break
+        except (UnicodeDecodeError, LookupError): 
+            logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Файл '{doc.file_name}' не в кодировке {encoding}.")
+        except Exception as e_decode: 
+            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка при декодировании '{doc.file_name}' как {encoding}: {e_decode}", exc_info=True)
+
     if text is None:
         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось декодировать '{doc.file_name}' ни одной из кодировок: {unique_encodings}")
         await update.message.reply_text(f"❌ Не удалось прочитать файл `{doc.file_name}`. Попробуйте UTF-8.", parse_mode=ParseMode.MARKDOWN); return
-    if not text.strip() and len(file_bytes) > 0:
+    
+    if not text.strip() and len(file_bytes) > 0: # File has bytes but decodes to empty/whitespace string
         logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Файл '{doc.file_name}' дал пустой текст после декодирования ({detected_encoding}).")
         await update.message.reply_text(f"⚠️ Не удалось извлечь текст из файла `{doc.file_name}`.", parse_mode=ParseMode.MARKDOWN); return
+
     approx_max_tokens_for_file = MAX_OUTPUT_TOKENS * 2 
     MAX_FILE_CHARS = min(MAX_CONTEXT_CHARS // 2, approx_max_tokens_for_file * 4) 
-    truncated_text = text; truncation_warning = ""
+    truncated_text = text
+    truncation_warning = ""
     if len(text) > MAX_FILE_CHARS:
         truncated_text = text[:MAX_FILE_CHARS]
         last_newline = truncated_text.rfind('\n')
-        if last_newline > MAX_FILE_CHARS * 0.8: truncated_text = truncated_text[:last_newline]
+        if last_newline > MAX_FILE_CHARS * 0.8: # Try to cut at a reasonable newline
+            truncated_text = truncated_text[:last_newline]
         chars_k = len(truncated_text) // 1000
         truncation_warning = f"\n\n**(⚠️ Текст файла был обрезан до ~{chars_k}k символов)**"
         logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Текст файла '{doc.file_name}' обрезан до {len(truncated_text)} символов.")
-    user_caption = message.caption if message.caption else ""
-    file_name = doc.file_name or "файл"
-    encoding_info = f"(~{detected_encoding})" if detected_encoding else "(кодировка?)"
-    file_context = f"Содержимое файла `{file_name}` {encoding_info}:\n```\n{truncated_text}\n```{truncation_warning}"
-    user_prompt_doc = (f"Пользователь загрузил файл `{file_name}` с комментарием: \"{user_caption.replace('\"', '\\\"')}\". {file_context}\nПроанализируй, пожалуйста."
-                      ) if user_caption else (f"Пользователь загрузил файл `{file_name}`. {file_context}\nЧто можешь сказать об этом тексте?")
+
+    user_caption_original = message.caption if message.caption else ""
+    file_name_for_prompt = doc.file_name or "файл"
+    encoding_info_for_prompt = f"(~{detected_encoding})" if detected_encoding else "(кодировка?)"
+    file_context_for_prompt = f"Содержимое файла `{file_name_for_prompt}` {encoding_info_for_prompt}:\n```\n{truncated_text}\n```{truncation_warning}"
+
+    # --- Исправление SyntaxError ---
+    if user_caption_original:
+        # Perform the replacement for escaping quotes outside the f-string expression part
+        escaped_caption_content = user_caption_original.replace('"', '\\"') 
+        user_prompt_doc = f"Пользователь загрузил файл `{file_name_for_prompt}` с комментарием: \"{escaped_caption_content}\". {file_context_for_prompt}\nПроанализируй, пожалуйста."
+    else:
+        user_prompt_doc = f"Пользователь загрузил файл `{file_name_for_prompt}`. {file_context_for_prompt}\nЧто можешь сказать об этом тексте?"
+    # --- Конец исправления ---
+        
     if get_user_setting(context, 'detailed_reasoning_enabled', True): 
         user_prompt_doc += REASONING_PROMPT_ADDITION
         logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (Document) Добавлена инструкция для детального рассуждения.")
     
-    # Вместо создания нового Update, мы модифицируем существующий message.text
-    # и передаем тот же update в handle_message.
-    # Это более чистый подход, если handle_message может справиться с этим.
-    # Убедимся, что message.text не None.
-    if message.text is None: # На случай, если сообщение было только с документом без caption
-        message.text = "" # Инициализируем, чтобы можно было добавить промпт
+    if message.text is None: 
+        message.text = "" 
     
-    # Модифицируем message.text для handle_message
-    message.text = user_prompt_doc # handle_message будет использовать это как original_user_message_text
+    message.text = user_prompt_doc
 
     logger.debug(f"UserID: {user_id}, ChatID: {chat_id} | Передача управления в handle_message с текстом документа.")
-    await handle_message(update, context) # Передаем ОРИГИНАЛЬНЫЙ update, но с измененным message.text
+    await handle_message(update, context)
 # ====================================================================
 
 # --- Функции веб-сервера и запуска ---
