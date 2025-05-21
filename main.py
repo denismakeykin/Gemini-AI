@@ -189,10 +189,10 @@ genai.configure(api_key=GOOGLE_API_KEY)
 
 # --- Модели, Константы, Системная инструкция ---
 AVAILABLE_MODELS = {
-    'gemini-2.5-flash-preview-05-20': '2.5 Flash (20.05)',
-    'gemini-2.5-pro-preview-05-06': '2.5 Pro (06.05)',
-    'gemini-2.5-pro-exp-03-25': '2.5 Pro exp. (25.03)',
-    'gemini-2.0-flash': '2.0 Flash',
+    'gemini-2.5-flash-preview-05-20': '2.5 Flash - 20.05',  # Changed (20.05) to - 20.05
+    'gemini-2.5-pro-preview-05-06': '2.5 Pro - 06.05',    # Changed (06.05) to - 06.05
+    'gemini-2.5-pro-exp-03-25': '2.5 Pro exp - 25.03', # Changed (25.03) to - 25.03
+    'gemini-2.0-flash': '2.0 Flash', # Already simple
 }
 DEFAULT_MODEL = 'gemini-2.5-flash-preview-05-20' if 'gemini-2.5-flash-preview-05-20' in AVAILABLE_MODELS else 'gemini-2.5-pro-exp-03-25'
 
@@ -312,10 +312,10 @@ def _strip_thoughts_from_text(text_content: str | None) -> str:
 # --- Команды (/start, /clear, /temp, /search_on/off, /model) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    user_id = user.id # Added for completeness, though not used in this snippet directly
-    # chat_id = update.effective_chat.id # Added for completeness
+    # user_id = user.id # For context, though not directly used in this message
+    # chat_id = update.effective_chat.id # For context
 
-    # Инициализация настроек пользователя (если они еще не установлены)
+    # Инициализация настроек пользователя
     if 'selected_model' not in context.user_data:
         set_user_setting(context, 'selected_model', DEFAULT_MODEL)
     if 'search_enabled' not in context.user_data:
@@ -327,6 +327,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Получаем отображаемые имена моделей
     bot_core_model_key = DEFAULT_MODEL
+    # Uses the (now simplified) values from the updated AVAILABLE_MODELS
     raw_bot_core_model_display_name = AVAILABLE_MODELS.get(bot_core_model_key, bot_core_model_key)
 
     current_model_key = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
@@ -334,16 +335,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Функция для экранирования специальных символов в именах моделей для Markdown V1
     def escape_model_name_md_v1(name: str) -> str:
-        # Экранируем символы, которые могут вызывать проблемы в Markdown V1, особенно в именах моделей
+        # Экранируем символы, которые могут вызывать проблемы в Markdown V1
+        # Since model names are now simpler, primarily '.' and '-' need escaping.
+        # Escaping '(' and ')' is harmless if they are no longer present.
+        name = str(name) # Ensure it's a string
         name = name.replace('.', r'\.')
-        name = name.replace('(', r'\(')
-        name = name.replace(')', r'\)')
+        name = name.replace('(', r'\(') # Still good to keep, in case of other uses
+        name = name.replace(')', r'\)') # Still good to keep
         name = name.replace('-', r'\-')
-        # Дополнительно можно экранировать _ * ` [ если они могут появиться в именах
-        # name = name.replace('_', r'\_')
-        # name = name.replace('*', r'\*')
-        # name = name.replace('`', r'\`')
-        # name = name.replace('[', r'\[')
+        # For Markdown V1, avoid escaping _ or * unless they are truly meant to be literal
+        # and are not part of intended formatting. Given the current model names,
+        # they don't contain _ or *.
         return name
 
     safe_bot_core_model_display_name = escape_model_name_md_v1(raw_bot_core_model_display_name)
@@ -352,23 +354,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     search_status = "Вкл" if get_user_setting(context, 'search_enabled', True) else "Выкл"
     reasoning_status = "Вкл" if get_user_setting(context, 'detailed_reasoning_enabled', True) else "Выкл" 
 
+    # The structure of the message remains, but the interpolated model names are simpler
     start_message = (
-        # Убраны внешние скобки вокруг имени основной модели бота для упрощения и безопасности
-        f"\nЯ - Женя, работаю на Google GEMINI {safe_bot_core_model_display_name}:"
-        f"\n- обладаю огромным объемом знаний до янв.2025 и поиском Google,"
-        f"\n- использую рассуждения и улучшенные настройки от автора бота @Denis_Leo777,"
-        f"\n- умею читать и понимать изображения и документы, а также контент YouTube и веб-страниц по ссылкам."
-        f"\nПишите мне сюда, добавляйте меня в группы, я запоминаю контекст чата и пользователей."
-        f"\nКанал автора: https://t.me/denisobovsyom"
-        f"\n/model — сменить модель (сейчас: {safe_current_model_display_name})"
-        f"\n/search_on / /search_off — вкл/выкл поиск Google (сейчас: {search_status})"
-        f"\n/reasoning_on / /reasoning_off — вкл/выкл рассуждения (сейчас: {reasoning_status})"
-        f"\n/clear — очистить историю этого чата"
+        f"\nЯ - Женя, работаю на Google GEMINI {safe_bot_core_model_display_name}:\n" # No outer parentheses here
+        f"- обладаю огромным объемом знаний до янв.2025 и поиском Google,\n"
+        f"- использую рассуждения и улучшенные настройки от автора бота @Denis_Leo777,\n"
+        f"- умею читать и понимать изображения и документы, а также контент YouTube и веб-страниц по ссылкам.\n"
+        f"Пишите мне сюда и добавляйте в группы, я запоминаю контекст чата и пользователей.\n"
+        f"Канал автора: https://t.me/denisobovsyom\n"
+        f"/model — сменить модель (сейчас: {safe_current_model_display_name})\n"
+        f"/search_on / /search_off — вкл/выкл поиск Google (сейчас: {search_status})\n"
+        f"/reasoning_on / /reasoning_off — вкл/выкл подробные рассуждения (сейчас: {reasoning_status})\n"
+        f"/clear — очистить историю этого чата"
     )
-    # Для отладки можно распечатать сообщение:
-    # logger.debug(f"Отформатированное start_message для Markdown V1:\n{start_message}")
+    
+    # logger.debug(f"Formatted start_message for Markdown V1:\n{start_message}")
 
-    await update.message.reply_text(start_message, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+    await update.message.reply_text(
+        start_message, 
+        parse_mode=ParseMode.MARKDOWN, 
+        disable_web_page_preview=True
+    )
     
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
