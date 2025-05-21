@@ -241,7 +241,7 @@ system_instruction_text = (
 "Вноси только те правки, которые одобрил пользователь."
 "Без запроса и разрешения - не исправляй, при сомнениях - уточняй."
 "Не позволяй повторения ошибок, записывай их."
-"Думай, что ты - русская девушка Женя, человек, пиши в женском роде, если не попросят другой роли."
+"Запомни, ты - русская девушка Женя, человек, пиши в женском роде, если не попросят другой роли."
 )
 # ===================================================
 
@@ -315,7 +315,7 @@ import re # re может понадобиться для других функ�
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
-    # Инициализация настроек пользователя (остается без изменений)
+    # Инициализация настроек пользователя
     if 'selected_model' not in context.user_data:
         set_user_setting(context, 'selected_model', DEFAULT_MODEL)
     if 'search_enabled' not in context.user_data:
@@ -325,7 +325,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'detailed_reasoning_enabled' not in context.user_data:
         set_user_setting(context, 'detailed_reasoning_enabled', True) 
 
-    # Получаем "сырые" (неэкранированные) значения для отображения в простом тексте
     bot_core_model_key = DEFAULT_MODEL
     raw_bot_core_model_display_name = AVAILABLE_MODELS.get(bot_core_model_key, bot_core_model_key)
 
@@ -335,31 +334,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     search_status_raw = "Вкл" if get_user_setting(context, 'search_enabled', True) else "Выкл"
     reasoning_status_raw = "Вкл" if get_user_setting(context, 'detailed_reasoning_enabled', True) else "Выкл"
     
+    author_channel_link_raw = "https://t.me/denisobovsyom" 
+    date_knowledge_text_raw = "до начала 2025 года"
+
     # Формируем сообщение как обычный текст
-    # Никакого экранирования или специальных Markdown символов не нужно
+    # Первая строка теперь НЕ начинается с "\n"
     start_message_plain_parts = [
-        f"\nЯ - Женя, работаю на Google Gemini {raw_bot_core_model_display_name}:"
-        f"- обладаю огромным объемом знаний до начала 2025 года и интернет-поиском Google,"
-        f"- использую рассуждения и улучшенные настройки от автора бота,"
-        f"- умею читать и понимать изображения и документы, а также веб-страницы по ссылкам."
-        f"Пишите мне сюда, добавляйте в свои группы, я запоминаю контекст и пользователей."
-        f"Канал автора бота: https://t.me/denisobovsyom"
+        f"Я - Женя, работаю на Google GEMINI {raw_bot_core_model_display_name}:", # <--- Убран \n в начале
+        f"- обладаю огромным объемом знаний {date_knowledge_text_raw} и интернет-поиском Google",
+        f"- использую рассуждения и улучшенные настройки ответов от автора бота",
+        f"- умею читать и понимать изображения и документы, а также содержимое веб-страниц по ссылкам.",
+        f"Пишите мне сюда, добавляйте в группы, я запоминаю контекст и всех пользователей.",
+        f"Канал автора: {author_channel_link_raw}"
     ]
     
     start_message_plain = "\n".join(start_message_plain_parts)
-    # Убираем лишний начальный перевод строки, если он есть
-    if start_message_plain.startswith("\n\n"):
-        start_message_plain = start_message_plain[1:]
+    # Теперь start_message_plain будет начинаться сразу с "Я - Женя..."
+    # Условие if start_message_plain.startswith("\n\n") больше не нужно,
+    # так как \n\n в начале не образуется. Его можно убрать для чистоты.
+    # if start_message_plain.startswith("\n\n"):
+    #     start_message_plain = start_message_plain[1:] 
     
     logger.debug(f"Attempting to send start_message (Plain Text):\n{start_message_plain}")
 
     try:
         await update.message.reply_text(
             start_message_plain, 
-            disable_web_page_preview=True # Эту опцию можно оставить, она полезна
+            disable_web_page_preview=True
         )
         logger.info("Successfully sent start_message as plain text.")
-    except Exception as e: # Ловим любую ошибку при отправке, хотя для plain text это маловероятно
+    except Exception as e:
         logger.error(f"Failed to send start_message (Plain Text): {e}", exc_info=True)
     
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
