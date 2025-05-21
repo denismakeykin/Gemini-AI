@@ -312,7 +312,7 @@ def _strip_thoughts_from_text(text_content: str | None) -> str:
 # --- Команды (/start, /clear, /temp, /search_on/off, /model) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # user_id = user.id # For context, though not directly used in this message
+    # user_id = user.id # For context
     # chat_id = update.effective_chat.id # For context
 
     # Инициализация настроек пользователя
@@ -323,58 +323,82 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'temperature' not in context.user_data:
         set_user_setting(context, 'temperature', 1.0)
     if 'detailed_reasoning_enabled' not in context.user_data:
-        set_user_setting(context, 'detailed_reasoning_enabled', True)
+        set_user_setting(context, 'detailed_reasoning_enabled', True) 
 
-    # Получаем отображаемые имена моделей
     bot_core_model_key = DEFAULT_MODEL
-    # Uses the (now simplified) values from the updated AVAILABLE_MODELS
+    # Using simplified names from AVAILABLE_MODELS from the previous fix attempt
     raw_bot_core_model_display_name = AVAILABLE_MODELS.get(bot_core_model_key, bot_core_model_key)
 
     current_model_key = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
     raw_current_model_display_name = AVAILABLE_MODELS.get(current_model_key, current_model_key)
 
-    # Функция для экранирования специальных символов в именах моделей для Markdown V1
-    def escape_model_name_md_v1(name: str) -> str:
-        # Экранируем символы, которые могут вызывать проблемы в Markdown V1
-        # Since model names are now simpler, primarily '.' and '-' need escaping.
-        # Escaping '(' and ')' is harmless if they are no longer present.
-        name = str(name) # Ensure it's a string
-        name = name.replace('.', r'\.')
-        name = name.replace('(', r'\(') # Still good to keep, in case of other uses
-        name = name.replace(')', r'\)') # Still good to keep
-        name = name.replace('-', r'\-')
-        # For Markdown V1, avoid escaping _ or * unless they are truly meant to be literal
-        # and are not part of intended formatting. Given the current model names,
-        # they don't contain _ or *.
-        return name
+    def escape_markdown_v1_special_chars(text: str) -> str:
+        """
+        Escapes special characters for Telegram MarkdownV1.
+        Focuses on characters that might be misinterpreted within dynamic content.
+        """
+        text = str(text)
+        # For model names like "2.5 Flash - 20.05", escaping '.' and '-' is crucial.
+        # Other characters like '_', '*', '`', '[' are not expected in these names.
+        text = text.replace('.', r'\.')
+        text = text.replace('-', r'\-')
+        # Parentheses were removed from model names, but escaping them is harmless
+        # if this function were to be used for other text.
+        text = text.replace('(', r'\(')
+        text = text.replace(')', r'\)')
+        return text
 
-    safe_bot_core_model_display_name = escape_model_name_md_v1(raw_bot_core_model_display_name)
-    safe_current_model_display_name = escape_model_name_md_v1(raw_current_model_display_name)
+    safe_bot_core_model_display_name = escape_markdown_v1_special_chars(raw_bot_core_model_display_name)
+    safe_current_model_display_name = escape_markdown_v1_special_chars(raw_current_model_display_name)
     
     search_status = "Вкл" if get_user_setting(context, 'search_enabled', True) else "Выкл"
     reasoning_status = "Вкл" if get_user_setting(context, 'detailed_reasoning_enabled', True) else "Выкл" 
 
-    # The structure of the message remains, but the interpolated model names are simpler
     start_message = (
-        f"\nЯ - Женя, работаю на Google GEMINI {safe_bot_core_model_display_name}:\n" # No outer parentheses here
+        f"\nЯ - Женя, работаю на Google GEMINI {safe_bot_core_model_display_name}:\n"
         f"- обладаю огромным объемом знаний до янв.2025 и поиском Google,\n"
         f"- использую рассуждения и улучшенные настройки от автора бота @Denis_Leo777,\n"
         f"- умею читать и понимать изображения и документы, а также контент YouTube и веб-страниц по ссылкам.\n"
         f"Пишите мне сюда и добавляйте в группы, я запоминаю контекст чата и пользователей.\n"
         f"Канал автора: https://t.me/denisobovsyom\n"
-        f"/model — сменить модель (сейчас: {safe_current_model_display_name})\n"
+        f"/model — сменить модель (сейчас: {safe_current_model_display_name})\n" # Literal parentheses here
         f"/search_on / /search_off — вкл/выкл поиск Google (сейчас: {search_status})\n"
         f"/reasoning_on / /reasoning_off — вкл/выкл подробные рассуждения (сейчас: {reasoning_status})\n"
         f"/clear — очистить историю этого чата"
     )
     
-    # logger.debug(f"Formatted start_message for Markdown V1:\n{start_message}")
+    # Log the exact message being sent for debugging
+    logger.debug(f"Attempting to send start_message (Markdown V1):\n{start_message}")
 
-    await update.message.reply_text(
-        start_message, 
-        parse_mode=ParseMode.MARKDOWN, 
-        disable_web_page_preview=True
-    )
+    try:
+        await update.message.reply_text(
+            start_message, 
+            parse_mode=ParseMode.MARKDOWN, 
+            disable_web_page_preview=True
+        )
+    except BadRequest as e:
+        logger.error(f"BadRequest when sending start_message: {e}. Message content was:\n{start_message}", exc_info=True)
+        # Fallback: try sending as plain text if Markdown fails
+        try:
+            plain_start_message = ( # Create a version without any Markdown attempts if there's complex logic
+                f"\nЯ - Женя, работаю на Google GEMINI {raw_bot_core_model_display_name}:\n" # Using raw names for plain text
+                f"- обладаю огромным объемом знаний до янв.2025 и поиском Google,\n"
+                f"- использую рассуждения и улучшенные настройки от автора бота @Denis_Leo777,\n"
+                f"- умею читать и понимать изображения и документы, а также контент YouTube и веб-страниц по ссылкам.\n"
+                f"Пишите мне сюда и добавляйте в группы, я запоминаю контекст чата и пользователей.\n"
+                f"Канал автора: https://t.me/denisobovsyom\n"
+                f"/model — сменить модель (сейчас: {raw_current_model_display_name})\n"
+                f"/search_on / /search_off — вкл/выкл поиск Google (сейчас: {search_status})\n"
+                f"/reasoning_on / /reasoning_off — вкл/выкл подробные рассуждения (сейчас: {reasoning_status})\n"
+                f"/clear — очистить историю этого чата"
+            )
+            await update.message.reply_text(
+                plain_start_message,
+                disable_web_page_preview=True
+            )
+            logger.info("Successfully sent start_message as plain text after Markdown V1 failure.")
+        except Exception as e_plain:
+            logger.error(f"Failed to send start_message even as plain text: {e_plain}", exc_info=True)
     
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
