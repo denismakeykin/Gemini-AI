@@ -128,11 +128,9 @@ genai.configure(api_key=GOOGLE_API_KEY)
 # --- Модели, Константы, Системная инструкция ---
 AVAILABLE_MODELS = {
     'gemini-2.5-flash-preview-05-20': '2.5 Flash - 20.05',
-    'gemini-2.5-pro-preview-05-06': '2.5 Pro - 06.05',
-    'gemini-2.5-pro-exp-03-25': '2.5 Pro exp - 25.03',
     'gemini-2.0-flash': '2.0 Flash',
 }
-DEFAULT_MODEL = 'gemini-2.5-flash-preview-05-20' if 'gemini-2.5-flash-preview-05-20' in AVAILABLE_MODELS else 'gemini-2.5-pro-exp-03-25'
+DEFAULT_MODEL = 'gemini-2.5-flash-preview-05-20' if 'gemini-2.5-flash-preview-05-20' in AVAILABLE_MODELS else 'gemini-2.0-flash'
 
 MAX_CONTEXT_CHARS = 200000; MAX_HISTORY_MESSAGES = 100; MAX_OUTPUT_TOKENS = 65536 
 DDG_MAX_RESULTS = 10; GOOGLE_SEARCH_MAX_RESULTS = 10
@@ -310,13 +308,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Я - Женя, работаю на Google GEMINI {raw_bot_core_model_display_name}:",
         f"- обладаю огромным объемом знаний {date_knowledge_text_raw} и поиском Google",
         f"- использую рассуждения и улучшенные настройки от автора бота",
-        f"- умею читать и понимать изображения и документы, а также контент YouTube и веб-страниц по ссылкам.",
+        f"- умею читать и понимать изображения, документы, а также веб-страницы по ссылкам.",
         f"Пишите мне сюда и добавляйте в группы, я запоминаю контекст чата и пользователей.",
-        f"Канал автора: {author_channel_link_raw}",
-        f"/model — сменить модель (сейчас: {raw_current_model_display_name})",
-        f"/search_on / /search_off — вкл/выкл поиск Google (сейчас: {search_status_raw})",
-        f"/reasoning_on / /reasoning_off — вкл/выкл подробные рассуждения (сейчас: {reasoning_status_raw})",
-        f"/clear — очистить историю этого чата"
+        f"Канал автора: {author_channel_link_raw}"
     ]; start_message_plain = "\n".join(start_message_plain_parts)
     logger.debug(f"Attempting to send start_message (Plain Text):\n{start_message_plain}")
     try: await update.message.reply_text(start_message_plain, disable_web_page_preview=True); logger.info("Successfully sent start_message as plain text.")
