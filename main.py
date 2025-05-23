@@ -871,7 +871,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       if potential_encoding == 'utf-8' and file_bytes.startswith(b'\xef\xbb\xbf'):
                            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Обнаружен UTF-8 BOM, используем 'utf-8-sig'."); detected_encoding = 'utf-8-sig'
                            if 'utf-8-sig' not in encodings_to_try: encodings_to_try.insert(0, 'utf-8-sig')
-                           if 'utf-8' in encodings_to_try: try: encodings_to_try.remove('utf-8') 
+                           if 'utf-8' in encodings_to_try: 
+                                                     try: 
+                                                         encodings_to_try.remove('utf-8') 
                            except ValueError: pass 
                       else:
                            detected_encoding = potential_encoding
