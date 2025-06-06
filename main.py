@@ -1,11 +1,3 @@
-# Обновлённый main.py:
-# === ИСПРАВЛЕНИЯ (дата текущего изменения, v12.1 - Полная версия с исправлением HTTP-клиента) ===
-# - Полностью переработана логика управления HTTP-клиентом для совместимости с python-telegram-bot v22.1.
-# - Библиотека теперь управляет своим клиентом, а для кастомных запросов (Google Search) создается
-#   отдельный httpx-клиент, который управляется в функции main().
-# - Функция perform_google_search переписана с aiohttp на httpx.
-# - Исправлена ошибка 'AttributeError' при инициализации ApplicationBuilder.
-
 import logging
 import os
 import asyncio
@@ -29,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 import aiohttp
 import aiohttp.web
-import httpx  # Импорт httpx для нашего кастомного клиента
+import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, BotCommand
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
@@ -45,6 +37,7 @@ from telegram.error import BadRequest, TelegramError
 import google.generativeai as genai
 from duckduckgo_search import DDGS
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api._errors import RequestBlocked  # Импорт для обработки блокировки YouTube
 from pdfminer.high_level import extract_text
 
 try:
@@ -75,27 +68,42 @@ class PostgresPersistence(BasePersistence):
     def _execute(self, query: str, params: tuple = None, fetch: str = None):
         if not self.db_pool:
             raise ConnectionError("PostgresPersistence: Пул соединений не инициализирован.")
+
         conn = None
-        try:
-            conn = self.db_pool.getconn()
-            with conn.cursor() as cur:
-                cur.execute(query, params)
-                if fetch == "one":
-                    return cur.fetchone()
-                if fetch == "all":
-                    return cur.fetchall()
-                conn.commit()
-        except psycopg2.Error as e:
-            logger.error(f"PostgresPersistence: Ошибка выполнения SQL-запроса: {e}")
-            if conn and not conn.closed:
-                try:
+        last_exception = None
+        for attempt in range(2):  # Попытаться 2 раза (1 оригинал + 1 ретрай)
+            try:
+                conn = self.db_pool.getconn()
+                with conn.cursor() as cur:
+                    cur.execute(query, params)
+                    if fetch == "one":
+                        result = cur.fetchone()
+                        self.db_pool.putconn(conn)
+                        return result
+                    if fetch == "all":
+                        result = cur.fetchall()
+                        self.db_pool.putconn(conn)
+                        return result
+                    conn.commit()
+                    self.db_pool.putconn(conn)
+                    return True  # Успешный коммит
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                logger.warning(f"PostgresPersistence: Ошибка соединения (попытка {attempt + 1}): {e}. Попытка переподключения...")
+                last_exception = e
+                if conn:
+                    self.db_pool.putconn(conn, close=True) # Закрываем "сломанное" соединение
+                    conn = None
+                time.sleep(1) # Небольшая пауза перед повторной попыткой
+                continue # Переходим к следующей итерации цикла
+            except psycopg2.Error as e:
+                logger.error(f"PostgresPersistence: Невосстановимая ошибка SQL: {e}")
+                if conn:
                     conn.rollback()
-                except psycopg2.Error as rb_e:
-                    logger.warning(f"PostgresPersistence: Не удалось откатить транзакцию: {rb_e}")
-            return None
-        finally:
-            if conn:
-                self.db_pool.putconn(conn)
+                    self.db_pool.putconn(conn)
+                return None
+        
+        logger.error(f"PostgresPersistence: Не удалось выполнить запрос после всех попыток. Последняя ошибка: {last_exception}")
+        return None
 
     def _initialize_db(self):
         create_table_query = """
@@ -496,12 +504,10 @@ def extract_youtube_id(url_text: str) -> str | None:
     return match.group(1) if match else None
 
 def extract_general_url(text: str) -> str | None:
-    # A more general URL regex that avoids capturing markdown links like `[text](url)`
     regex = r'(?<![)\]])https?:\/\/[^\s<>"\'`]+'
     match = re.search(regex, text)
     if match:
         url = match.group(0)
-        # Clean trailing punctuation
         while url.endswith(('.', ',', '?', '!')):
             url = url[:-1]
         return url
@@ -1041,6 +1047,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except (TranscriptsDisabled, NoTranscriptFound):
                 logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_yt_summary}) Для видео {youtube_id} субтитры отключены или не найдены.")
                 await update.message.reply_text("❌ К сожалению, для этого видео нет субтитров (ни на русском, ни на английском), поэтому я не могу сделать конспект.")
+                return
+            except RequestBlocked:
+                logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_yt_summary}) Запрос к YouTube для видео {youtube_id} заблокирован. Вероятно, из-за IP хостинга.")
+                await update.message.reply_text("❌ Увы, YouTube заблокировал мой запрос. Такое часто случается, когда я работаю из облака. Сделать конспект этого видео не получится.")
                 return
             except Exception as e_transcript:
                 logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_yt_summary}) Ошибка при получении расшифровки для {youtube_id}: {e_transcript}", exc_info=True)
@@ -1840,4 +1850,4 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger.info("Приложение прервано пользователем (KeyboardInterrupt в main).")
     except Exception as e_top:
-        logger.critical("Неперехваченная ошибка на верхнем уровне asyncio.run(main).", exc_info=True)
+        logger.critical(f"Неперехваченная ошибка на верхнем уровне asyncio.run(main).", exc_info=True)
