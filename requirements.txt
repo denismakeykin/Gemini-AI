@@ -1,0 +1,11 @@
+python-telegram-bot[webhooks]
+google-generativeai
+duckduckgo-search
+pytz
+chardet
+psycopg2-binary
+sqlalchemy
+youtube-transcript-api
+pdfminer.six
+aiohttp
+httpx

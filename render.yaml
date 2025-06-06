@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: gemini-bot
+    env: python
+    plan: free # Убедись, что используешь бесплатный тариф
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: GOOGLE_CSE_ID
+        sync: false
+      - key: WEBHOOK_HOST
+        sync: false
+      - key: GEMINI_WEBHOOK_PATH
+        sync: false
+      - key: DATABASE_URL # <-- Важно указать, что эта переменная используется
+        sync: false
