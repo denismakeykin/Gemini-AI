@@ -284,12 +284,12 @@ if missing_vars:
 genai.configure(api_key=GOOGLE_API_KEY)
 
 AVAILABLE_MODELS = {
-    'gemini-2.5-flash-preview-05-20': '2.5 Flash - 20.05.25',
+    'gemini-2.5-flash': '2.5 Flash',
     'gemini-2.0-flash': '2.0 Flash',
 }
-DEFAULT_MODEL = 'gemini-2.5-flash-preview-05-20' if 'gemini-2.5-flash-preview-05-20' in AVAILABLE_MODELS else 'gemini-2.0-flash'
+DEFAULT_MODEL = 'gemini-2.5-flash' if 'gemini-2.5-flash' in AVAILABLE_MODELS else 'gemini-2.0-flash'
 
-MAX_CONTEXT_CHARS = 200000
+MAX_CONTEXT_CHARS = 100000
 MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 65536
 DDG_MAX_RESULTS = 10
@@ -298,8 +298,8 @@ RETRY_ATTEMPTS = 5
 RETRY_DELAY_SECONDS = 1
 IMAGE_DESCRIPTION_PREFIX = "[Описание изображения]: "
 YOUTUBE_SUMMARY_PREFIX = "[Конспект видео]: "
-VISION_CAPABLE_KEYWORDS = ['flash', 'pro', 'vision', 'ultra']
-VIDEO_CAPABLE_KEYWORDS = ['gemini-2.5-flash-preview-05-20']
+VISION_CAPABLE_KEYWORDS = ['gemini-2.5-flash', 'pro', 'vision', 'ultra']
+VIDEO_CAPABLE_KEYWORDS = ['gemini-2.5-flash']
 USER_ID_PREFIX_FORMAT = "[User {user_id}; Name: {user_name}]: "
 TARGET_TIMEZONE = "Europe/Moscow"
 
@@ -525,7 +525,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_knowledge_text_raw = "до начала 2025 года"
     
     start_message_plain_parts = [
-        f"Меня зовут Джой, работаю на Google Gemini {raw_bot_core_model_display_name} с настройками от автора бота: {author_channel_link_raw}",
+        f"Меня зовут Женя, работаю на Google Gemini {raw_bot_core_model_display_name} с настройками от автора бота: {author_channel_link_raw}",
         f"- обладаю огромным объемом знаний {date_knowledge_text_raw} и поиском Google,",
         f"- умею понимать и обсуждать изображения, txt, pdf и веб-страницы,",
         f"- знаю ваше имя, помню историю чата. Пишите лично и добавляйте меня в группы.",
@@ -1036,20 +1036,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             search_context_str = "\n\n==== РЕЗУЛЬТАТЫ ПОИСКА ====\n" + "\n".join(f"- {s.strip()}" for s in google_results)
             search_actually_performed = True
     
-    # Промпт для модели включает поиск, но в историю он не попадет
-    final_user_prompt = f"{user_message_for_history}{search_context_str}"
+    # === ИСПРАВЛЕНИЕ НАЧИНАЕТСЯ ЗДЕСЬ ===
+
+    # Получаем текущее время
+    current_time_str = get_current_time_str()
+    time_prefix_for_prompt = f"(Текущая дата и время: {current_time_str})\n"
+
+    # Промпт для модели теперь всегда будет содержать время
+    final_user_prompt = f"{time_prefix_for_prompt}{user_message_for_history}{search_context_str}"
 
     # Добавляем в историю ЧИСТОЕ сообщение пользователя
     chat_history.append({
         "role": "user",
-        "parts": [{"text": user_message_for_history}], # <-- Без поиска!
+        "parts": [{"text": user_message_for_history}], # <-- Без поиска и времени!
         "user_id": user_id,
         "message_id": message.message_id
     })
     
+    # === ИСПРАВЛЕНИЕ ЗАКАНЧИВАЕТСЯ ЗДЕСЬ ===
+
     # Собираем контекст из истории. Последнее сообщение будет заменено на промпт с поиском
     context_for_model = build_context_for_model(chat_history)
     if context_for_model and context_for_model[-1]["role"] == "user":
+        # Заменяем последнее чистое сообщение на полный промпт для модели
         context_for_model[-1]["parts"][0]["text"] = final_user_prompt
 
     gemini_reply_text = await _generate_gemini_response(
@@ -1211,10 +1220,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_caption_original = message.caption or ""
+    # === ИСПРАВЛЕНИЕ ===
+    current_time_str_doc = get_current_time_str()
+    time_prefix_for_prompt_doc = f"(Текущая дата и время: {current_time_str_doc})\n"
+    # === КОНЕЦ ИСПРАВЛЕНИЯ ===
+
     file_context_for_prompt = f"Содержимое файла `{doc.file_name or 'файл'}`:\n```\n{text[:10000]}\n```"
 
     user_name = user.first_name if user.first_name else "Пользователь"
-    user_prompt_doc_for_gemini = (f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name)}"
+    # Добавляем префикс времени в начало промпта
+    user_prompt_doc_for_gemini = (f"{time_prefix_for_prompt_doc}"
+                                  f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name)}"
                                   f"Проанализируй текст из файла. Мой комментарий: \"{user_caption_original}\".\n{file_context_for_prompt}")
     user_prompt_doc_for_gemini += REASONING_PROMPT_ADDITION
 
