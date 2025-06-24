@@ -619,7 +619,10 @@ async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
 
+# <<< НАЧАЛО БЛОКА ИСПРАВЛЕНИЯ >>>
+
 async def perform_google_search(query: str, api_key: str, cse_id: str, num_results: int, session: httpx.AsyncClient) -> list[str] | None:
+    # Эта функция остается без изменений, она работает хорошо.
     search_url = "https://www.googleapis.com/customsearch/v1"
     params = {'key': api_key, 'cx': cse_id, 'q': query, 'num': num_results, 'lr': 'lang_ru', 'gl': 'ru'}
     query_short = query[:50] + '...' if len(query) > 50 else query
@@ -627,7 +630,6 @@ async def perform_google_search(query: str, api_key: str, cse_id: str, num_resul
     try:
         response = await session.get(search_url, params=params, timeout=10.0)
         response.raise_for_status() 
-
         data = response.json()
         items = data.get('items', [])
         snippets = [item.get('snippet', item.get('title', '')) for item in items if item.get('snippet') or item.get('title')]
@@ -637,23 +639,48 @@ async def perform_google_search(query: str, api_key: str, cse_id: str, num_resul
         else:
             logger.info(f"Google Search: Нет сниппетов/заголовков для '{query_short}'.")
             return None
-    except httpx.TimeoutException:
-        logger.warning(f"Google Search: Таймаут запроса для '{query_short}'")
     except httpx.HTTPStatusError as e:
-        status = e.response.status_code
-        response_text = e.response.text
-        if status == 400: logger.error(f"Google Search: Ошибка 400 (Bad Request) для '{query_short}'. Ответ: {response_text[:200]}...")
-        elif status == 403: logger.error(f"Google Search: Ошибка 403 (Forbidden) для '{query_short}'. Проверьте API ключ/CSE ID. Ответ: {response_text[:200]}...")
-        elif status == 429: logger.warning(f"Google Search: Ошибка 429 (Too Many Requests) для '{query_short}'. Квота? Ответ: {response_text[:200]}...")
-        elif status >= 500: logger.warning(f"Google Search: Серверная ошибка {status} для '{query_short}'. Ответ: {response_text[:200]}...")
-        else: logger.error(f"Google Search: Неожиданный статус {status} для '{query_short}'. Ответ: {response_text[:200]}...")
-    except httpx.RequestError as e:
-        logger.error(f"Google Search: Ошибка сети (RequestError) для '{query_short}' - {e}")
-    except json.JSONDecodeError as e_json:
-        logger.error(f"Google Search: Ошибка JSON для '{query_short}' - {e_json}. Ответ (вероятно, не JSON): {response.text[:200] if 'response' in locals() else 'N/A'}...")
+        logger.error(f"Google Search: Ошибка HTTP {e.response.status_code} для '{query_short}'. Ответ: {e.response.text[:200]}...")
     except Exception as e:
         logger.error(f"Google Search: Непредвиденная ошибка для '{query_short}' - {e}", exc_info=True)
     return None
+
+async def perform_ddg_search(query: str, num_results: int) -> list[str] | None:
+    """Выполняет поиск через DuckDuckGo как запасной вариант."""
+    query_short = query[:50] + '...' if len(query) > 50 else query
+    logger.info(f"Запрос к DDG Search API для '{query_short}'...")
+    try:
+        # DDGS().text() является синхронной, поэтому запускаем в отдельном потоке
+        results = await asyncio.to_thread(DDGS().text, keywords=query, region='ru-ru', max_results=num_results)
+        if results:
+            snippets = [r['body'] for r in results]
+            logger.info(f"DDG Search: Найдено {len(snippets)} результатов для '{query_short}'.")
+            return snippets
+        logger.info(f"DDG Search: Не найдено результатов для '{query_short}'.")
+        return None
+    except Exception as e:
+        logger.error(f"DDG Search: Непредвиденная ошибка для '{query_short}' - {e}", exc_info=True)
+        return None
+
+async def perform_web_search(query: str, context: ContextTypes.DEFAULT_TYPE) -> tuple[str | None, str | None]:
+    """
+    Универсальная функция поиска. Сначала пытается через Google, при неудаче - через DDG.
+    Возвращает кортеж (строка_с_результатами, источник_поиска).
+    """
+    session = getattr(context.application, 'http_client', None)
+    if session and not session.is_closed:
+        google_results = await perform_google_search(query, GOOGLE_API_KEY, GOOGLE_CSE_ID, GOOGLE_SEARCH_MAX_RESULTS, session)
+        if google_results:
+            search_str = "\n".join(f"- {s.strip()}" for s in google_results)
+            return search_str, "Google"
+            
+    logger.warning(f"Поиск Google не дал результатов для '{query[:50]}...'. Переключаюсь на DuckDuckGo.")
+    ddg_results = await perform_ddg_search(query, DDG_MAX_RESULTS)
+    if ddg_results:
+        search_str = "\n".join(f"- {s.strip()}" for s in ddg_results)
+        return search_str, "DuckDuckGo"
+        
+    return None, None
 
 async def _generate_gemini_response(
     user_prompt_text_initial: str,
@@ -922,10 +949,70 @@ def build_context_for_model(chat_history: list) -> list:
 
 # <<< НАЧАЛО БЛОКА ИСПРАВЛЕНИЯ >>>
 
+async def perform_google_search(query: str, api_key: str, cse_id: str, num_results: int, session: httpx.AsyncClient) -> list[str] | None:
+    # Эта функция остается без изменений, она работает хорошо.
+    search_url = "https://www.googleapis.com/customsearch/v1"
+    params = {'key': api_key, 'cx': cse_id, 'q': query, 'num': num_results, 'lr': 'lang_ru', 'gl': 'ru'}
+    query_short = query[:50] + '...' if len(query) > 50 else query
+    logger.debug(f"Запрос к Google Search API для '{query_short}'...")
+    try:
+        response = await session.get(search_url, params=params, timeout=10.0)
+        response.raise_for_status() 
+        data = response.json()
+        items = data.get('items', [])
+        snippets = [item.get('snippet', item.get('title', '')) for item in items if item.get('snippet') or item.get('title')]
+        if snippets:
+            logger.info(f"Google Search: Найдено {len(snippets)} результатов для '{query_short}'.")
+            return snippets
+        else:
+            logger.info(f"Google Search: Нет сниппетов/заголовков для '{query_short}'.")
+            return None
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Google Search: Ошибка HTTP {e.response.status_code} для '{query_short}'. Ответ: {e.response.text[:200]}...")
+    except Exception as e:
+        logger.error(f"Google Search: Непредвиденная ошибка для '{query_short}' - {e}", exc_info=True)
+    return None
+
+async def perform_ddg_search(query: str, num_results: int) -> list[str] | None:
+    """Выполняет поиск через DuckDuckGo как запасной вариант."""
+    query_short = query[:50] + '...' if len(query) > 50 else query
+    logger.info(f"Запрос к DDG Search API для '{query_short}'...")
+    try:
+        # DDGS().text() является синхронной, поэтому запускаем в отдельном потоке
+        results = await asyncio.to_thread(DDGS().text, keywords=query, region='ru-ru', max_results=num_results)
+        if results:
+            snippets = [r['body'] for r in results]
+            logger.info(f"DDG Search: Найдено {len(snippets)} результатов для '{query_short}'.")
+            return snippets
+        logger.info(f"DDG Search: Не найдено результатов для '{query_short}'.")
+        return None
+    except Exception as e:
+        logger.error(f"DDG Search: Непредвиденная ошибка для '{query_short}' - {e}", exc_info=True)
+        return None
+
+async def perform_web_search(query: str, context: ContextTypes.DEFAULT_TYPE) -> tuple[str | None, str | None]:
+    """
+    Универсальная функция поиска. Сначала пытается через Google, при неудаче - через DDG.
+    Возвращает кортеж (строка_с_результатами, источник_поиска).
+    """
+    session = getattr(context.application, 'http_client', None)
+    if session and not session.is_closed:
+        google_results = await perform_google_search(query, GOOGLE_API_KEY, GOOGLE_CSE_ID, GOOGLE_SEARCH_MAX_RESULTS, session)
+        if google_results:
+            search_str = "\n".join(f"- {s.strip()}" for s in google_results)
+            return search_str, "Google"
+            
+    logger.warning(f"Поиск Google не дал результатов для '{query[:50]}...'. Переключаюсь на DuckDuckGo.")
+    ddg_results = await perform_ddg_search(query, DDG_MAX_RESULTS)
+    if ddg_results:
+        search_str = "\n".join(f"- {s.strip()}" for s in ddg_results)
+        return search_str, "DuckDuckGo"
+        
+    return None, None
+
 async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text_to_process: str):
     """
-    Основная логика обработки текстового запроса, полученного либо напрямую,
-    либо после расшифровки голоса. Выполняет поиск, вызывает модель и отправляет ответ.
+    Основная логика обработки текстового запроса. Выполняет поиск, вызывает модель и отправляет ответ.
     """
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -936,22 +1023,19 @@ async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
     user_name = user.first_name if user.first_name else "Пользователь"
     user_message_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name) + text_to_process
 
-    # --- Поиск Google ---
+    # --- Универсальный Поиск ---
     search_context_str = ""
     search_actually_performed = False
-    session = getattr(context.application, 'http_client', None)
-    if session and not session.is_closed:
-        google_results = await perform_google_search(text_to_process, GOOGLE_API_KEY, GOOGLE_CSE_ID, GOOGLE_SEARCH_MAX_RESULTS, session)
-        if google_results:
-            search_context_str = "\n\n==== РЕЗУЛЬТАТЫ ПОИСКА ====\n" + "\n".join(f"- {s.strip()}" for s in google_results)
-            search_actually_performed = True
+    search_results, search_source = await perform_web_search(text_to_process, context)
+    if search_results:
+        search_context_str = f"\n\n==== РЕЗУЛЬТАТЫ ПОИСКА ({search_source}) ====\n{search_results}"
+        search_actually_performed = True
             
     # --- Формирование промпта и вызов модели ---
     current_time_str = get_current_time_str()
     time_prefix_for_prompt = f"(Текущая дата и время: {current_time_str})\n"
     final_user_prompt = f"{time_prefix_for_prompt}{user_message_for_history}{search_context_str}"
 
-    # Сохраняем сообщение пользователя в историю
     history_entry_user = {
         "role": "user", "parts": [{"text": user_message_for_history}],
         "user_id": user_id, "message_id": message.message_id
@@ -972,7 +1056,6 @@ async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
         is_text_request_with_search=search_actually_performed
     )
     
-    # --- Отправка ответа и сохранение в историю ---
     sent_message = await send_reply(message, gemini_reply_text, context)
     
     chat_history.append({
@@ -982,7 +1065,6 @@ async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if context.application.persistence:
         await context.application.persistence.update_chat_data(chat_id, context.chat_data)
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | История чата (текст/голос) принудительно сохранена.")
 
     while len(chat_history) > MAX_HISTORY_MESSAGES:
         chat_history.pop(0)
@@ -990,7 +1072,7 @@ async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Обрабатывает входящее голосовое сообщение: расшифровывает и передает текст в process_text_query.
+    Обрабатывает голос: расшифровывает и передает текст в process_text_query.
     """
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -1000,7 +1082,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_id = user.id
     log_prefix = "VoiceHandler"
-
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     try:
@@ -1018,16 +1099,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Отправка аудио на расшифровку в {model_id}.")
-        response = await asyncio.to_thread(
-            model_obj.generate_content,
-            [transcription_prompt, {"mime_type": "audio/ogg", "data": bytes(file_bytes)}]
-        )
+        response = await asyncio.to_thread(model_obj.generate_content, [transcription_prompt, {"mime_type": "audio/ogg", "data": bytes(file_bytes)}])
         transcribed_text = _get_text_from_response(response, user_id, chat_id, log_prefix)
-
         if not transcribed_text:
             await message.reply_text("🤖 Не удалось распознать речь. Попробуйте еще раз.")
             return
-            
     except Exception as e:
         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка при расшифровке: {e}", exc_info=True)
         await message.reply_text(f"❌ Ошибка сервиса распознавания речи: {str(e)[:100]}")
@@ -1042,12 +1118,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Обрабатывает все входящие текстовые сообщения, ссылки YouTube и уточняющие вопросы (ответы на сообщения бота).
     """
     message = update.message
-    if not message or not message.text: return
+    if not message or (not message.text and not message.caption): return
     
     chat_id = update.effective_chat.id
     user = update.effective_user
     user_id = user.id
-    original_text = message.text.strip()
+    original_text = (message.text or message.caption).strip()
     chat_history = context.chat_data.setdefault("history", [])
     
     context.user_data['id'] = user_id
@@ -1056,48 +1132,66 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # --- 1. Обработка уточняющих вопросов (re-analyze) ---
     if message.reply_to_message and not original_text.startswith('/'):
+        # Логика re-analyze остается без изменений
         replied_to_id = message.reply_to_message.message_id
         old_bot_response = message.reply_to_message.text or ""
-        
         for i in range(len(chat_history) - 1, -1, -1):
             if chat_history[i].get("role") == "model" and chat_history[i].get("bot_message_id") == replied_to_id:
                 if i > 0 and chat_history[i-1].get("role") == "user":
                     prev_user_entry = chat_history[i-1]
                     content_type = prev_user_entry.get("content_type")
                     content_id = prev_user_entry.get("content_id")
-                    
                     if content_type and content_id:
                         new_reply_text = None
                         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-                        
-                        if content_type == "image":
-                            new_reply_text = await reanalyze_image_from_id(content_id, old_bot_response, original_text, context)
-                        elif content_type == "document":
-                            new_reply_text = await reanalyze_document_from_id(content_id, old_bot_response, original_text, context)
-
+                        if content_type == "image": new_reply_text = await reanalyze_image_from_id(content_id, old_bot_response, original_text, context)
+                        elif content_type == "document": new_reply_text = await reanalyze_document_from_id(content_id, old_bot_response, original_text, context)
                         if new_reply_text:
                             user_name = user.first_name or "Пользователь"
                             chat_history.append({"role": "user", "parts": [{"text": USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name) + original_text}], "user_id": user_id, "message_id": message.message_id})
                             sent_message = await send_reply(message, new_reply_text, context)
                             chat_history.append({"role": "model", "parts": [{"text": new_reply_text}], "bot_message_id": sent_message.message_id if sent_message else None})
-                            if context.application.persistence:
-                                await context.application.persistence.update_chat_data(chat_id, context.chat_data)
+                            if context.application.persistence: await context.application.persistence.update_chat_data(chat_id, context.chat_data)
                             return
                 break
     
     # --- 2. Обработка ссылок YouTube ---
     youtube_id = extract_youtube_id(original_text)
     if youtube_id:
-        # Эта логика остается здесь, т.к. она уникальна для YouTube
+        log_prefix = "YouTubeHandler"
+        user_name = user.first_name or "Пользователь"
+        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Обнаружена ссылка YouTube (ID: {youtube_id}).")
+        await message.reply_text(f"Окей, {user_name}, сейчас гляну видео (ID: ...{youtube_id[-4:]}) и сделаю конспект...")
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        transcript_text = "..." # (здесь ваш код для получения транскрипта)
-        # ... и остальная логика для YouTube ...
+        
+        transcript_text = None
+        try:
+            transcript_list = await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, youtube_id, languages=['ru', 'en'])
+            transcript_text = " ".join([d['text'] for d in transcript_list])
+        except (TranscriptsDisabled, NoTranscriptFound):
+            await message.reply_text("❌ К сожалению, для этого видео нет субтитров, поэтому я не могу сделать конспект.")
+            return
+        except RequestBlocked:
+            await message.reply_text("❌ Ой, похоже, YouTube временно заблокировал мои запросы. Попробуйте позже.")
+            return
+        except Exception as e_transcript:
+            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка при получении расшифровки для {youtube_id}: {e_transcript}", exc_info=True)
+            await message.reply_text("❌ Произошла ошибка при попытке получить субтитры из видео.")
+            return
+
+        summary_prompt = (
+            f"Проанализируй следующую расшифровку видео с YouTube и сделай из нее информативный конспект. "
+            f"Оригинальный запрос пользователя был: '{original_text}'. Ответь на русском языке.\n\n"
+            f"--- НАЧАЛО РАСШИФРОВКИ ---\n{transcript_text[:20000]}\n--- КОНЕЦ РАСШИФРОВКИ ---"
+        )
+        # Обрезаем до 20к символов на всякий случай
+        
+        # Передаем задачу на обработку основной функции
+        await process_text_query(update, context, summary_prompt)
         return
 
     # --- 3. Обработка обычного текстового сообщения ---
     await process_text_query(update, context, original_text)
-
-# <<< КОНЕЦ БЛОКА ИСПРАВЛЕНИЯ >>>
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
