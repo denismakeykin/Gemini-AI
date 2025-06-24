@@ -313,6 +313,21 @@ def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value
 def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value):
     context.user_data[key] = value
 
+def sanitize_for_html(text: str) -> str:
+    """
+    Принудительно заменяет остатки Markdown на HTML-теги.
+    Работает как "санитар" на выходе, если модель ослушалась.
+    """
+    # Сначала заменяем жирный с двойными звездочками
+    text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
+    # Затем курсив с одинарными звездочками
+    text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
+    # Затем блоки кода
+    text = re.sub(r'```(.*?)```', r'<code>\1</code>', text, flags=re.DOTALL)
+    # И инлайн-код
+    text = re.sub(r'`(.*?)`', r'<code>\1</code>', text)
+    return text
+
 async def send_reply(target_message: Message, text: str, context: ContextTypes.DEFAULT_TYPE) -> Message | None:
     MAX_MESSAGE_LENGTH = 4096
 
@@ -335,7 +350,9 @@ async def send_reply(target_message: Message, text: str, context: ContextTypes.D
             remaining_text = remaining_text[split_pos:].lstrip()
         return chunks
 
-    reply_chunks = smart_chunker(text, MAX_MESSAGE_LENGTH)
+    sanitized_text = sanitize_for_html(text)
+    
+    reply_chunks = smart_chunker(sanitized_text, MAX_MESSAGE_LENGTH)
     sent_message = None
     chat_id = target_message.chat_id
     message_id = target_message.message_id
