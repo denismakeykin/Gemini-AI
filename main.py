@@ -574,6 +574,71 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_model_name = AVAILABLE_MODELS.get(current_model, current_model)
     await update.message.reply_text(f"{user_mention}, выбери модель (сейчас у тебя: {current_model_name}):", reply_markup=InlineKeyboardMarkup(keyboard))
 
+# <<< НАЧАЛО: НОВЫЙ БЛОК ДЛЯ КОМАНДЫ ТРАНСКРИПЦИИ >>>
+
+async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает команду /transcribe, использованную в ответ на голосовое сообщение,
+    и возвращает его дословную текстовую расшифровку.
+    """
+    message = update.message
+    replied_message = message.reply_to_message
+    
+    # 1. Проверяем, что команда использована в ответ на сообщение
+    if not replied_message:
+        await message.reply_text("ℹ️ Пожалуйста, используйте эту команду, отвечая на голосовое сообщение, которое нужно превратить в текст.")
+        return
+
+    # 2. Проверяем, что ответ был именно на голосовое сообщение
+    if not replied_message.voice:
+        await message.reply_text("❌ Эта команда работает только с голосовыми сообщениями.")
+        return
+
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    user_id = user.id
+    log_prefix = "TranscribeCmd"
+
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    # 3. Скачиваем аудиофайл из сообщения, на которое ответили
+    try:
+        voice_file = await replied_message.voice.get_file()
+        file_bytes = await voice_file.download_as_bytearray()
+    except Exception as e:
+        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка скачивания голоса: {e}", exc_info=True)
+        await message.reply_text("❌ Ошибка при загрузке исходного голосового сообщения.")
+        return
+
+    # 4. Отправляем в Gemini с той же логикой, что и в handle_voice
+    transcription_prompt = "Расшифруй это аудиосообщение и верни только текст расшифровки, без каких-либо добавлений или комментариев."
+    effective_context = _get_effective_context_for_task("audio", context, user_id, chat_id, log_prefix)
+    model_id = get_user_setting(effective_context, 'selected_model', DEFAULT_MODEL)
+    model_obj = genai.GenerativeModel(model_id)
+
+    try:
+        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Запрос на чистую транскрипцию в {model_id}.")
+        response = await asyncio.to_thread(
+            model_obj.generate_content,
+            [transcription_prompt, {"mime_type": "audio/ogg", "data": bytes(file_bytes)}]
+        )
+        transcribed_text = _get_text_from_response(response, user_id, chat_id, log_prefix)
+
+        if not transcribed_text:
+            await message.reply_text("🤖 Не удалось распознать речь в указанном сообщении.")
+            return
+            
+    except Exception as e:
+        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка при транскрипции: {e}", exc_info=True)
+        await message.reply_text(f"❌ Ошибка сервиса распознавания речи: {str(e)[:100]}")
+        return
+
+    # 5. Отправляем результат пользователю
+    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Транскрипция успешна.")
+    await message.reply_text(f"📝 *Транскрипт:*\n\n{transcribed_text}", parse_mode=ParseMode.MARKDOWN)
+
+# <<< КОНЕЦ: НОВЫЙ БЛОК ДЛЯ КОМАНДЫ ТРАНСКРИПЦИИ >>>
+
 async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
@@ -618,69 +683,6 @@ async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Ошибка обработки выбора.")
         except Exception:
             pass
-
-# <<< НАЧАЛО БЛОКА ИСПРАВЛЕНИЯ >>>
-
-async def perform_google_search(query: str, api_key: str, cse_id: str, num_results: int, session: httpx.AsyncClient) -> list[str] | None:
-    # Эта функция остается без изменений, она работает хорошо.
-    search_url = "https://www.googleapis.com/customsearch/v1"
-    params = {'key': api_key, 'cx': cse_id, 'q': query, 'num': num_results, 'lr': 'lang_ru', 'gl': 'ru'}
-    query_short = query[:50] + '...' if len(query) > 50 else query
-    logger.debug(f"Запрос к Google Search API для '{query_short}'...")
-    try:
-        response = await session.get(search_url, params=params, timeout=10.0)
-        response.raise_for_status() 
-        data = response.json()
-        items = data.get('items', [])
-        snippets = [item.get('snippet', item.get('title', '')) for item in items if item.get('snippet') or item.get('title')]
-        if snippets:
-            logger.info(f"Google Search: Найдено {len(snippets)} результатов для '{query_short}'.")
-            return snippets
-        else:
-            logger.info(f"Google Search: Нет сниппетов/заголовков для '{query_short}'.")
-            return None
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Google Search: Ошибка HTTP {e.response.status_code} для '{query_short}'. Ответ: {e.response.text[:200]}...")
-    except Exception as e:
-        logger.error(f"Google Search: Непредвиденная ошибка для '{query_short}' - {e}", exc_info=True)
-    return None
-
-async def perform_ddg_search(query: str, num_results: int) -> list[str] | None:
-    """Выполняет поиск через DuckDuckGo как запасной вариант."""
-    query_short = query[:50] + '...' if len(query) > 50 else query
-    logger.info(f"Запрос к DDG Search API для '{query_short}'...")
-    try:
-        # DDGS().text() является синхронной, поэтому запускаем в отдельном потоке
-        results = await asyncio.to_thread(DDGS().text, keywords=query, region='ru-ru', max_results=num_results)
-        if results:
-            snippets = [r['body'] for r in results]
-            logger.info(f"DDG Search: Найдено {len(snippets)} результатов для '{query_short}'.")
-            return snippets
-        logger.info(f"DDG Search: Не найдено результатов для '{query_short}'.")
-        return None
-    except Exception as e:
-        logger.error(f"DDG Search: Непредвиденная ошибка для '{query_short}' - {e}", exc_info=True)
-        return None
-
-async def perform_web_search(query: str, context: ContextTypes.DEFAULT_TYPE) -> tuple[str | None, str | None]:
-    """
-    Универсальная функция поиска. Сначала пытается через Google, при неудаче - через DDG.
-    Возвращает кортеж (строка_с_результатами, источник_поиска).
-    """
-    session = getattr(context.application, 'http_client', None)
-    if session and not session.is_closed:
-        google_results = await perform_google_search(query, GOOGLE_API_KEY, GOOGLE_CSE_ID, GOOGLE_SEARCH_MAX_RESULTS, session)
-        if google_results:
-            search_str = "\n".join(f"- {s.strip()}" for s in google_results)
-            return search_str, "Google"
-            
-    logger.warning(f"Поиск Google не дал результатов для '{query[:50]}...'. Переключаюсь на DuckDuckGo.")
-    ddg_results = await perform_ddg_search(query, DDG_MAX_RESULTS)
-    if ddg_results:
-        search_str = "\n".join(f"- {s.strip()}" for s in ddg_results)
-        return search_str, "DuckDuckGo"
-        
-    return None, None
 
 async def _generate_gemini_response(
     user_prompt_text_initial: str,
@@ -1397,10 +1399,10 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
     application = builder.build()
     
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("transcribe", transcribe_command))
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("clear", clear_history))
     application.add_handler(CallbackQueryHandler(select_model_callback, pattern="^set_model_"))
-    
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -1410,6 +1412,7 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
         await application.initialize()
         commands = [
             BotCommand("start", "Начать работу и инфо"),
+            BotCommand("transcribe", "Превратить голосовое в текст"),
             BotCommand("model", "Выбрать модель Gemini"),
             BotCommand("clear", "Очистить историю чата"),
         ]
