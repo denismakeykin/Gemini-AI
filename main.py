@@ -451,7 +451,7 @@ def _get_effective_context_for_task(
     capability_map = {
         "vision": VISION_CAPABLE_KEYWORDS,
         "video": VIDEO_CAPABLE_KEYWORDS,
-        "audio": ['gemini-2.5', 'pro', 'flash']  # <<< ИЗМЕНЕНИЕ: Добавлена поддержка аудио
+        "audio": ['gemini-2.5', 'pro', 'flash']
     }
     required_keywords = capability_map.get(task_type)
     if not required_keywords:
@@ -920,8 +920,13 @@ def build_context_for_model(chat_history: list) -> list:
     history_for_model.reverse()
     return history_for_model
 
-# <<< НАЧАЛО: НОВЫЙ ОБРАБОТЧИК ДЛЯ ГОЛОСОВЫХ СООБЩЕНИЙ >>>
+# <<< ИЗМЕНЕНИЕ: Функция handle_voice полностью переписана >>>
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает входящее голосовое сообщение.
+    Эта функция действует как "переводчик": расшифровывает голос в текст,
+    а затем передает управление основному обработчику текста handle_message.
+    """
     chat_id = update.effective_chat.id
     user = update.effective_user
     if not user:
@@ -929,10 +934,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = user.id
     message = update.message
-    log_prefix_handler = "VoiceHandler"
+    log_prefix_handler = "VoiceTranslator"
 
     if not message or not message.voice:
-        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) В handle_voice не найдено голосовое сообщение.")
+        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Нет голосового сообщения.")
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -944,69 +949,44 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("❌ Не удалось загрузить голосовое сообщение (файл пуст).")
             return
     except Exception as e:
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Не удалось скачать голосовое по file_id: {message.voice.file_id}: {e}", exc_info=True)
-        await message.reply_text("❌ Не удалось загрузить голосовое сообщение.")
+        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Ошибка скачивания голоса: {e}", exc_info=True)
+        await message.reply_text("❌ Ошибка при загрузке вашего голосового сообщения.")
         return
 
+    # Запрашиваем у Gemini только расшифровку текста
+    transcription_prompt = "Расшифруй это аудиосообщение и верни только текст расшифровки, без каких-либо добавлений или комментариев."
+    
+    # Для расшифровки всегда используем быструю и подходящую для аудио модель
     effective_context_voice = _get_effective_context_for_task("audio", context, user_id, chat_id, log_prefix_handler)
-    user_name = user.first_name or "Пользователь"
+    model_id_for_transcription = get_user_setting(effective_context_voice, 'selected_model', DEFAULT_MODEL)
+    model_obj = genai.GenerativeModel(model_id_for_transcription)
+
+    try:
+        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Отправка аудио на расшифровку в модель {model_id_for_transcription}.")
+        response = await asyncio.to_thread(
+            model_obj.generate_content,
+            [transcription_prompt, {"mime_type": "audio/ogg", "data": bytes(file_bytes)}]
+        )
+        transcribed_text = _get_text_from_response(response, user_id, chat_id, log_prefix_handler)
+
+        if not transcribed_text:
+            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Модель вернула пустую расшифровку.")
+            await message.reply_text("🤖 Не удалось распознать речь в вашем сообщении. Пожалуйста, попробуйте еще раз.")
+            return
+            
+    except Exception as e:
+        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Ошибка при расшифровке: {e}", exc_info=True)
+        await message.reply_text(f"❌ Ошибка сервиса распознавания речи: {str(e)[:100]}")
+        return
+
+    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Голос расшифрован: -> '{transcribed_text}'")
     
-    # Промпт для модели: просим не просто расшифровать, а сразу ответить по существу
-    prompt_text_voice = (f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name)}"
-                         f"Это голосовое сообщение от пользователя. Расшифруй его и сразу ответь на него по существу. "
-                         f"Саму расшифровку в ответе приводить не нужно, только твой итоговый ответ.")
-
-    # Собираем данные для запроса к Gemini
-    parts_voice = [
-    prompt_text_voice,
-    {"mime_type": "audio/ogg", "data": bytes(file_bytes)} # <-- Вот оно, исправление!
-]
+    # "Подменяем" текст в сообщении на расшифрованный
+    message.text = transcribed_text
     
-    # Используем _generate_gemini_response для обработки запроса, чтобы сохранить все плюсы (ретрансляции, обработка ошибок и т.д.)
-    # Мы передаем "фальшивую" историю, состоящую только из одного этого запроса,
-    # так как аудиофайлы не могут быть частью длинной истории в текущей реализации API.
-    reply_text = await _generate_gemini_response(
-        user_prompt_text_initial=prompt_text_voice,
-        chat_history_for_model_initial=[{"role": "user", "parts": parts_voice}],
-        user_id=user_id, chat_id=chat_id, context=effective_context_voice,
-        system_instruction=system_instruction_text, log_prefix="VoiceGen"
-    )
-
-    if not reply_text:
-        reply_text = "🤖 Не удалось распознать речь или сформулировать ответ."
-
-    # Сохраняем "диалог" в историю для будущих сообщений
-    chat_history = context.chat_data.setdefault("history", [])
-    
-    # Для истории мы представляем голосовое сообщение как текстовую заглушку
-    user_message_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name) + "[Пользователь отправил голосовое сообщение]"
-    
-    history_entry_user = {
-        "role": "user",
-        "parts": [{"text": user_message_for_history}],
-        "content_type": "voice", # Для возможного будущего re-analyze
-        "content_id": message.voice.file_id,
-        "user_id": user_id,
-        "message_id": message.message_id
-    }
-    chat_history.append(history_entry_user)
-
-    sent_message = await send_reply(message, reply_text, context)
-
-    history_entry_model = {
-        "role": "model",
-        "parts": [{"text": reply_text}],
-        "bot_message_id": sent_message.message_id if sent_message else None
-    }
-    chat_history.append(history_entry_model)
-
-    if context.application.persistence:
-        await context.application.persistence.update_chat_data(chat_id, context.chat_data)
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) История чата (голос) сохранена.")
-    
-    while len(chat_history) > MAX_HISTORY_MESSAGES:
-        chat_history.pop(0)
-# <<< КОНЕЦ: НОВЫЙ ОБРАБОТЧИК ДЛЯ ГОЛОСОВЫХ СООБЩЕНИЙ >>>
+    # Передаем управление основному обработчику текста
+    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Передаю управление в handle_message.")
+    return await handle_message(update, context)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1067,7 +1047,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     youtube_id = extract_youtube_id(original_user_message_text)
     if youtube_id:
         user_mention = user_name
-        log_prefix_handler = "YouTubeHandler" # Добавил для консистентности логов
+        log_prefix_handler = "YouTubeHandler"
         logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Обнаружена ссылка YouTube (ID: {youtube_id}).")
         try: await update.message.reply_text(f"Окей, {user_mention}, сейчас гляну видео (ID: ...{youtube_id[-4:]}) и попробую сделать конспект из субтитров...")
         except Exception as e_reply: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Не удалось отправить сообщение 'гляну видео': {e_reply}")
@@ -1110,8 +1090,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         while len(chat_history) > MAX_HISTORY_MESSAGES: chat_history.pop(0)
         return
 
-    # Обработка обычного текста
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    # Обработка обычного текста (и текста из голосовых)
+    if not message.reply_to_message: # Не отправляем "typing" повторно при re-analyze
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     
     search_context_str = ""
     search_actually_performed = False
@@ -1127,12 +1108,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     final_user_prompt = f"{time_prefix_for_prompt}{user_message_for_history}{search_context_str}"
 
-    chat_history.append({
+    # <<< ИЗМЕНЕНИЕ: Умное сохранение в историю >>>
+    history_entry_user = {
         "role": "user",
         "parts": [{"text": user_message_for_history}],
         "user_id": user_id,
         "message_id": message.message_id
-    })
+    }
+    # Если это было голосовое, добавляем метки для re-analyze
+    if message.voice:
+        history_entry_user["content_type"] = "voice"
+        history_entry_user["content_id"] = message.voice.file_id
+    chat_history.append(history_entry_user)
     
     context_for_model = build_context_for_model(chat_history)
     if context_for_model and context_for_model[-1]["role"] == "user":
@@ -1155,7 +1142,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.application.persistence:
         await context.application.persistence.update_chat_data(chat_id, context.chat_data)
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | История чата (текст) принудительно сохранена.")
+        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | История чата (текст/голос) принудительно сохранена.")
 
     while len(chat_history) > MAX_HISTORY_MESSAGES:
         chat_history.pop(0)
@@ -1368,7 +1355,6 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
     application.add_handler(CommandHandler("clear", clear_history))
     application.add_handler(CallbackQueryHandler(select_model_callback, pattern="^set_model_"))
     
-    # <<< ИЗМЕНЕНИЕ: Зарегистрирован новый обработчик >>>
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
