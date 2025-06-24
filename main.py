@@ -528,9 +528,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_message_plain_parts = [
         f"Меня зовут Женя, работаю на Google Gemini {raw_bot_core_model_display_name} с настройками от автора бота: {author_channel_link_raw}",
         f"- обладаю огромным объемом знаний {date_knowledge_text_raw} и поиском Google,",
-        f"- умею понимать и обсуждать изображения, txt, pdf и веб-страницы,",
+        f"- умею понимать и обсуждать изображения, голосовые сообщения (!), файлы txt, pdf и веб-страницы,",
         f"- знаю ваше имя, помню историю чата. Пишите лично и добавляйте меня в группы.",
-        f"(!) Пользуясь данным ботом, вы автоматически соглашаетесь на отправку ваших сообщений через Google API для получения ответов моделей Gemini."
+        f"(!) Пользуясь данным ботом, вы автоматически соглашаетесь на отправку ваших сообщений через Google (Search + Gemini API) для получения ответов."
     ]
 
     start_message_plain = "\n".join(start_message_plain_parts)
