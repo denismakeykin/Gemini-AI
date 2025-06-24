@@ -635,7 +635,7 @@ async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # 5. Отправляем результат пользователю
     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Транскрипция успешна.")
-    await message.reply_text(f"📝 *Транскрипт:*\n\n{transcribed_text}", parse_mode=ParseMode.MARKDOWN)
+    await message.reply_text(f"📝 *Транскрипт:*\n\n{transcribed_text}", parse_mode=ParseMode.HMTL)
 
 # <<< КОНЕЦ: НОВЫЙ БЛОК ДЛЯ КОМАНДЫ ТРАНСКРИПЦИИ >>>
 
@@ -656,7 +656,7 @@ async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
             reply_text = f"Ок, {user_mention}, твоя модель установлена: **{model_name}**"
             logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Модель установлена на {model_name} для {user_mention}.")
             try:
-                await query.edit_message_text(reply_text, parse_mode=ParseMode.MARKDOWN)
+                await query.edit_message_text(reply_text, parse_mode=ParseMode.HTML)
             except BadRequest as e_md:
                  if "Message is not modified" in str(e_md):
                      logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Пользователь {user_mention} выбрал ту же модель: {model_name}")
@@ -667,10 +667,10 @@ async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
                          await query.edit_message_text(reply_text.replace('**', ''))
                      except Exception as e_edit_plain:
                           logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение даже как простой текст для {user_mention}: {e_edit_plain}. Отправляю новое.")
-                          await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.MARKDOWN)
+                          await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.HTML)
             except Exception as e:
                 logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение (другая ошибка) для {user_mention}: {e}. Отправляю новое.", exc_info=True)
-                await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.MARKDOWN)
+                await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.HTML)
         else:
             logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Пользователь {user_mention} выбрал неизвестную модель: {selected}")
             try:
