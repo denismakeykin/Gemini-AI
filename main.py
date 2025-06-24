@@ -313,37 +313,36 @@ def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value
 def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value):
     context.user_data[key] = value
 
-# <<< НАЧАЛО БЛОКА ИСПРАВЛЕНИЯ >>>
-def sanitize_for_html(text: str) -> str:
+# <<< НАЧАЛО БЛОКА ИСПРАВЛЕНИЯ (ФИНАЛЬНАЯ ВЕРСИЯ) >>>
+def prepare_html_for_telegram(text: str) -> str:
     """
-    Принудительно заменяет остатки Markdown на HTML-теги.
+    Финальная, надежная функция для подготовки текста к отправке в Telegram в режиме HTML.
+    Сначала заменяет Markdown, потом экранирует ВСЕ спецсимволы,
+    а затем "разэкранирует" только разрешенные HTML-теги.
     """
+    # 1. Заменяем остатки Markdown, если модель их сгенерировала
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
     text = re.sub(r'```(.*?)```', r'<code>\1</code>', text, flags=re.DOTALL)
     text = re.sub(r'`(.*?)`', r'<code>\1</code>', text)
+    
+    # 2. Экранируем амперсанд в первую очередь, т.к. он используется для экранирования
+    text = text.replace('&', '&')
+    
+    # 3. Экранируем угловые скобки
+    text = text.replace('<', '<')
+    text = text.replace('>', '>')
+    
+    # 4. Теперь, когда все "опасно", "разрешаем" наши теги обратно
+    allowed_tags_map = {
+        '<b>': '<b>', '</b>': '</b>',
+        '<i>': '<i>', '</i>': '</i>',
+        '<code>': '<code>', '</code>': '</code>',
+    }
+    for escaped, unescaped in allowed_tags_map.items():
+        text = text.replace(escaped, unescaped)
+        
     return text
-
-def escape_html_tags(text: str) -> str:
-    """
-    Экранирует символы '<' и '>', которые НЕ являются частью разрешенных HTML-тегов.
-    Это надежный способ предотвратить ошибки парсинга в Telegram.
-    """
-    allowed_tags_pattern = r'(</?(?:b|i|code)>)'
-    
-    # Разделяем текст на части: валидные теги и обычный текст
-    parts = re.split(allowed_tags_pattern, text)
-    
-    result = []
-    for i, part in enumerate(parts):
-        # Части с нечетными индексами - это наши разрешенные теги. Их не трогаем.
-        if i % 2 == 1:
-            result.append(part)
-        # Части с четными индексами - это обычный текст. В нем нужно экранировать спецсимволы.
-        else:
-            result.append(part.replace('<', '<').replace('>', '>'))
-            
-    return "".join(result)
 
 async def send_reply(target_message: Message, text: str, context: ContextTypes.DEFAULT_TYPE) -> Message | None:
     MAX_MESSAGE_LENGTH = 4096
@@ -363,11 +362,8 @@ async def send_reply(target_message: Message, text: str, context: ContextTypes.D
             remaining_text = remaining_text[split_pos:].lstrip()
         return chunks
 
-    # 1. Сначала принудительно заменяем Markdown на HTML
-    sanitized_text_md = sanitize_for_html(text)
-    
-    # 2. Затем экранируем все "опасные" символы, сохраняя наши теги
-    final_safe_text = escape_html_tags(sanitized_text_md)
+    # Применяем единую, надежную функцию очистки
+    final_safe_text = prepare_html_for_telegram(text)
 
     reply_chunks = smart_chunker(final_safe_text, MAX_MESSAGE_LENGTH)
     sent_message = None
@@ -384,17 +380,15 @@ async def send_reply(target_message: Message, text: str, context: ContextTypes.D
             await asyncio.sleep(0.1)
         return sent_message
     except BadRequest as e_html:
-        # Эта логика теперь будет срабатывать гораздо реже, но как защита она важна.
         if "Can't parse entities" in str(e_html).lower():
             problematic_chunk_preview = "N/A"
             if 'i' in locals() and i < len(reply_chunks):
                 problematic_chunk_preview = reply_chunks[i][:500].replace('\n', '\\n')
-            logger.warning(f"UserID: {current_user_id}, ChatID: {chat_id} | КРИТИЧЕСКАЯ ОШИБКА ПАРСИНГА HTML: {e_html}. Проблемный чанк (начало): '{problematic_chunk_preview}...'. Попытка отправить как обычный текст.")
+            logger.critical(f"UserID: {current_user_id}, ChatID: {chat_id} | ФИНАЛЬНАЯ ЗАЩИТА НЕ СРАБОТАЛА! Ошибка: {e_html}. ИСХОДНЫЙ ТЕКСТ: '{text[:500]}...'. Проблемный чанк: '{problematic_chunk_preview}...'. Отправляю как обычный текст.")
             
             try:
                 sent_message = None
-                # Для запасного варианта удаляем вообще все теги
-                plain_text = re.sub(r'<[^>]*>', '', text)
+                plain_text = re.sub(r'<[^>]*>', '', text) # Удаляем все теги из исходного текста
                 plain_chunks = [plain_text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(plain_text), MAX_MESSAGE_LENGTH)]
                 for i_plain, chunk_plain in enumerate(plain_chunks):
                      if i_plain == 0: sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk_plain, reply_to_message_id=message_id)
