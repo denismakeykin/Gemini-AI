@@ -958,9 +958,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Собираем данные для запроса к Gemini
     parts_voice = [
-        prompt_text_voice,
-        {"mime_type": "audio/ogg", "data": file_bytes}
-    ]
+    prompt_text_voice,
+    {"mime_type": "audio/ogg", "data": bytes(file_bytes)} # <-- Вот оно, исправление!
+]
     
     # Используем _generate_gemini_response для обработки запроса, чтобы сохранить все плюсы (ретрансляции, обработка ошибок и т.д.)
     # Мы передаем "фальшивую" историю, состоящую только из одного этого запроса,
