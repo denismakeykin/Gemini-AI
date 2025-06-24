@@ -314,33 +314,42 @@ def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value):
     context.user_data[key] = value
 
 # <<< НАЧАЛО БЛОКА ИСПРАВЛЕНИЯ >>>
-
 def sanitize_for_html(text: str) -> str:
     """
     Принудительно заменяет остатки Markdown на HTML-теги.
-    Работает как "санитар" на выходе, если модель ослушалась.
     """
-    # Сначала заменяем жирный с двойными звездочками
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
-    # Затем курсив с одинарными звездочками
     text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
-    # Затем блоки кода
     text = re.sub(r'```(.*?)```', r'<code>\1</code>', text, flags=re.DOTALL)
-    # И инлайн-код
     text = re.sub(r'`(.*?)`', r'<code>\1</code>', text)
     return text
 
-def escape_html(text: str) -> str:
+def escape_html_tags(text: str) -> str:
     """
-    Экранирует специальные HTML-символы '<' и '>', чтобы они не ломали парсер Telegram.
-    Это нужно делать ПОСЛЕ sanitize_for_html.
+    Экранирует символы '<' и '>', которые НЕ являются частью разрешенных HTML-тегов.
+    Это надежный способ предотвратить ошибки парсинга в Telegram.
     """
-    return text.replace('<', '<').replace('>', '>')
+    allowed_tags_pattern = r'(</?(?:b|i|code)>)'
+    
+    # Разделяем текст на части: валидные теги и обычный текст
+    parts = re.split(allowed_tags_pattern, text)
+    
+    result = []
+    for i, part in enumerate(parts):
+        # Части с нечетными индексами - это наши разрешенные теги. Их не трогаем.
+        if i % 2 == 1:
+            result.append(part)
+        # Части с четными индексами - это обычный текст. В нем нужно экранировать спецсимволы.
+        else:
+            result.append(part.replace('<', '<').replace('>', '>'))
+            
+    return "".join(result)
 
 async def send_reply(target_message: Message, text: str, context: ContextTypes.DEFAULT_TYPE) -> Message | None:
     MAX_MESSAGE_LENGTH = 4096
 
     def smart_chunker(text_to_chunk, chunk_size):
+        # Эта внутренняя функция остается без изменений
         chunks = []
         remaining_text = text_to_chunk
         while len(remaining_text) > 0:
@@ -354,26 +363,13 @@ async def send_reply(target_message: Message, text: str, context: ContextTypes.D
             remaining_text = remaining_text[split_pos:].lstrip()
         return chunks
 
-    # 1. Сначала принудительно заменяем Markdown на HTML, если модель "забылась"
-    sanitized_text = sanitize_for_html(text)
+    # 1. Сначала принудительно заменяем Markdown на HTML
+    sanitized_text_md = sanitize_for_html(text)
+    
+    # 2. Затем экранируем все "опасные" символы, сохраняя наши теги
+    final_safe_text = escape_html_tags(sanitized_text_md)
 
-    # 2. Теперь в тексте есть только нужные теги. Защитим их временно.
-    placeholders = {
-        '<b>': '::B_START::', '</b>': '::B_END::',
-        '<i>': '::I_START::', '</i>': '::I_END::',
-        '<code>': '::C_START::', '</code>': '::C_END::',
-    }
-    for tag, placeholder in placeholders.items():
-        sanitized_text = sanitized_text.replace(tag, placeholder)
-
-    # 3. Теперь, когда валидные теги в безопасности, экранируем все остальные '<' и '>'
-    safe_text = escape_html(sanitized_text)
-
-    # 4. Возвращаем наши теги на место
-    for tag, placeholder in placeholders.items():
-        safe_text = safe_text.replace(placeholder, tag)
-
-    reply_chunks = smart_chunker(safe_text, MAX_MESSAGE_LENGTH)
+    reply_chunks = smart_chunker(final_safe_text, MAX_MESSAGE_LENGTH)
     sent_message = None
     chat_id = target_message.chat_id
     message_id = target_message.message_id
@@ -387,19 +383,19 @@ async def send_reply(target_message: Message, text: str, context: ContextTypes.D
                 sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML)
             await asyncio.sleep(0.1)
         return sent_message
-    except BadRequest as e_md:
-        if "Can't parse entities" in str(e_md).lower():
+    except BadRequest as e_html:
+        # Эта логика теперь будет срабатывать гораздо реже, но как защита она важна.
+        if "Can't parse entities" in str(e_html).lower():
             problematic_chunk_preview = "N/A"
             if 'i' in locals() and i < len(reply_chunks):
                 problematic_chunk_preview = reply_chunks[i][:500].replace('\n', '\\n')
-            logger.warning(f"UserID: {current_user_id}, ChatID: {chat_id} | Ошибка парсинга HTML ({e_md}). Проблемный чанк (начало): '{problematic_chunk_preview}...'. Попытка отправить как обычный текст.")
+            logger.warning(f"UserID: {current_user_id}, ChatID: {chat_id} | КРИТИЧЕСКАЯ ОШИБКА ПАРСИНГА HTML: {e_html}. Проблемный чанк (начало): '{problematic_chunk_preview}...'. Попытка отправить как обычный текст.")
             
             try:
                 sent_message = None
                 # Для запасного варианта удаляем вообще все теги
                 plain_text = re.sub(r'<[^>]*>', '', text)
                 plain_chunks = [plain_text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(plain_text), MAX_MESSAGE_LENGTH)]
-
                 for i_plain, chunk_plain in enumerate(plain_chunks):
                      if i_plain == 0: sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk_plain, reply_to_message_id=message_id)
                      else: sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk_plain)
@@ -407,23 +403,13 @@ async def send_reply(target_message: Message, text: str, context: ContextTypes.D
                 return sent_message
             except Exception as e_plain:
                 logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Не удалось отправить даже как обычный текст: {e_plain}", exc_info=True)
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text="❌ Не удалось отправить ответ.")
-                except Exception as e_final_send:
-                    logger.critical(f"UserID: {current_user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке: {e_final_send}")
+                await context.bot.send_message(chat_id=chat_id, text="❌ Не удалось отправить ответ.")
         else:
-            logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Ошибка при отправке ответа (HTML): {e_md}", exc_info=True)
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка при отправке ответа: {str(e_md)[:100]}...")
-            except Exception as e_error_send:
-                logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке отправки: {e_error_send}")
+            logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Ошибка при отправке ответа (HTML): {e_html}", exc_info=True)
     except Exception as e_other:
         logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Непредвиденная ошибка при отправке ответа: {e_other}", exc_info=True)
-        try:
-            await context.bot.send_message(chat_id=chat_id, text="❌ Произошла непредвиденная ошибка при отправке ответа.")
-        except Exception as e_unexp_send:
-            logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Не удалось отправить сообщение о непредвиденной ошибке: {e_unexp_send}")
     return None
+# <<< КОНЕЦ БЛОКА ИСПРАВЛЕНИЯ >>>
 
 def _get_text_from_response(response_obj, user_id_for_log, chat_id_for_log, log_prefix_for_func) -> str | None:
     reply_text = None
