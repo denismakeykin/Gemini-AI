@@ -450,7 +450,8 @@ def _get_effective_context_for_task(
 ) -> ContextTypes.DEFAULT_TYPE:
     capability_map = {
         "vision": VISION_CAPABLE_KEYWORDS,
-        "video": VIDEO_CAPABLE_KEYWORDS
+        "video": VIDEO_CAPABLE_KEYWORDS,
+        "audio": ['gemini-2.5', 'pro', 'flash']  # <<< ИЗМЕНЕНИЕ: Добавлена поддержка аудио
     }
     required_keywords = capability_map.get(task_type)
     if not required_keywords:
@@ -525,7 +526,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     date_knowledge_text_raw = "до начала 2025 года"
     
     start_message_plain_parts = [
-        f"Меня зовут Джой, работаю на Google Gemini {raw_bot_core_model_display_name} с настройками от автора бота: {author_channel_link_raw}",
+        f"Меня зовут Женя, работаю на Google Gemini {raw_bot_core_model_display_name} с настройками от автора бота: {author_channel_link_raw}",
         f"- обладаю огромным объемом знаний {date_knowledge_text_raw} и поиском Google,",
         f"- умею понимать и обсуждать изображения, txt, pdf и веб-страницы,",
         f"- знаю ваше имя, помню историю чата. Пишите лично и добавляйте меня в группы.",
@@ -821,8 +822,6 @@ async def _generate_gemini_response(
 
     return reply
 
-# Вставьте этот блок перед handle_message
-
 async def reanalyze_image_from_id(file_id: str, old_bot_response: str, user_question: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
     """Асинхронно скачивает изображение и выполняет его повторный анализ с полным контекстом."""
     user_id = context.user_data.get('id', 'Unknown')
@@ -888,8 +887,6 @@ async def reanalyze_document_from_id(file_id: str, old_bot_response: str, user_q
         system_instruction=system_instruction_text, log_prefix=log_prefix
     )
 
-# Ваша старая do_reanalyze_image больше не нужна, её можно удалить.
-
 def build_context_for_model(chat_history: list) -> list:
     """
     Собирает и фильтрует историю чата для передачи модели.
@@ -922,6 +919,94 @@ def build_context_for_model(chat_history: list) -> list:
     # Возвращаем в правильном хронологическом порядке
     history_for_model.reverse()
     return history_for_model
+
+# <<< НАЧАЛО: НОВЫЙ ОБРАБОТЧИК ДЛЯ ГОЛОСОВЫХ СООБЩЕНИЙ >>>
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    if not user:
+        logger.warning(f"ChatID: {chat_id} | handle_voice: Не удалось определить пользователя.")
+        return
+    user_id = user.id
+    message = update.message
+    log_prefix_handler = "VoiceHandler"
+
+    if not message or not message.voice:
+        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) В handle_voice не найдено голосовое сообщение.")
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    try:
+        voice_file = await message.voice.get_file()
+        file_bytes = await voice_file.download_as_bytearray()
+        if not file_bytes:
+            await message.reply_text("❌ Не удалось загрузить голосовое сообщение (файл пуст).")
+            return
+    except Exception as e:
+        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Не удалось скачать голосовое по file_id: {message.voice.file_id}: {e}", exc_info=True)
+        await message.reply_text("❌ Не удалось загрузить голосовое сообщение.")
+        return
+
+    effective_context_voice = _get_effective_context_for_task("audio", context, user_id, chat_id, log_prefix_handler)
+    user_name = user.first_name or "Пользователь"
+    
+    # Промпт для модели: просим не просто расшифровать, а сразу ответить по существу
+    prompt_text_voice = (f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name)}"
+                         f"Это голосовое сообщение от пользователя. Расшифруй его и сразу ответь на него по существу. "
+                         f"Саму расшифровку в ответе приводить не нужно, только твой итоговый ответ.")
+
+    # Собираем данные для запроса к Gemini
+    parts_voice = [
+        prompt_text_voice,
+        {"mime_type": "audio/ogg", "data": file_bytes}
+    ]
+    
+    # Используем _generate_gemini_response для обработки запроса, чтобы сохранить все плюсы (ретрансляции, обработка ошибок и т.д.)
+    # Мы передаем "фальшивую" историю, состоящую только из одного этого запроса,
+    # так как аудиофайлы не могут быть частью длинной истории в текущей реализации API.
+    reply_text = await _generate_gemini_response(
+        user_prompt_text_initial=prompt_text_voice,
+        chat_history_for_model_initial=[{"role": "user", "parts": parts_voice}],
+        user_id=user_id, chat_id=chat_id, context=effective_context_voice,
+        system_instruction=system_instruction_text, log_prefix="VoiceGen"
+    )
+
+    if not reply_text:
+        reply_text = "🤖 Не удалось распознать речь или сформулировать ответ."
+
+    # Сохраняем "диалог" в историю для будущих сообщений
+    chat_history = context.chat_data.setdefault("history", [])
+    
+    # Для истории мы представляем голосовое сообщение как текстовую заглушку
+    user_message_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name) + "[Пользователь отправил голосовое сообщение]"
+    
+    history_entry_user = {
+        "role": "user",
+        "parts": [{"text": user_message_for_history}],
+        "content_type": "voice", # Для возможного будущего re-analyze
+        "content_id": message.voice.file_id,
+        "user_id": user_id,
+        "message_id": message.message_id
+    }
+    chat_history.append(history_entry_user)
+
+    sent_message = await send_reply(message, reply_text, context)
+
+    history_entry_model = {
+        "role": "model",
+        "parts": [{"text": reply_text}],
+        "bot_message_id": sent_message.message_id if sent_message else None
+    }
+    chat_history.append(history_entry_model)
+
+    if context.application.persistence:
+        await context.application.persistence.update_chat_data(chat_id, context.chat_data)
+        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) История чата (голос) сохранена.")
+    
+    while len(chat_history) > MAX_HISTORY_MESSAGES:
+        chat_history.pop(0)
+# <<< КОНЕЦ: НОВЫЙ ОБРАБОТЧИК ДЛЯ ГОЛОСОВЫХ СООБЩЕНИЙ >>>
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -982,6 +1067,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     youtube_id = extract_youtube_id(original_user_message_text)
     if youtube_id:
         user_mention = user_name
+        log_prefix_handler = "YouTubeHandler" # Добавил для консистентности логов
         logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Обнаружена ссылка YouTube (ID: {youtube_id}).")
         try: await update.message.reply_text(f"Окей, {user_mention}, сейчас гляну видео (ID: ...{youtube_id[-4:]}) и попробую сделать конспект из субтитров...")
         except Exception as e_reply: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Не удалось отправить сообщение 'гляну видео': {e_reply}")
@@ -1009,7 +1095,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         prompt_for_summary += REASONING_PROMPT_ADDITION
         
-        chat_history.append({"role": "user", "parts": [{"text": user_message_with_id}], "user_id": user_id, "message_id": message.message_id, "youtube_id": youtube_id})
+        chat_history.append({"role": "user", "parts": [{"text": user_message_for_history}], "user_id": user_id, "message_id": message.message_id, "youtube_id": youtube_id})
 
         reply_yt = await _generate_gemini_response(
             user_prompt_text_initial=prompt_for_summary,
@@ -1036,29 +1122,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             search_context_str = "\n\n==== РЕЗУЛЬТАТЫ ПОИСКА ====\n" + "\n".join(f"- {s.strip()}" for s in google_results)
             search_actually_performed = True
     
-    # === ИСПРАВЛЕНИЕ НАЧИНАЕТСЯ ЗДЕСЬ ===
-
-    # Получаем текущее время
     current_time_str = get_current_time_str()
     time_prefix_for_prompt = f"(Текущая дата и время: {current_time_str})\n"
 
-    # Промпт для модели теперь всегда будет содержать время
     final_user_prompt = f"{time_prefix_for_prompt}{user_message_for_history}{search_context_str}"
 
-    # Добавляем в историю ЧИСТОЕ сообщение пользователя
     chat_history.append({
         "role": "user",
-        "parts": [{"text": user_message_for_history}], # <-- Без поиска и времени!
+        "parts": [{"text": user_message_for_history}],
         "user_id": user_id,
         "message_id": message.message_id
     })
     
-    # === ИСПРАВЛЕНИЕ ЗАКАНЧИВАЕТСЯ ЗДЕСЬ ===
-
-    # Собираем контекст из истории. Последнее сообщение будет заменено на промпт с поиском
     context_for_model = build_context_for_model(chat_history)
     if context_for_model and context_for_model[-1]["role"] == "user":
-        # Заменяем последнее чистое сообщение на полный промпт для модели
         context_for_model[-1]["parts"][0]["text"] = final_user_prompt
 
     gemini_reply_text = await _generate_gemini_response(
@@ -1220,15 +1297,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_caption_original = message.caption or ""
-    # === ИСПРАВЛЕНИЕ ===
     current_time_str_doc = get_current_time_str()
     time_prefix_for_prompt_doc = f"(Текущая дата и время: {current_time_str_doc})\n"
-    # === КОНЕЦ ИСПРАВЛЕНИЯ ===
 
     file_context_for_prompt = f"Содержимое файла `{doc.file_name or 'файл'}`:\n```\n{text[:10000]}\n```"
 
     user_name = user.first_name if user.first_name else "Пользователь"
-    # Добавляем префикс времени в начало промпта
     user_prompt_doc_for_gemini = (f"{time_prefix_for_prompt_doc}"
                                   f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name)}"
                                   f"Проанализируй текст из файла. Мой комментарий: \"{user_caption_original}\".\n{file_context_for_prompt}")
@@ -1293,6 +1367,9 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
     application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("clear", clear_history))
     application.add_handler(CallbackQueryHandler(select_model_callback, pattern="^set_model_"))
+    
+    # <<< ИЗМЕНЕНИЕ: Зарегистрирован новый обработчик >>>
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
