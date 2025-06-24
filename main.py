@@ -344,9 +344,9 @@ async def send_reply(target_message: Message, text: str, context: ContextTypes.D
     try:
         for i, chunk in enumerate(reply_chunks):
             if i == 0:
-                sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk, reply_to_message_id=message_id, parse_mode=ParseMode.MARKDOWN)
+                sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk, reply_to_message_id=message_id, parse_mode=ParseMode.HTML)
             else:
-                sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.MARKDOWN)
+                sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML)
             await asyncio.sleep(0.1)
         return sent_message
     except BadRequest as e_md:
@@ -1292,7 +1292,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed_mime_types = ('application/pdf', 'application/json', 'application/xml', 'application/csv')
     mime_type = doc.mime_type or "application/octet-stream"
     if not (any(mime_type.startswith(p) for p in allowed_mime_prefixes) or mime_type in allowed_mime_types):
-        await update.message.reply_text(f"⚠️ Пока могу читать только текстовые файлы и PDF... Ваш тип: `{mime_type}`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"⚠️ Пока могу читать только текстовые файлы и PDF... Ваш тип: `{mime_type}`", parse_mode=ParseMode.HTML)
         return
 
     if doc.file_size > 15 * 1024 * 1024:
