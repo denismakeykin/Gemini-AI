@@ -68,7 +68,6 @@ class PostgresPersistence(BasePersistence):
             raise
 
     def _connect(self):
-        """Инициализирует или пересоздает пул соединений."""
         if self.db_pool:
             try:
                 self.db_pool.closeall()
@@ -77,11 +76,8 @@ class PostgresPersistence(BasePersistence):
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=self.dsn)
         logger.info("PostgresPersistence: Пул соединений успешно (пере)создан.")
 
-
     def _execute(self, query: str, params: tuple = None, fetch: str = None):
-        if not self.db_pool:
-            raise ConnectionError("PostgresPersistence: Пул соединений не инициализирован.")
-
+        if not self.db_pool: raise ConnectionError("PostgresPersistence: Пул соединений не инициализирован.")
         last_exception = None
         for attempt in range(3):
             conn = None
@@ -103,10 +99,8 @@ class PostgresPersistence(BasePersistence):
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
                 logger.warning(f"PostgresPersistence: Ошибка соединения (попытка {attempt + 1}): {e}. Попытка переподключения...")
                 last_exception = e
-                if conn:
-                    self.db_pool.putconn(conn, close=True)
-                if attempt < 2:
-                    self._connect()
+                if conn: self.db_pool.putconn(conn, close=True)
+                if attempt < 2: self._connect()
                 time.sleep(1 + attempt)
                 continue
             except psycopg2.Error as e:
@@ -115,17 +109,11 @@ class PostgresPersistence(BasePersistence):
                     conn.rollback()
                     self.db_pool.putconn(conn)
                 return None
-        
         logger.error(f"PostgresPersistence: Не удалось выполнить запрос после всех попыток. Последняя ошибка: {last_exception}")
         return None
 
     def _initialize_db(self):
-        create_table_query = """
-        CREATE TABLE IF NOT EXISTS persistence_data (
-            key TEXT PRIMARY KEY,
-            data BYTEA NOT NULL
-        );
-        """
+        create_table_query = "CREATE TABLE IF NOT EXISTS persistence_data (key TEXT PRIMARY KEY, data BYTEA NOT NULL);"
         self._execute(create_table_query)
 
     def _get_pickled(self, key: str) -> object | None:
@@ -138,42 +126,29 @@ class PostgresPersistence(BasePersistence):
         self._execute(query, (key, pickled_data, pickled_data))
 
     async def get_bot_data(self) -> dict:
-        bot_data = await asyncio.to_thread(self._get_pickled, "bot_data")
-        return bot_data or {}
-
+        return await asyncio.to_thread(self._get_pickled, "bot_data") or {}
     async def update_bot_data(self, data: dict) -> None:
         await asyncio.to_thread(self._set_pickled, "bot_data", data)
-
     async def get_chat_data(self) -> defaultdict[int, dict]:
         all_chat_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'chat_data_%';", fetch="all")
         chat_data = defaultdict(dict)
         if all_chat_data:
             for key, data in all_chat_data:
-                try:
-                    chat_id = int(key.split('_')[-1])
-                    chat_data[chat_id] = pickle.loads(data)
-                except (ValueError, IndexError):
-                    logger.warning(f"PostgresPersistence: Не удалось распарсить ключ чата: {key}")
+                try: chat_data[int(key.split('_')[-1])] = pickle.loads(data)
+                except (ValueError, IndexError): logger.warning(f"PostgresPersistence: Не удалось распарсить ключ чата: {key}")
         return chat_data
-
     async def update_chat_data(self, chat_id: int, data: dict) -> None:
         await asyncio.to_thread(self._set_pickled, f"chat_data_{chat_id}", data)
-
     async def get_user_data(self) -> defaultdict[int, dict]:
         all_user_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'user_data_%';", fetch="all")
         user_data = defaultdict(dict)
         if all_user_data:
             for key, data in all_user_data:
-                try:
-                    user_id = int(key.split('_')[-1])
-                    user_data[user_id] = pickle.loads(data)
-                except (ValueError, IndexError):
-                    logger.warning(f"PostgresPersistence: Не удалось распарсить ключ пользователя: {key}")
+                try: user_data[int(key.split('_')[-1])] = pickle.loads(data)
+                except (ValueError, IndexError): logger.warning(f"PostgresPersistence: Не удалось распарсить ключ пользователя: {key}")
         return user_data
-
     async def update_user_data(self, user_id: int, data: dict) -> None:
         await asyncio.to_thread(self._set_pickled, f"user_data_{user_id}", data)
-    
     async def get_callback_data(self) -> dict | None: return None
     async def update_callback_data(self, data: dict) -> None: pass
     async def get_conversations(self, name: str) -> dict: return {}
@@ -190,176 +165,101 @@ class PostgresPersistence(BasePersistence):
     async def flush(self) -> None: pass
 
     def close(self):
-        if self.db_pool:
-            self.db_pool.closeall()
-            logger.info("PostgresPersistence: Все соединения с базой данных успешно закрыты.")
+        if self.db_pool: self.db_pool.closeall(); logger.info("PostgresPersistence: Все соединения с базой данных успешно закрыты.")
 
 HARM_CATEGORIES_STRINGS = ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]
 BLOCK_NONE_STRING = "BLOCK_NONE"
 SAFETY_SETTINGS_BLOCK_NONE = []
 BlockedPromptException = type('BlockedPromptException', (Exception,), {})
 StopCandidateException = type('StopCandidateException', (Exception,), {})
-HarmCategory = type('HarmCategory', (object,), {})
-HarmBlockThreshold = type('HarmBlockThreshold', (object,), {})
-SafetyRating = type('SafetyRating', (object,), {'category': None, 'probability': None})
-BlockReason = type('BlockReason', (object,), {'UNSPECIFIED': 'UNSPECIFIED', 'OTHER': 'OTHER', 'SAFETY': 'SAFETY', 'name': 'UNSPECIFIED'})
-FinishReason = type('FinishReason', (object,), {'STOP': 'STOP', 'SAFETY': 'SAFETY', 'RECITATION': 'RECITATION', 'OTHER':'OTHER', 'MAX_TOKENS':'MAX_TOKENS', 'name': 'STOP'})
+HarmCategory, HarmBlockThreshold, SafetyRating, BlockReason, FinishReason = (type(n, (object,), {}) for n in ['HarmCategory', 'HarmBlockThreshold', 'SafetyRating', 'BlockReason', 'FinishReason'])
 
 try:
-    from google.generativeai.types import (
-        HarmCategory as RealHarmCategory, HarmBlockThreshold as RealHarmBlockThreshold,
-        BlockedPromptException as RealBlockedPromptException, StopCandidateException as RealStopCandidateException,
-        SafetyRating as RealSafetyRating, BlockReason as RealBlockReason, FinishReason as RealFinishReason
-    )
+    from google.generativeai.types import HarmCategory as RealHarmCategory, HarmBlockThreshold as RealHarmBlockThreshold, BlockedPromptException as RealBlockedPromptException, StopCandidateException as RealStopCandidateException, SafetyRating as RealSafetyRating, BlockReason as RealBlockReason, FinishReason as RealFinishReason
     logger.info("Типы google.generativeai.types успешно импортированы.")
-    HarmCategory, HarmBlockThreshold, BlockedPromptException, StopCandidateException, SafetyRating, BlockReason, FinishReason = \
-        RealHarmCategory, RealHarmBlockThreshold, RealBlockedPromptException, RealStopCandidateException, RealSafetyRating, RealBlockReason, RealFinishReason
-
+    HarmCategory, HarmBlockThreshold, BlockedPromptException, StopCandidateException, SafetyRating, BlockReason, FinishReason = RealHarmCategory, RealHarmBlockThreshold, RealBlockedPromptException, RealStopCandidateException, RealSafetyRating, RealBlockReason, RealFinishReason
     temp_safety_settings = []
     all_enums_found = True
     if hasattr(HarmBlockThreshold, 'BLOCK_NONE'):
         block_none_enum = HarmBlockThreshold.BLOCK_NONE
         for cat_str in HARM_CATEGORIES_STRINGS:
-            if hasattr(HarmCategory, cat_str):
-                temp_safety_settings.append({"category": getattr(HarmCategory, cat_str), "threshold": block_none_enum})
-            else:
-                logger.warning(f"Атрибут категории '{cat_str}' не найден в HarmCategory.")
-                all_enums_found = False
-                break
-    else:
-        logger.warning("Атрибут 'BLOCK_NONE' не найден в HarmBlockThreshold.")
-        all_enums_found = False
-
-    if all_enums_found and temp_safety_settings:
-        SAFETY_SETTINGS_BLOCK_NONE = temp_safety_settings
-        logger.info("Настройки безопасности BLOCK_NONE установлены с Enum.")
-    elif HARM_CATEGORIES_STRINGS:
-        logger.warning("Не удалось создать SAFETY_SETTINGS_BLOCK_NONE с Enum. Используем строки.")
-        SAFETY_SETTINGS_BLOCK_NONE = [{"category": cat_str, "threshold": BLOCK_NONE_STRING} for cat_str in HARM_CATEGORIES_STRINGS]
-    else:
-        logger.warning("Список HARM_CATEGORIES_STRINGS пуст, настройки безопасности не установлены.")
-        SAFETY_SETTINGS_BLOCK_NONE = []
+            if hasattr(HarmCategory, cat_str): temp_safety_settings.append({"category": getattr(HarmCategory, cat_str), "threshold": block_none_enum})
+            else: logger.warning(f"Атрибут категории '{cat_str}' не найден в HarmCategory."); all_enums_found = False; break
+    else: logger.warning("Атрибут 'BLOCK_NONE' не найден в HarmBlockThreshold."); all_enums_found = False
+    if all_enums_found and temp_safety_settings: SAFETY_SETTINGS_BLOCK_NONE = temp_safety_settings; logger.info("Настройки безопасности BLOCK_NONE установлены с Enum.")
+    elif HARM_CATEGORIES_STRINGS: logger.warning("Не удалось создать SAFETY_SETTINGS_BLOCK_NONE с Enum. Используем строки."); SAFETY_SETTINGS_BLOCK_NONE = [{"category": cat_str, "threshold": BLOCK_NONE_STRING} for cat_str in HARM_CATEGORIES_STRINGS]
+    else: logger.warning("Список HARM_CATEGORIES_STRINGS пуст, настройки безопасности не установлены."); SAFETY_SETTINGS_BLOCK_NONE = []
 except ImportError:
     logger.warning("Не удалось импортировать типы из google.generativeai.types. Используем строки и заглушки.")
-    if HARM_CATEGORIES_STRINGS:
-        SAFETY_SETTINGS_BLOCK_NONE = [{"category": cat_str, "threshold": BLOCK_NONE_STRING} for cat_str in HARM_CATEGORIES_STRINGS]
-        logger.warning("Настройки безопасности установлены со строками (BLOCK_NONE).")
-    else:
-        logger.warning("Список HARM_CATEGORIES_STRINGS пуст, настройки не установлены.")
-        SAFETY_SETTINGS_BLOCK_NONE = []
-except Exception as e_import_types:
-    logger.error(f"Ошибка при импорте/настройке типов Gemini: {e_import_types}", exc_info=True)
-    if HARM_CATEGORIES_STRINGS:
-         SAFETY_SETTINGS_BLOCK_NONE = [{"category": cat_str, "threshold": BLOCK_NONE_STRING} for cat_str in HARM_CATEGORIES_STRINGS]
-         logger.warning("Настройки безопасности установлены со строками (BLOCK_NONE) из-за ошибки.")
-    else:
-         logger.warning("Список HARM_CATEGORIES_STRINGS пуст, настройки не установлены из-за ошибки.")
-         SAFETY_SETTINGS_BLOCK_NONE = []
+    if HARM_CATEGORIES_STRINGS: SAFETY_SETTINGS_BLOCK_NONE = [{"category": cat_str, "threshold": BLOCK_NONE_STRING} for cat_str in HARM_CATEGORIES_STRINGS]; logger.warning("Настройки безопасности установлены со строками (BLOCK_NONE).")
+    else: logger.warning("Список HARM_CATEGORIES_STRINGS пуст, настройки не установлены."); SAFETY_SETTINGS_BLOCK_NONE = []
+except Exception as e:
+    logger.error(f"Ошибка при импорте/настройке типов Gemini: {e}", exc_info=True)
+    if HARM_CATEGORIES_STRINGS: SAFETY_SETTINGS_BLOCK_NONE = [{"category": cat_str, "threshold": BLOCK_NONE_STRING} for cat_str in HARM_CATEGORIES_STRINGS]; logger.warning("Настройки безопасности установлены со строками (BLOCK_NONE) из-за ошибки.")
+    else: logger.warning("Список HARM_CATEGORIES_STRINGS пуст, настройки не установлены из-за ошибки."); SAFETY_SETTINGS_BLOCK_NONE = []
 
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
-GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID')
-WEBHOOK_HOST = os.getenv('WEBHOOK_HOST')
-GEMINI_WEBHOOK_PATH = os.getenv('GEMINI_WEBHOOK_PATH')
-DATABASE_URL = os.getenv('DATABASE_URL')
-
+TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, GOOGLE_CSE_ID, WEBHOOK_HOST, GEMINI_WEBHOOK_PATH, DATABASE_URL = (os.getenv(k) for k in ["TELEGRAM_BOT_TOKEN", "GOOGLE_API_KEY", "GOOGLE_CSE_ID", "WEBHOOK_HOST", "GEMINI_WEBHOOK_PATH", "DATABASE_URL"])
 required_env_vars = {"TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, "GOOGLE_API_KEY": GOOGLE_API_KEY, "GOOGLE_CSE_ID": GOOGLE_CSE_ID, "WEBHOOK_HOST": WEBHOOK_HOST, "GEMINI_WEBHOOK_PATH": GEMINI_WEBHOOK_PATH}
-missing_vars = [name for name, value in required_env_vars.items() if not value]
-if missing_vars:
-    logger.critical(f"Отсутствуют переменные окружения: {', '.join(missing_vars)}")
-    exit(1)
+if missing_vars := [name for name, value in required_env_vars.items() if not value]: logger.critical(f"Отсутствуют переменные окружения: {', '.join(missing_vars)}"); exit(1)
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
 AVAILABLE_MODELS = {'gemini-2.5-flash': '2.5 Flash', 'gemini-2.0-flash': '2.0 Flash'}
 DEFAULT_MODEL = 'gemini-2.5-flash' if 'gemini-2.5-flash' in AVAILABLE_MODELS else 'gemini-2.0-flash'
-MAX_CONTEXT_CHARS = 100000
-MAX_HISTORY_MESSAGES = 100
-MAX_OUTPUT_TOKENS = 65536
-DDG_MAX_RESULTS = 10
-GOOGLE_SEARCH_MAX_RESULTS = 10
-RETRY_ATTEMPTS = 5
-RETRY_DELAY_SECONDS = 1
-IMAGE_DESCRIPTION_PREFIX = "[Описание изображения]: "
-YOUTUBE_SUMMARY_PREFIX = "[Конспект видео]: "
-VISION_CAPABLE_KEYWORDS = ['gemini-2.5-flash', 'pro', 'vision', 'ultra']
-VIDEO_CAPABLE_KEYWORDS = ['gemini-2.5-flash']
-USER_ID_PREFIX_FORMAT = "[User {user_id}; Name: {user_name}]: "
-TARGET_TIMEZONE = "Europe/Moscow"
-REASONING_PROMPT_ADDITION = ""
+MAX_CONTEXT_CHARS, MAX_HISTORY_MESSAGES, MAX_OUTPUT_TOKENS = 100000, 100, 65536
+DDG_MAX_RESULTS, GOOGLE_SEARCH_MAX_RESULTS, RETRY_ATTEMPTS, RETRY_DELAY_SECONDS = 10, 10, 5, 1
+IMAGE_DESCRIPTION_PREFIX, YOUTUBE_SUMMARY_PREFIX = "[Описание изображения]: ", "[Конспект видео]: "
+VISION_CAPABLE_KEYWORDS, VIDEO_CAPABLE_KEYWORDS = ['gemini-2.5-flash', 'pro', 'vision', 'ultra'], ['gemini-2.5-flash']
+USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE, REASONING_PROMPT_ADDITION = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow", ""
 
-def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value):
-    return context.user_data.get(key, default_value)
+def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value): return context.user_data.get(key, default_value)
+def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value): context.user_data[key] = value
 
-def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value):
-    context.user_data[key] = value
-
-async def _add_to_history(
-    context: ContextTypes.DEFAULT_TYPE,
-    role: str,
-    text: str,
-    bot_message_id: int | None = None,
-    content_type: str | None = None,
-    content_id: str | None = None,
-    user_id: int | None = None,
-    message_id: int | None = None,
-):
-    """Добавляет запись в историю чата и обрезает старые сообщения."""
+async def _add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, text: str, bot_message_id: int | None = None, content_type: str | None = None, content_id: str | None = None, user_id: int | None = None, message_id: int | None = None):
     chat_id = context.chat_data.get('id', 'Unknown')
     chat_history = context.chat_data.setdefault("history", [])
-
     entry = {"role": role, "parts": [{"text": text}]}
     if bot_message_id: entry["bot_message_id"] = bot_message_id
     if content_type: entry["content_type"] = content_type
     if content_id: entry["content_id"] = content_id
     if user_id: entry["user_id"] = user_id
     if message_id: entry["message_id"] = message_id
-    
     chat_history.append(entry)
+    while len(chat_history) > MAX_HISTORY_MESSAGES: chat_history.pop(0)
+    if context.application.persistence: await context.application.persistence.update_chat_data(chat_id, context.chat_data)
 
-    while len(chat_history) > MAX_HISTORY_MESSAGES:
-        chat_history.pop(0)
-
-    if context.application.persistence:
-        await context.application.persistence.update_chat_data(chat_id, context.chat_data)
+def sanitize_telegram_html(raw_html: str) -> str:
+    if not raw_html: return ""
+    allowed_tags = ['b', 'i', 'u', 's', 'tg-spoiler', 'a', 'code', 'pre']
+    sanitized_text = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
+    sanitized_text = re.sub(r'</li>', '\n', sanitized_text, flags=re.IGNORECASE)
+    sanitized_text = re.sub(r'<li>', '• ', sanitized_text, flags=re.IGNORECASE)
+    def strip_unsupported_tags(match):
+        tag_name = match.group(2).lower()
+        return match.group(0) if tag_name in allowed_tags else ''
+    tag_regex = re.compile(r'<(/?)([a-z0-9]+)[^>]*>', re.IGNORECASE)
+    sanitized_text = tag_regex.sub(strip_unsupported_tags, sanitized_text)
+    return sanitized_text.strip()
 
 def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
-    """
-    Разделяет текст на части, безопасные для отправки с parse_mode=HTML.
-    Корректно обрабатывает вложенные теги с помощью стека.
-    """
-    chunks = []
-    tag_stack = []
-    remaining_text = text_to_chunk
-    
-    tag_regex = re.compile(r'<(/?)(b|i|u|s|code|pre|br)>', re.IGNORECASE)
-
+    chunks, tag_stack, remaining_text = [], [], text_to_chunk
+    tag_regex = re.compile(r'<(/?)(b|i|u|s|code|pre|a|tg-spoiler)>', re.IGNORECASE) # <br> обрабатывается санитайзером
     while len(remaining_text) > chunk_size:
         split_pos = remaining_text.rfind('\n', 0, chunk_size)
         if split_pos == -1: split_pos = remaining_text.rfind(' ', 0, chunk_size)
         if split_pos == -1 or split_pos == 0: split_pos = chunk_size
-
         current_chunk = remaining_text[:split_pos]
-        
         temp_stack = list(tag_stack)
         for match in tag_regex.finditer(current_chunk):
-            tag_name = match.group(2).lower()
-            is_closing = bool(match.group(1))
-            
-            if tag_name == 'br': continue
-
-            if not is_closing:
-                temp_stack.append(tag_name)
-            elif temp_stack and temp_stack[-1] == tag_name:
-                temp_stack.pop()
-        
+            tag_name, is_closing = match.group(2).lower(), bool(match.group(1))
+            if tag_name == 'a': continue # Не отслеживаем теги <a>, т.к. они сложные
+            if not is_closing: temp_stack.append(tag_name)
+            elif temp_stack and temp_stack[-1] == tag_name: temp_stack.pop()
         closing_tags = ''.join(f'</{tag}>' for tag in reversed(temp_stack))
         chunks.append(current_chunk + closing_tags)
-        
         tag_stack = temp_stack
         opening_tags = ''.join(f'<{tag}>' for tag in tag_stack)
         remaining_text = opening_tags + remaining_text[split_pos:].lstrip()
-
     chunks.append(remaining_text)
     return chunks
 
@@ -367,780 +267,372 @@ async def send_reply(target_message: Message, text: str, context: ContextTypes.D
     MAX_MESSAGE_LENGTH = 4096
     reply_chunks = html_safe_chunker(text, MAX_MESSAGE_LENGTH)
     sent_message = None
-    chat_id = target_message.chat_id
-    message_id = target_message.message_id
+    chat_id, message_id = target_message.chat_id, target_message.message_id
     current_user_id = target_message.from_user.id if target_message.from_user else "Unknown"
-
     try:
         for i, chunk in enumerate(reply_chunks):
-            if i == 0:
-                sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk, reply_to_message_id=message_id, parse_mode=ParseMode.HTML)
-            else:
-                sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML)
+            reply_to = message_id if i == 0 else None
+            sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk, reply_to_message_id=reply_to, parse_mode=ParseMode.HTML)
             await asyncio.sleep(0.1)
         return sent_message
-    except BadRequest as e_md:
-        if "Can't parse entities" in str(e_md) or "can't parse" in str(e_md).lower() or "reply message not found" in str(e_md).lower():
-            problematic_chunk_preview = "N/A"
-            if 'i' in locals() and i < len(reply_chunks):
-                problematic_chunk_preview = reply_chunks[i][:500].replace('\n', '\\n')
-            
-            logger.warning(f"UserID: {current_user_id}, ChatID: {chat_id} | Ошибка парсинга HTML ({message_id}): {e_md}. Проблемный чанк (начало): '{problematic_chunk_preview}...'. Попытка отправить как обычный текст без тегов.")
-            
+    except BadRequest as e:
+        if "Can't parse entities" in str(e).lower():
+            problem_chunk_preview = reply_chunks[locals().get('i', 0)][:500] if 'reply_chunks' in locals() else "N/A"
+            logger.warning(f"UserID: {current_user_id}, ChatID: {chat_id} | Ошибка парсинга HTML: {e}. Чанк: '{problem_chunk_preview}...'. Отправка как обычный текст.")
             plain_text = re.sub(r'<[^>]*>', '', text)
             plain_chunks = [plain_text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(plain_text), MAX_MESSAGE_LENGTH)]
-
-            for i_plain, chunk_plain in enumerate(plain_chunks):
-                 if i_plain == 0:
-                     sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk_plain, reply_to_message_id=message_id)
-                 else:
-                     sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk_plain)
-                 await asyncio.sleep(0.1)
+            for i, chunk in enumerate(plain_chunks):
+                reply_to = message_id if i == 0 else None
+                sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk, reply_to_message_id=reply_to)
+                await asyncio.sleep(0.1)
             return sent_message
         else:
-            logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Ошибка при отправке ответа (HTML): {e_md}", exc_info=True)
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка при отправке ответа: {html.escape(str(e_md)[:100])}...")
-            except Exception as e_error_send:
-                logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке отправки: {e_error_send}")
-    except Exception as e_other:
-        logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Непредвиденная ошибка при отправке ответа: {e_other}", exc_info=True)
-        try:
-            await context.bot.send_message(chat_id=chat_id, text="❌ Произошла непредвиденная ошибка при отправке ответа.")
-        except Exception as e_unexp_send:
-            logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Не удалось отправить сообщение о непредвиденной ошибке: {e_unexp_send}")
+            logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Непредвиденная ошибка BadRequest: {e}", exc_info=True)
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка: {html.escape(str(e)[:100])}...")
+    except Exception as e:
+        logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Общая ошибка отправки: {e}", exc_info=True)
+        await context.bot.send_message(chat_id=chat_id, text="❌ Произошла ошибка при отправке ответа.")
     return None
 
 def _get_text_from_response(response_obj, user_id_for_log, chat_id_for_log, log_prefix_for_func) -> str | None:
-    reply_text = None
     try:
-        reply_text = response_obj.text
-        if reply_text:
-             logger.debug(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) Текст успешно извлечен из response.text.")
-             return reply_text.strip()
-        logger.debug(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) response.text пуст или None, проверяем candidates.")
-    except ValueError as e_val_text:
-        logger.warning(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) response.text вызвал ValueError: {e_val_text}. Проверяем candidates...")
-    except Exception as e_generic_text:
-        logger.error(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) Неожиданная ошибка при доступе к response.text: {e_generic_text}", exc_info=True)
-
+        if (text := response_obj.text): return text.strip()
+    except (ValueError, Exception) as e: logger.warning(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) Ошибка доступа к response.text: {e}")
     if hasattr(response_obj, 'candidates') and response_obj.candidates:
         try:
-            candidate = response_obj.candidates[0]
-            if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts') and candidate.content.parts:
-                parts_texts = [part.text for part in candidate.content.parts if hasattr(part, 'text')]
-                if parts_texts:
-                    reply_text = "".join(parts_texts).strip()
-                    if reply_text:
-                        logger.info(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) Текст извлечен из response.candidates[0].content.parts.")
-                        return reply_text
-                    else:
-                        logger.warning(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) Текст из response.candidates[0].content.parts оказался пустым после strip.")
-                else:
-                    logger.warning(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) response.candidates[0].content.parts есть, но не содержат текстовых частей.")
-            else:
-                fr_candidate = getattr(candidate, 'finish_reason', None)
-                fr_name = "N/A"
-                if fr_candidate is not None: fr_name = getattr(fr_candidate, 'name', str(fr_candidate))
-                is_safety_other_reason = False
-                if FinishReason and hasattr(FinishReason, 'SAFETY') and hasattr(FinishReason, 'OTHER'): is_safety_other_reason = (fr_candidate == FinishReason.SAFETY or fr_candidate == FinishReason.OTHER)
-                elif fr_name in ['SAFETY', 'OTHER']: is_safety_other_reason = True
-                if fr_candidate and not is_safety_other_reason: logger.warning(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) response.candidates[0] не имеет (валидных) content.parts, но finish_reason={fr_name}.")
-                else: logger.warning(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) response.candidates[0] не имеет (валидных) content.parts. Finish_reason: {fr_name}")
-        except IndexError: logger.warning(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) IndexError при доступе к response_obj.candidates[0] (список кандидатов пуст).")
-        except Exception as e_cand: logger.error(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) Ошибка при обработке candidates: {e_cand}", exc_info=True)
-    else: logger.warning(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) В ответе response нет ни response.text, ни валидных candidates с текстом.")
+            if (parts := response_obj.candidates[0].content.parts): return "".join(p.text for p in parts if hasattr(p, 'text')).strip()
+        except (AttributeError, IndexError, Exception) as e: logger.error(f"UserID: {user_id_for_log}, ChatID: {chat_id_for_log} | ({log_prefix_for_func}) Ошибка извлечения текста из candidates: {e}", exc_info=True)
     return None
 
 def _get_effective_context_for_task(task_type: str, original_context: ContextTypes.DEFAULT_TYPE, user_id: int | str, chat_id: int, log_prefix: str) -> ContextTypes.DEFAULT_TYPE:
     capability_map = {"vision": VISION_CAPABLE_KEYWORDS, "video": VIDEO_CAPABLE_KEYWORDS, "audio": ['gemini-2.5', 'pro', 'flash']}
-    required_keywords = capability_map.get(task_type)
-    if not required_keywords:
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Неизвестный тип задачи '{task_type}' для выбора модели.")
-        return original_context
+    required_keywords = capability_map.get(task_type, [])
     selected_model = get_user_setting(original_context, 'selected_model', DEFAULT_MODEL)
-    is_capable = any(keyword in selected_model for keyword in required_keywords)
-    if is_capable:
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Модель пользователя '{selected_model}' подходит для задачи '{task_type}'.")
-        return original_context
-    available_capable_models = [m_id for m_id in AVAILABLE_MODELS if any(keyword in m_id for keyword in required_keywords)]
-    if not available_capable_models:
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Нет доступных моделей для задачи '{task_type}'.")
-        return original_context
-    fallback_model_id = next((m for m in available_capable_models if 'flash' in m), available_capable_models[0])
-    original_model_name = AVAILABLE_MODELS.get(selected_model, selected_model)
-    new_model_name = AVAILABLE_MODELS.get(fallback_model_id, fallback_model_id)
-    logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Модель пользователя '{original_model_name}' не подходит для '{task_type}'. Временно используется '{new_model_name}'.")
+    if any(keyword in selected_model for keyword in required_keywords): return original_context
+    capable_models = [m_id for m_id in AVAILABLE_MODELS if any(keyword in m_id for keyword in required_keywords)]
+    if not capable_models: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Нет доступных моделей для '{task_type}'."); return original_context
+    fallback_model_id = next((m for m in capable_models if 'flash' in m), capable_models[0])
+    logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Модель '{selected_model}' не подходит для '{task_type}'. Временно используется '{fallback_model_id}'.")
     temp_context = ContextTypes.DEFAULT_TYPE(application=original_context.application, chat_id=chat_id, user_id=user_id)
     temp_context.user_data = original_context.user_data.copy()
     temp_context.user_data['selected_model'] = fallback_model_id
     return temp_context
 
-def get_current_time_str() -> str:
-    now_utc = datetime.datetime.now(pytz.utc)
-    target_tz = pytz.timezone(TARGET_TIMEZONE)
-    now_target = now_utc.astimezone(target_tz)
-    return now_target.strftime("%Y-%m-%d %H:%M:%S %Z")
-
-def extract_youtube_id(url_text: str) -> str | None:
-    regex = r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})"
-    match = re.search(regex, url_text)
-    return match.group(1) if match else None
-
-def extract_general_url(text: str) -> str | None:
-    regex = r'(?<![)\]])https?:\/\/[^\s<>"\'`]+'
-    match = re.search(regex, text)
-    if match:
-        url = match.group(0)
-        while url.endswith(('.', ',', '?', '!')): url = url[:-1]
-        return url
-    return None
+def get_current_time_str() -> str: return datetime.datetime.now(pytz.timezone(TARGET_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
+def extract_youtube_id(url: str) -> str | None: return (m.group(1) if (m := re.search(r"(?:v=|\/)([a-zA-Z0-9_-]{11}).*", url)) else None)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if 'selected_model' not in context.user_data: set_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    if 'search_enabled' not in context.user_data: set_user_setting(context, 'search_enabled', True)
-    if 'temperature' not in context.user_data: set_user_setting(context, 'temperature', 1.0)
-    if 'detailed_reasoning_enabled' not in context.user_data: set_user_setting(context, 'detailed_reasoning_enabled', True)
-    bot_core_model_key = DEFAULT_MODEL
-    raw_bot_core_model_display_name = AVAILABLE_MODELS.get(bot_core_model_key, bot_core_model_key)
-    author_channel_link_raw = "https://t.me/denisobovsyom"
-    date_knowledge_text_raw = "до начала 2025 года"
-    start_message_plain_parts = [
-        f"Меня зовут Женя, работаю на Google Gemini {raw_bot_core_model_display_name} с настройками от автора бота: {author_channel_link_raw}",
-        f"- обладаю огромным объемом знаний {date_knowledge_text_raw} и поиском Google,",
-        f"- умею понимать и обсуждать изображения, голосовые сообщения (!), файлы txt, pdf и веб-страницы,",
-        f"- знаю ваше имя, помню историю чата. Пишите лично и добавляйте меня в группы.",
-        f"(!) Пользуясь данным ботом, вы автоматически соглашаетесь на отправку ваших сообщений через Google (Search + Gemini API) для получения ответов."]
-    start_message_plain = "\n".join(start_message_plain_parts)
-    logger.debug(f"Attempting to send start_message (Plain Text):\n{start_message_plain}")
-    try:
-        await update.message.reply_text(start_message_plain, disable_web_page_preview=True)
-        logger.info("Successfully sent start_message as plain text.")
-    except Exception as e: logger.error(f"Failed to send start_message (Plain Text): {e}", exc_info=True)
+    for key, value in {'selected_model': DEFAULT_MODEL, 'search_enabled': True, 'temperature': 1.0, 'detailed_reasoning_enabled': True}.items():
+        context.user_data.setdefault(key, value)
+    start_message = f"""Меня зовут Женя, работаю на Google Gemini {AVAILABLE_MODELS.get(DEFAULT_MODEL, DEFAULT_MODEL)} с настройками от автора бота: https://t.me/denisobovsyom
+- обладаю огромным объемом знаний до начала 2025 года и поиском Google,
+- умею понимать и обсуждать изображения, голосовые сообщения (!), файлы txt, pdf и веб-страницы,
+- знаю ваше имя, помню историю чата. Пишите лично и добавляйте меня в группы.
+(!) Пользуясь данным ботом, вы автоматически соглашаетесь на отправку ваших сообщений через Google (Search + Gemini API) для получения ответов."""
+    await update.message.reply_text(start_message, disable_web_page_preview=True)
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-    user_id = user.id
-    safe_first_name = html.escape(user.first_name) if user.first_name else None
-    user_mention = f"{safe_first_name}" if safe_first_name else f"User {user_id}"
+    user, user_id, chat_id = update.effective_user, update.effective_user.id, update.effective_chat.id
+    user_mention = f"{html.escape(user.first_name)}" if user.first_name else f"User {user_id}"
     context.chat_data.clear()
-    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | История чата в памяти очищена по команде от {user_mention}.")
-    if context.application.persistence:
-        await context.application.persistence.drop_chat_data(chat_id)
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | История чата в базе данных удалена.")
+    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | История чата в памяти очищена.")
+    if context.application.persistence: await context.application.persistence.drop_chat_data(chat_id)
     await update.message.reply_text(f"🧹 Окей, {user_mention}, история этого чата очищена.")
 
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
-    safe_first_name = html.escape(user.first_name) if user.first_name else None
-    user_mention = f"{safe_first_name}" if safe_first_name else f"User {user_id}"
+    user_mention = f"{html.escape(update.effective_user.first_name)}" if update.effective_user.first_name else f"User {update.effective_user.id}"
     current_model = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    keyboard = []
-    sorted_models = sorted(AVAILABLE_MODELS.items())
-    for m, name in sorted_models:
-         button_text = f"{'✅ ' if m == current_model else ''}{name}"
-         keyboard.append([InlineKeyboardButton(button_text, callback_data=f"set_model_{m}")])
-    current_model_name = AVAILABLE_MODELS.get(current_model, current_model)
-    await update.message.reply_text(f"{user_mention}, выбери модель (сейчас у тебя: {current_model_name}):", reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = [[InlineKeyboardButton(f"{'✅ ' if m == current_model else ''}{name}", callback_data=f"set_model_{m}")] for m, name in sorted(AVAILABLE_MODELS.items())]
+    await update.message.reply_text(f"{user_mention}, выбери модель (сейчас: {AVAILABLE_MODELS.get(current_model, current_model)}):", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    replied_message = message.reply_to_message
-    if not replied_message:
-        await message.reply_text("ℹ️ Пожалуйста, используйте эту команду, отвечая на голосовое сообщение, которое нужно превратить в текст.")
-        return
-    if not replied_message.voice:
-        await message.reply_text("❌ Эта команда работает только с голосовыми сообщениями.")
-        return
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-    user_id = user.id
-    log_prefix = "TranscribeCmd"
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    if not (replied_message := update.message.reply_to_message): return await update.message.reply_text("ℹ️ Используйте команду ответом на голосовое сообщение.")
+    if not replied_message.voice: return await update.message.reply_text("❌ Команда работает только с голосовыми сообщениями.")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     try:
         voice_file = await replied_message.voice.get_file()
         file_bytes = await voice_file.download_as_bytearray()
+        prompt = "Расшифруй это аудиосообщение и верни только текст расшифровки."
+        model = genai.GenerativeModel(get_user_setting(context, 'selected_model', DEFAULT_MODEL))
+        response = await asyncio.to_thread(model.generate_content, [prompt, {"mime_type": "audio/ogg", "data": bytes(file_bytes)}])
+        if (transcribed_text := _get_text_from_response(response, update.effective_user.id, update.effective_chat.id, "TranscribeCmd")):
+            await replied_message.reply_text(f"📝 <b>Транскрипт:</b>\n\n{html.escape(transcribed_text)}", parse_mode=ParseMode.HTML)
+        else: await replied_message.reply_text("🤖 Не удалось распознать речь.")
     except Exception as e:
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка скачивания голоса: {e}", exc_info=True)
-        await message.reply_text("❌ Ошибка при загрузке исходного голосового сообщения.")
-        return
-    transcription_prompt = "Расшифруй это аудиосообщение и верни только текст расшифровки, без каких-либо добавлений или комментариев."
-    effective_context = _get_effective_context_for_task("audio", context, user_id, chat_id, log_prefix)
-    model_id = get_user_setting(effective_context, 'selected_model', DEFAULT_MODEL)
-    model_obj = genai.GenerativeModel(model_id)
-    try:
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Запрос на чистую транскрипцию в {model_id}.")
-        response = await asyncio.to_thread(model_obj.generate_content, [transcription_prompt, {"mime_type": "audio/ogg", "data": bytes(file_bytes)}])
-        transcribed_text = _get_text_from_response(response, user_id, chat_id, log_prefix)
-        if not transcribed_text:
-            await message.reply_text("🤖 Не удалось распознать речь в указанном сообщении.")
-            return
-    except Exception as e:
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка при транскрипции: {e}", exc_info=True)
-        await message.reply_text(f"❌ Ошибка сервиса распознавания речи: {str(e)[:100]}")
-        return
-    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Транскрипция успешна.")
-    await message.reply_text(f"📝 <b>Транскрипт:</b>\n\n{html.escape(transcribed_text)}", parse_mode=ParseMode.HTML)
+        logger.error(f"Ошибка транскрипции: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка сервиса распознавания: {str(e)[:100]}")
 
 async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user = query.from_user
-    user_id = user.id
-    chat_id = query.message.chat_id
-    safe_first_name = html.escape(user.first_name) if user.first_name else None
-    user_mention = f"{safe_first_name}" if safe_first_name else f"User {user_id}"
     await query.answer()
-    callback_data = query.data
-    if callback_data and callback_data.startswith("set_model_"):
-        selected = callback_data.replace("set_model_", "")
-        if selected in AVAILABLE_MODELS:
-            set_user_setting(context, 'selected_model', selected)
-            model_name = AVAILABLE_MODELS[selected]
-            reply_text = f"Ок, {user_mention}, твоя модель установлена: <b>{model_name}</b>"
-            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Модель установлена на {model_name} для {user_mention}.")
-            try:
-                await query.edit_message_text(reply_text, parse_mode=ParseMode.HTML)
-            except BadRequest as e_md:
-                 if "Message is not modified" in str(e_md):
-                     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Пользователь {user_mention} выбрал ту же модель: {model_name}")
-                     await query.answer(f"Модель {model_name} уже выбрана.", show_alert=False)
-                 else:
-                     logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение (HTML) для {user_mention}: {e_md}. Отправляю новое.")
-                     plain_reply_text = re.sub('<[^<]+?>', '', reply_text)
-                     try:
-                         await query.edit_message_text(plain_reply_text)
-                     except Exception as e_edit_plain:
-                          logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение даже как простой текст для {user_mention}: {e_edit_plain}. Отправляю новое.")
-                          await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.HTML)
-            except Exception as e:
-                logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение (другая ошибка) для {user_mention}: {e}. Отправляю новое.", exc_info=True)
-                await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.HTML)
-        else:
-            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Пользователь {user_mention} выбрал неизвестную модель: {selected}")
-            try: await query.edit_message_text("❌ Неизвестная модель выбрана.")
-            except Exception: await context.bot.send_message(chat_id=chat_id, text="❌ Неизвестная модель выбрана.")
-    else:
-        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Получен неизвестный callback_data от {user_mention}: {callback_data}")
-        try: await query.edit_message_text("❌ Ошибка обработки выбора.")
-        except Exception: pass
+    selected_model_id = query.data.replace("set_model_", "")
+    if selected_model_id in AVAILABLE_MODELS:
+        set_user_setting(context, 'selected_model', selected_model_id)
+        model_name = AVAILABLE_MODELS[selected_model_id]
+        user_mention = f"{html.escape(query.from_user.first_name)}" if query.from_user.first_name else f"User {query.from_user.id}"
+        reply_text = f"Ок, {user_mention}, твоя модель установлена: <b>{model_name}</b>"
+        try: await query.edit_message_text(reply_text, parse_mode=ParseMode.HTML)
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                logger.warning(f"Ошибка изменения сообщения (выбор модели): {e}")
+                await context.bot.send_message(chat_id=query.message.chat_id, text=reply_text, parse_mode=ParseMode.HTML)
 
-async def _generate_gemini_response(user_prompt_text_initial: str, chat_history_for_model_initial: list, user_id: int | str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, system_instruction: str, log_prefix: str = "GeminiGen", is_text_request_with_search: bool = False) -> str | None:
+async def _generate_gemini_response(user_prompt_text_initial: str, chat_history_for_model_initial: list, user_id: int | str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, is_text_request_with_search: bool = False) -> str | None:
     model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
     temperature = 1.0
     reply = None
-    search_block_pattern_to_remove = re.compile(r"\n*\s*==== РЕЗУЛЬТАТЫ ПОИСКА .*?====\n.*?Используй эту информацию для ответа на вопрос пользователя \[User \d+; Name: .*?\]:.*?\n\s*===========================================================\n\s*.*?\n", re.DOTALL | re.IGNORECASE)
+    search_block_pattern_to_remove = re.compile(r"\n*\s*==== РЕЗУЛЬТАТЫ ПОИСКА .*?====\n.*", re.DOTALL)
     for attempt in range(RETRY_ATTEMPTS):
         contents_to_use = chat_history_for_model_initial
-        current_prompt_text_for_log = user_prompt_text_initial
-        attempted_without_search_this_cycle = False
-        for sub_attempt in range(2):
-            if sub_attempt == 1 and not attempted_without_search_this_cycle: break
-            if sub_attempt == 1 and attempted_without_search_this_cycle:
-                logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Попытка {attempt + 1}, суб-попытка БЕЗ ПОИСКА.")
-                if not chat_history_for_model_initial or not chat_history_for_model_initial[-1]['role'] == 'user' or not chat_history_for_model_initial[-1]['parts'] or not chat_history_for_model_initial[-1]['parts'][0]['text']:
-                    logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Некорректная структура chat_history_for_model_initial для удаления поиска.")
-                    reply = "❌ Ошибка: не удалось подготовить запрос без поиска из-за структуры истории."; break
-                last_user_prompt_with_search = chat_history_for_model_initial[-1]['parts'][0]['text']
-                text_without_search = search_block_pattern_to_remove.sub("", last_user_prompt_with_search)
-                if text_without_search == last_user_prompt_with_search:
-                    logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Блок поиска не был удален регулярным выражением. Повторная попытка будет с тем же промптом."); break
-                else: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Блок поиска удален для повторной суб-попытки.")
-                new_history_for_model = [entry for entry in chat_history_for_model_initial[:-1]]
-                new_history_for_model.append({"role": "user", "parts": [{"text": text_without_search.strip()}]})
-                contents_to_use = new_history_for_model
-                current_prompt_text_for_log = text_without_search.strip()
-            elif sub_attempt == 0: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Попытка {attempt + 1}, суб-попытка С ПОИСКОМ (если есть в промпте).")
-            try:
-                generation_config = genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
-                model_obj = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, generation_config=generation_config, system_instruction=system_instruction)
-                response_obj = await asyncio.to_thread(model_obj.generate_content, contents_to_use)
-                reply = _get_text_from_response(response_obj, user_id, chat_id, f"{log_prefix}{'_NoSearch' if sub_attempt == 1 else ''}")
-                block_reason_str, finish_reason_str = 'N/A', 'N/A'
-                if not reply:
-                    try:
-                        if hasattr(response_obj, 'prompt_feedback') and response_obj.prompt_feedback and hasattr(response_obj.prompt_feedback, 'block_reason'):
-                            block_reason_enum = response_obj.prompt_feedback.block_reason
-                            block_reason_str = block_reason_enum.name if hasattr(block_reason_enum, 'name') else str(block_reason_enum)
-                        if hasattr(response_obj, 'candidates') and response_obj.candidates:
-                            first_candidate = response_obj.candidates[0]
-                            if hasattr(first_candidate, 'finish_reason'):
-                                finish_reason_enum = first_candidate.finish_reason
-                                finish_reason_str = finish_reason_enum.name if hasattr(finish_reason_enum, 'name') else str(finish_reason_enum)
-                    except Exception as e_inner_reason_extract: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка извлечения причин пустого ответа: {e_inner_reason_extract}")
-                    logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Пустой ответ (попытка {attempt + 1}{', суб-попытка без поиска' if sub_attempt == 1 else ''}). Block: {block_reason_str}, Finish: {finish_reason_str}")
-                    is_other_or_safety_block = (block_reason_str == 'OTHER' or (hasattr(BlockReason, 'OTHER') and block_reason_str == BlockReason.OTHER.name) or block_reason_str == 'SAFETY' or (hasattr(BlockReason, 'SAFETY') and block_reason_str == BlockReason.SAFETY.name))
-                    if sub_attempt == 0 and is_text_request_with_search and is_other_or_safety_block:
-                        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Попытка с поиском заблокирована ({block_reason_str}). Планируем суб-попытку без поиска.")
-                        attempted_without_search_this_cycle = True
-                        try:
-                            prompt_details_for_log = pprint.pformat(chat_history_for_model_initial)
-                            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Исходный промпт (с поиском), вызвавший {block_reason_str} (первые 2000 символов):\n{prompt_details_for_log[:2000]}")
-                        except Exception as e_log_prompt_block: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка логирования промпта для {block_reason_str}: {e_log_prompt_block}")
-                        reply = None; continue
-                    if block_reason_str not in ['UNSPECIFIED', 'N/A', '', None] and (not hasattr(BlockReason, 'BLOCK_REASON_UNSPECIFIED') or block_reason_str != BlockReason.BLOCK_REASON_UNSPECIFIED.name): reply = f"🤖 Модель не дала ответ. (Блокировка: {block_reason_str})"
-                    elif finish_reason_str not in ['STOP', 'N/A', '', None] and (not hasattr(FinishReason, 'FINISH_REASON_STOP') or finish_reason_str != FinishReason.FINISH_REASON_STOP.name) and finish_reason_str not in ['OTHER', FinishReason.OTHER.name if hasattr(FinishReason,'OTHER') else 'OTHER_STR'] and finish_reason_str not in ['SAFETY', FinishReason.SAFETY.name if hasattr(FinishReason,'SAFETY') else 'SAFETY_STR']: reply = f"🤖 Модель завершила работу без ответа. (Причина: {finish_reason_str})"
-                    elif (finish_reason_str in ['OTHER', FinishReason.OTHER.name if hasattr(FinishReason,'OTHER') else 'OTHER_STR'] or finish_reason_str in ['SAFETY', FinishReason.SAFETY.name if hasattr(FinishReason,'SAFETY') else 'SAFETY_STR']) and (block_reason_str in ['UNSPECIFIED', 'N/A', '', None] or (hasattr(BlockReason, 'BLOCK_REASON_UNSPECIFIED') and block_reason_str == BlockReason.BLOCK_REASON_UNSPECIFIED.name)): reply = f"🤖 Модель завершила работу по причине: {finish_reason_str}."
-                    else: reply = "🤖 Модель дала пустой ответ."
-                    break
-                if reply:
-                    is_error_reply_generated_by_us = reply.startswith("🤖") or reply.startswith("❌")
-                    if not is_error_reply_generated_by_us:
-                        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}{'_NoSearch' if sub_attempt == 1 and attempted_without_search_this_cycle else ''}) Успешная генерация на попытке {attempt + 1}."); break
-                    else:
-                        if sub_attempt == 0 and attempted_without_search_this_cycle:
-                            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Первая суб-попытка дала ошибку, но вторая (без поиска) запланирована.")
-                            reply = None; continue
-                        else: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}{'_NoSearch' if sub_attempt == 1 and attempted_without_search_this_cycle else ''}) Получен \"технический\" ответ об ошибке: {reply[:100]}..."); break
-            except (BlockedPromptException, StopCandidateException) as e_block_stop_sub:
-                reason_str_sub = str(e_block_stop_sub.args[0]) if hasattr(e_block_stop_sub, 'args') and e_block_stop_sub.args else "неизвестна"
-                logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}{'_NoSearch' if sub_attempt == 1 and attempted_without_search_this_cycle else ''}) Запрос заблокирован/остановлен (попытка {attempt + 1}): {e_block_stop_sub} (Причина: {reason_str_sub})")
-                reply = f"❌ Запрос заблокирован/остановлен моделью."; break
-            except Exception as e_sub:
-                error_message_sub = str(e_sub)
-                logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}{'_NoSearch' if sub_attempt == 1 and attempted_without_search_this_cycle else ''}) Ошибка генерации (попытка {attempt + 1}): {error_message_sub[:200]}...")
-                if "429" in error_message_sub: reply = f"❌ Слишком много запросов к модели. Попробуйте позже."
-                elif "400" in error_message_sub: reply = f"❌ Ошибка в запросе к модели (400 Bad Request)."
-                elif "location is not supported" in error_message_sub: reply = f"❌ Эта модель недоступна в вашем регионе."
-                else: reply = f"❌ Непредвиденная ошибка при генерации: {error_message_sub[:100]}..."; break
-        if reply and not (reply.startswith("🤖") or reply.startswith("❌")): break
-        if attempt == RETRY_ATTEMPTS - 1:
-            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Не удалось получить успешный ответ после {RETRY_ATTEMPTS} попыток. Финальный reply: {reply}")
-            if reply is None: reply = f"❌ Ошибка при обращении к модели после {RETRY_ATTEMPTS} попыток."; break
-        is_retryable_error_type = False
-        if reply and ("500" in reply or "503" in reply or "timeout" in reply.lower()): is_retryable_error_type = True
-        elif 'last_exception' in locals() and hasattr(locals()['last_exception'], 'message') :
-             error_message_from_exception = str(locals()['last_exception'].message)
-             if "500" in error_message_from_exception or "503" in error_message_from_exception or "timeout" in error_message_from_exception.lower(): is_retryable_error_type = True
-        if is_retryable_error_type:
-            wait_time = RETRY_DELAY_SECONDS * (2 ** attempt)
-            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ожидание {wait_time:.1f} сек перед попыткой {attempt + 2}..."); await asyncio.sleep(wait_time)
+        if not contents_to_use or contents_to_use[-1]['role'] != 'user':
+            contents_to_use.append({'role': 'user', 'parts': [{'text': user_prompt_text_initial}]})
         else:
-            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Неретраябл ошибка или достигнут лимит ретраев. Финальный reply: {reply}")
-            if reply is None : reply = f"❌ Ошибка при обращении к модели после {attempt + 1} попыток."; break
+            contents_to_use[-1]['parts'][0]['text'] = user_prompt_text_initial
+
+        try:
+            generation_config = genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
+            model_obj = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, generation_config=generation_config, system_instruction=system_instruction_text)
+            response_obj = await asyncio.to_thread(model_obj.generate_content, contents_to_use)
+            reply = _get_text_from_response(response_obj, user_id, chat_id, "GeminiGen")
+            if reply: break
+            
+            block_reason = getattr(getattr(response_obj, 'prompt_feedback', None), 'block_reason', None)
+            if is_text_request_with_search and block_reason:
+                logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Попытка с поиском заблокирована ({block_reason}). Повторная попытка без поиска.")
+                prompt_without_search = search_block_pattern_to_remove.sub("", user_prompt_text_initial).strip()
+                return await _generate_gemini_response(prompt_without_search, chat_history_for_model_initial[:-1], user_id, chat_id, context, False)
+
+        except (BlockedPromptException, StopCandidateException) as e:
+            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Запрос заблокирован/остановлен: {e}")
+            reply = "❌ Запрос заблокирован моделью."
+            break
+        except Exception as e:
+            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка генерации (попытка {attempt + 1}): {e}", exc_info=True)
+            if "429" in str(e): reply = "❌ Слишком много запросов к модели, попробуйте позже."
+            elif attempt == RETRY_ATTEMPTS - 1: reply = f"❌ Ошибка модели после {RETRY_ATTEMPTS} попыток: {str(e)[:100]}"
+            await asyncio.sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
     return reply
 
-async def reanalyze_image_from_id(file_id: str, old_bot_response: str, user_question: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
-    user_id = context.user_data.get('id', 'Unknown')
-    chat_id = context.chat_data.get('id', 'Unknown')
-    log_prefix = "ReanalyzeImgV3"
-    try:
-        img_file = await context.bot.get_file(file_id)
-        file_bytes = await img_file.download_as_bytearray()
-        if not file_bytes: return "❌ Не удалось получить исходное изображение (файл пуст)."
-    except Exception as e:
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка скачивания {file_id}: {e}")
-        return f"❌ Ошибка при получении изображения: {e}"
-    b64_data = base64.b64encode(file_bytes).decode()
-    effective_context = _get_effective_context_for_task("vision", context, user_id, chat_id, log_prefix)
-    safe_user_name = html.escape(context.user_data.get('first_name', 'Пользователь'))
-    safe_user_question = html.escape(user_question)
-    prompt_text = (f"Это уточняющий вопрос к изображению, которое ты уже видела.\n"
-                   f"ТВОЙ ПРЕДЫДУЩИЙ ОТВЕТ:\n---\n{old_bot_response}\n---\n\n"
-                   f"НОВЫЙ ВОПРОС ОТ {safe_user_name}: \"{safe_user_question}\"\n\n"
-                   f"ЗАДАЧА: Внимательно посмотри на изображение ещё раз и ответь на новый вопрос. Будь краткой и точной.")
-    parts = [{"text": prompt_text}, {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}}]
-    return await _generate_gemini_response(user_prompt_text_initial=prompt_text, chat_history_for_model_initial=[{"role": "user", "parts": parts}], user_id=user_id, chat_id=chat_id, context=effective_context, system_instruction=system_instruction_text, log_prefix=log_prefix)
-
-async def reanalyze_document_from_id(file_id: str, old_bot_response: str, user_question: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
-    user_id = context.user_data.get('id', 'Unknown')
-    chat_id = context.chat_data.get('id', 'Unknown')
-    log_prefix = "ReanalyzeDocV1"
-    try:
-        doc_file = await context.bot.get_file(file_id)
-        file_bytes = await doc_file.download_as_bytearray()
-        text = file_bytes.decode('utf-8', errors='ignore')
-    except Exception as e:
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка скачивания/чтения {file_id}: {e}")
-        return f"❌ Ошибка при получении документа: {e}"
-    safe_user_name = html.escape(context.user_data.get('first_name', 'Пользователь'))
-    safe_user_question = html.escape(user_question)
-    prompt_text = (f"Это уточняющий вопрос к документу, который ты уже читала.\n"
-                   f"ТВОЙ ПРЕДЫДУЩИЙ ОТВЕТ:\n---\n{old_bot_response}\n---\n\n"
-                   f"СОДЕРЖИМОЕ ДОКУМЕНТА (для справки):\n---\n{text[:5000]}\n---\n\n"
-                   f"НОВЫЙ ВОПРОС ОТ {safe_user_name}: \"{safe_user_question}\"\n\n"
-                   f"ЗАДАЧА: Внимательно перечитай документ и ответь на новый вопрос.")
-    return await _generate_gemini_response(user_prompt_text_initial=prompt_text, chat_history_for_model_initial=[{"role": "user", "parts": [{"text": prompt_text}]}], user_id=user_id, chat_id=chat_id, context=context, system_instruction=system_instruction_text, log_prefix=log_prefix)
-
-def build_context_for_model(chat_history: list) -> list:
-    clean_history = []
-    for entry in chat_history:
-        if entry.get("role") in ("user", "model") and isinstance(entry.get("parts"), list):
-            clean_entry = {"role": entry["role"], "parts": []}
-            for part in entry["parts"]:
-                if isinstance(part, dict) and "text" in part:
-                    clean_entry["parts"].append({"text": part["text"]})
-            if clean_entry["parts"]: clean_history.append(clean_entry)
-    history_for_model = []
-    current_chars = 0
-    for entry in reversed(clean_history):
-        entry_text = "".join(p.get("text", "") for p in entry.get("parts", []))
-        if current_chars + len(entry_text) > MAX_CONTEXT_CHARS:
-            logger.info(f"Обрезка истории по символам. Учтено {len(history_for_model)} сообщений из {len(clean_history)}.")
-            break
-        history_for_model.append(entry)
-        current_chars += len(entry_text)
-    history_for_model.reverse()
-    return history_for_model
-
-async def perform_google_search(query: str, api_key: str, cse_id: str, num_results: int, session: httpx.AsyncClient) -> list[str] | None:
-    search_url = "https://www.googleapis.com/customsearch/v1"
-    params = {'key': api_key, 'cx': cse_id, 'q': query, 'num': num_results, 'lr': 'lang_ru', 'gl': 'ru'}
-    query_short = query[:50] + '...' if len(query) > 50 else query
-    logger.debug(f"Запрос к Google Search API для '{query_short}'...")
-    try:
-        response = await session.get(search_url, params=params, timeout=10.0)
-        response.raise_for_status() 
-        data = response.json()
-        items = data.get('items', [])
-        snippets = [item.get('snippet', item.get('title', '')) for item in items if item.get('snippet') or item.get('title')]
-        if snippets:
-            logger.info(f"Google Search: Найдено {len(snippets)} результатов для '{query_short}'.")
-            return snippets
-        else:
-            logger.info(f"Google Search: Нет сниппетов/заголовков для '{query_short}'.")
-            return None
-    except httpx.HTTPStatusError as e: logger.error(f"Google Search: Ошибка HTTP {e.response.status_code} для '{query_short}'. Ответ: {e.response.text[:200]}...")
-    except Exception as e: logger.error(f"Google Search: Непредвиденная ошибка для '{query_short}' - {e}", exc_info=True)
-    return None
-
-async def perform_ddg_search(query: str, num_results: int) -> list[str] | None:
-    query_short = query[:50] + '...' if len(query) > 50 else query
-    logger.info(f"Запрос к DDG Search API для '{query_short}'...")
-    try:
-        results = await asyncio.to_thread(DDGS().text, keywords=query, region='ru-ru', max_results=num_results)
-        if results:
-            snippets = [r['body'] for r in results]
-            logger.info(f"DDG Search: Найдено {len(snippets)} результатов для '{query_short}'.")
-            return snippets
-        logger.info(f"DDG Search: Не найдено результатов для '{query_short}'.")
-        return None
-    except Exception as e:
-        logger.error(f"DDG Search: Непредвиденная ошибка для '{query_short}' - {e}", exc_info=True)
-        return None
-
-async def perform_web_search(query: str, context: ContextTypes.DEFAULT_TYPE) -> tuple[str | None, str | None]:
-    session = getattr(context.application, 'http_client', None)
-    if session and not session.is_closed:
-        google_results = await perform_google_search(query, GOOGLE_API_KEY, GOOGLE_CSE_ID, GOOGLE_SEARCH_MAX_RESULTS, session)
-        if google_results:
-            search_str = "\n".join(f"- {s.strip()}" for s in google_results)
-            return search_str, "Google"
-    logger.warning(f"Поиск Google не дал результатов для '{query[:50]}...'. Переключаюсь на DuckDuckGo.")
-    ddg_results = await perform_ddg_search(query, DDG_MAX_RESULTS)
-    if ddg_results:
-        search_str = "\n".join(f"- {s.strip()}" for s in ddg_results)
-        return search_str, "DuckDuckGo"
-    return None, None
-
-async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text_to_process: str):
-    chat_id, user, message, user_id = update.effective_chat.id, update.effective_user, update.message, update.effective_user.id
-    safe_user_name = html.escape(user.first_name) if user.first_name else "Пользователь"
-    search_context_str, search_actually_performed = "", False
-    search_results, search_source = await perform_web_search(text_to_process, context)
-    if search_results:
-        search_context_str = f"\n\n==== РЕЗУЛЬТАТЫ ПОИСКА ({search_source}) ====\n{search_results}"
-        search_actually_performed = True
-    current_time_str = get_current_time_str()
-    time_prefix_for_prompt = f"(Текущая дата и время: {current_time_str})\n"
-    user_message_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name)
-    final_user_prompt_for_model_and_history = f"{time_prefix_for_prompt}{user_message_prefix}{html.escape(text_to_process)}{search_context_str}"
-
-    await _add_to_history(context, "user", final_user_prompt_for_model_and_history, user_id=user_id, message_id=message.message_id, content_type="voice" if message.voice else None, content_id=message.voice.file_id if message.voice else None)
+async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    user, msg, uid, cid = update.effective_user, update.message, update.effective_user.id, update.effective_chat.id
+    history = build_context_for_model(context.chat_data.get("history", []))
+    search_str, is_search = "", False
+    if get_user_setting(context, 'search_enabled', True):
+        if (results := await perform_web_search(text, context)):
+            search_str, is_search = f"\n\n==== РЕЗУЛЬТАТЫ ПОИСКА ({results[1]}) ====\n{results[0]}", True
     
-    context_for_model = build_context_for_model(context.chat_data.get("history", []))
-    gemini_reply_text = await _generate_gemini_response(user_prompt_text_initial=final_user_prompt_for_model_and_history, chat_history_for_model_initial=context_for_model, user_id=user_id, chat_id=chat_id, context=context, system_instruction=system_instruction_text, is_text_request_with_search=search_actually_performed)
+    safe_name = html.escape(user.first_name or f"User {uid}")
+    prompt = f"(Время: {get_current_time_str()})\n{USER_ID_PREFIX_FORMAT.format(user_id=uid, user_name=safe_name)}{html.escape(text)}{search_str}"
     
-    sent_message = await send_reply(message, gemini_reply_text or "🤖 Модель не дала ответ.", context)
-    await _add_to_history(context, "model", gemini_reply_text or "🤖 Модель не дала ответ.", bot_message_id=sent_message.message_id if sent_message else None)
+    await _add_to_history(context, "user", prompt, user_id=uid, message_id=msg.message_id, content_type="voice" if msg.voice else None, content_id=msg.voice.file_id if msg.voice else None)
+    
+    raw_reply = await _generate_gemini_response(prompt, history, uid, cid, context, is_search)
+    sanitized_reply = sanitize_telegram_html(raw_reply or "🤖 Модель не дала ответ.")
+
+    sent_msg = await send_reply(msg, sanitized_reply, context)
+    await _add_to_history(context, "model", sanitized_reply, bot_message_id=sent_msg.message_id if sent_msg else None)
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id, user, message = update.effective_chat.id, update.effective_user, update.message
-    if not user or not message or not message.voice: return
-    user_id, log_prefix = user.id, "VoiceHandler"
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    # This logic just transcribes and then passes to the main text processor.
+    user, msg, uid, cid = update.effective_user, update.message, update.effective_user.id, update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=cid, action=ChatAction.TYPING)
     try:
-        voice_file = await message.voice.get_file()
+        voice_file = await msg.voice.get_file()
         file_bytes = await voice_file.download_as_bytearray()
+        prompt = "Расшифруй это аудиосообщение и верни только текст расшифровки."
+        model = genai.GenerativeModel(get_user_setting(context, 'selected_model', DEFAULT_MODEL))
+        response = await asyncio.to_thread(model.generate_content, [prompt, {"mime_type": "audio/ogg", "data": bytes(file_bytes)}])
+        if (transcribed_text := _get_text_from_response(response, uid, cid, "VoiceHandler")):
+            await process_text_query(update, context, transcribed_text)
+        else: await msg.reply_text("🤖 Не удалось распознать речь.")
     except Exception as e:
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка скачивания голоса: {e}", exc_info=True)
-        await message.reply_text("❌ Ошибка при загрузке вашего голосового сообщения."); return
-    transcription_prompt = "Расшифруй это аудиосообщение и верни только текст расшифровки, без каких-либо добавлений или комментариев."
-    effective_context = _get_effective_context_for_task("audio", context, user_id, chat_id, log_prefix)
-    model_id = get_user_setting(effective_context, 'selected_model', DEFAULT_MODEL)
-    model_obj = genai.GenerativeModel(model_id)
-    try:
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Отправка аудио на расшифровку в {model_id}.")
-        response = await asyncio.to_thread(model_obj.generate_content, [transcription_prompt, {"mime_type": "audio/ogg", "data": bytes(file_bytes)}])
-        transcribed_text = _get_text_from_response(response, user_id, chat_id, log_prefix)
-        if not transcribed_text:
-            await message.reply_text("🤖 Не удалось распознать речь. Попробуйте еще раз."); return
-    except Exception as e:
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка при расшифровке: {e}", exc_info=True)
-        await message.reply_text(f"❌ Ошибка сервиса распознавания речи: {str(e)[:100]}"); return
-    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Голос расшифрован -> '{transcribed_text}'. Передача в обработчик.")
-    await process_text_query(update, context, transcribed_text)
+        logger.error(f"Ошибка обработки голоса: {e}", exc_info=True)
+        await msg.reply_text(f"❌ Ошибка сервиса распознавания: {str(e)[:100]}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message or (not message.text and not message.caption): return
-    chat_id, user, user_id = update.effective_chat.id, update.effective_user, update.effective_user.id
-    original_text = (message.text or message.caption).strip()
-    chat_history = context.chat_data.setdefault("history", [])
-    context.user_data['id'], context.user_data['first_name'], context.chat_data['id'] = user_id, user.first_name, chat_id
-    if message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id and not original_text.startswith('/'):
-        replied_to_id, old_bot_response = message.reply_to_message.message_id, message.reply_to_message.text or ""
-        for i in range(len(chat_history) - 1, -1, -1):
-            if chat_history[i].get("role") == "model" and chat_history[i].get("bot_message_id") == replied_to_id:
-                if i > 0 and chat_history[i-1].get("role") == "user":
-                    prev_user_entry = chat_history[i-1]
-                    content_type, content_id = prev_user_entry.get("content_type"), prev_user_entry.get("content_id")
-                    if content_type and content_id:
-                        new_reply_text = None
-                        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-                        if content_type == "image": new_reply_text = await reanalyze_image_from_id(content_id, old_bot_response, original_text, context)
-                        elif content_type == "document": new_reply_text = await reanalyze_document_from_id(content_id, old_bot_response, original_text, context)
-                        if new_reply_text:
-                            safe_user_name = html.escape(user.first_name or "Пользователь")
-                            user_message_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name) + html.escape(original_text)
-                            await _add_to_history(context, "user", user_message_for_history, user_id=user_id, message_id=message.message_id)
-                            sent_message = await send_reply(message, new_reply_text, context)
-                            await _add_to_history(context, "model", new_reply_text, bot_message_id=sent_message.message_id if sent_message else None)
-                            return
-                break
-    youtube_id = extract_youtube_id(original_text)
-    if youtube_id:
-        log_prefix = "YouTubeHandler"
-        safe_user_name = html.escape(user.first_name or "Пользователь")
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Обнаружена ссылка YouTube (ID: {youtube_id}).")
-        await message.reply_text(f"Окей, {safe_user_name}, сейчас гляну видео (ID: ...{youtube_id[-4:]}) и сделаю конспект...")
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        transcript_text = None
+    msg, text = update.message, (update.message.text or update.message.caption or "").strip()
+    if not text: return
+    context.user_data.setdefault('id', update.effective_user.id); context.user_data.setdefault('first_name', update.effective_user.first_name); context.chat_data.setdefault('id', update.effective_chat.id)
+    
+    if (r_msg := msg.reply_to_message) and r_msg.from_user.id == context.bot.id and not text.startswith('/'):
+        history = context.chat_data.get("history", [])
+        for i in range(len(history) - 1, -1, -1):
+            if history[i].get("bot_message_id") == r_msg.message_id and i > 0:
+                prev_entry = history[i-1]
+                if (c_type := prev_entry.get("content_type")) and (c_id := prev_entry.get("content_id")):
+                    await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+                    reanalyze_func = {'image': reanalyze_image_from_id, 'document': reanalyze_document_from_id}.get(c_type)
+                    if reanalyze_func and (new_raw_reply := await reanalyze_func(c_id, r_msg.text, text, context)):
+                        sanitized_reply = sanitize_telegram_html(new_raw_reply)
+                        sent = await send_reply(msg, sanitized_reply, context)
+                        safe_name = html.escape(msg.from_user.first_name or f"User {msg.from_user.id}")
+                        prompt = f"{USER_ID_PREFIX_FORMAT.format(user_id=msg.from_user.id, user_name=safe_name)}{html.escape(text)}"
+                        await _add_to_history(context, "user", prompt, user_id=msg.from_user.id, message_id=msg.message_id)
+                        await _add_to_history(context, "model", sanitized_reply, bot_message_id=sent.message_id if sent else None)
+                    return
+    
+    if (yt_id := extract_youtube_id(text)):
+        await context.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
         try:
-            transcript_list = await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, youtube_id, languages=['ru', 'en'])
-            transcript_text = " ".join([d['text'] for d in transcript_list])
-        except (TranscriptsDisabled, NoTranscriptFound): await message.reply_text("❌ К сожалению, для этого видео нет субтитров, поэтому я не могу сделать конспект."); return
-        except RequestBlocked: await message.reply_text("❌ Ой, похоже, YouTube временно заблокировал мои запросы. Попробуйте позже."); return
-        except Exception as e_transcript:
-            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка при получении расшифровки для {youtube_id}: {e_transcript}", exc_info=True)
-            await message.reply_text("❌ Произошла ошибка при попытке получить субтитры из видео."); return
-        safe_original_text = html.escape(original_text)
-        summary_prompt = (f"Проанализируй следующую расшифровку видео с YouTube и сделай из нее информативный конспект. "
-                        f"Оригинальный запрос пользователя был: '{safe_original_text}'. Ответь на русском языке.\n\n"
-                        f"--- НАЧАЛО РАСШИФРОВКИ ---\n{transcript_text[:20000]}\n--- КОНЕЦ РАСШИФРОВКИ ---")
-        await process_text_query(update, context, summary_prompt)
+            transcript_list = await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, yt_id, languages=['ru', 'en'])
+            transcript = " ".join([d['text'] for d in transcript_list])
+            summary_prompt = f"Сделай конспект из расшифровки видео с YouTube. Запрос пользователя: '{html.escape(text)}'. Расшифровка:\n{transcript[:20000]}"
+            await process_text_query(update, context, summary_prompt)
+        except Exception as e:
+            logger.error(f"Ошибка обработки YouTube {yt_id}: {e}", exc_info=True)
+            await msg.reply_text(f"❌ Ошибка при обработке видео: {str(e)[:150]}")
         return
-    await process_text_query(update, context, original_text)
+        
+    await process_text_query(update, context, text)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id, user = update.effective_chat.id, update.effective_user
-    if not user: logger.warning(f"ChatID: {chat_id} | handle_photo: Не удалось определить пользователя."); return
-    user_id, message, log_prefix_handler = user.id, update.message, "PhotoVision"
-    if not message or not message.photo: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) В handle_photo не найдено фото."); return
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    photo_file_id = message.photo[-1].file_id
+    user, msg, uid, cid = update.effective_user, update.message, update.effective_user.id, update.effective_chat.id
+    if not msg.photo: return
+    await context.bot.send_chat_action(chat_id=cid, action=ChatAction.TYPING)
     try:
-        photo_file = await context.bot.get_file(photo_file_id)
+        photo_file = await msg.photo[-1].get_file()
         file_bytes = await photo_file.download_as_bytearray()
-        if not file_bytes: await message.reply_text("❌ Не удалось загрузить изображение (файл пуст)."); return
+        b64_data = base64.b64encode(file_bytes).decode()
+        mime_type = "image/jpeg" if file_bytes.startswith(b'\xff\xd8\xff') else "image/png"
+        safe_caption = html.escape(msg.caption or "")
+        safe_name = html.escape(user.first_name or f"User {uid}")
+        
+        prompt_text = f"{USER_ID_PREFIX_FORMAT.format(user_id=uid, user_name=safe_name)}Опиши изображение. Подпись: \"{safe_caption}\""
+        parts = [{"text": prompt_text}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}]
+        
+        model = genai.GenerativeModel(get_user_setting(context, 'selected_model', DEFAULT_MODEL))
+        response = await asyncio.to_thread(model.generate_content, parts)
+        raw_reply = _get_text_from_response(response, uid, cid, "PhotoHandler")
+        sanitized_reply = sanitize_telegram_html(f"{IMAGE_DESCRIPTION_PREFIX}{raw_reply}" if raw_reply else "🤖 Не удалось проанализировать изображение.")
+        
+        sent_msg = await send_reply(msg, sanitized_reply, context)
+        
+        history_prompt = f"{USER_ID_PREFIX_FORMAT.format(user_id=uid, user_name=safe_name)}{safe_caption or 'Прислал фото'}"
+        await _add_to_history(context, "user", history_prompt, user_id=uid, message_id=msg.message_id, content_type="image", content_id=msg.photo[-1].file_id)
+        await _add_to_history(context, "model", sanitized_reply, bot_message_id=sent_msg.message_id if sent_msg else None)
+
     except Exception as e:
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось скачать фото по file_id: {photo_file_id}: {e}", exc_info=True)
-        await message.reply_text("❌ Не удалось загрузить изображение."); return
-    safe_user_caption = html.escape(message.caption or "")
-    effective_context_photo = _get_effective_context_for_task("vision", context, user_id, chat_id, log_prefix_handler)
-    safe_user_name = html.escape(user.first_name if user.first_name else "Пользователь")
-    current_time_str_photo = get_current_time_str()
-    prompt_text_vision = (f"(Текущая дата и время: {current_time_str_photo})\n"
-                          f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name)}Опиши это изображение. Подпись от пользователя: \"{safe_user_caption}\"")
-    prompt_text_vision += REASONING_PROMPT_ADDITION
-    try: b64_data = base64.b64encode(file_bytes).decode()
-    except Exception: await message.reply_text("❌ Ошибка обработки изображения."); return
-    mime_type = "image/jpeg" if file_bytes.startswith(b'\xff\xd8\xff') else "image/png"
-    parts_photo = [{"text": prompt_text_vision}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}]
-    reply_photo = await _generate_gemini_response(user_prompt_text_initial=prompt_text_vision, chat_history_for_model_initial=[{"role": "user", "parts": parts_photo}], user_id=user_id, chat_id=chat_id, context=effective_context_photo, system_instruction=system_instruction_text, log_prefix="PhotoVisionGen")
-    
-    user_text_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name) + (safe_user_caption or "Пользователь прислал фото.")
-    await _add_to_history(context, "user", user_text_for_history, user_id=user_id, message_id=message.message_id, content_type="image", content_id=photo_file_id)
-    
-    reply_for_user_display = f"{IMAGE_DESCRIPTION_PREFIX}{reply_photo}" if reply_photo and not reply_photo.startswith(("🤖", "❌")) else (reply_photo or "🤖 Не удалось проанализировать изображение.")
-    sent_message = await send_reply(message, reply_for_user_display, context)
-    
-    await _add_to_history(context, "model", reply_for_user_display, bot_message_id=sent_message.message_id if sent_message else None)
+        logger.error(f"Ошибка обработки фото: {e}", exc_info=True)
+        await msg.reply_text(f"❌ Ошибка обработки изображения: {str(e)[:150]}")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id, user = update.effective_chat.id, update.effective_user
-    if not user: logger.warning(f"ChatID: {chat_id} | handle_document: Не удалось определить пользователя."); return
-    user_id, message, log_prefix_handler = user.id, update.message, "DocHandler"
-    if not message or not message.document: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) В handle_document нет документа."); return
-    doc = message.document
-    allowed_mime_prefixes, allowed_mime_types = ('text/',), ('application/pdf', 'application/json', 'application/xml', 'application/csv')
-    mime_type = doc.mime_type or "application/octet-stream"
-    if not (any(mime_type.startswith(p) for p in allowed_mime_prefixes) or mime_type in allowed_mime_types):
-        await update.message.reply_text(f"⚠️ Пока могу читать только текстовые файлы и PDF... Ваш тип: `{mime_type}`", parse_mode=ParseMode.HTML); return
-    if doc.file_size > 15 * 1024 * 1024: await update.message.reply_text(f"❌ Файл `{doc.file_name}` слишком большой (> 15 MB)."); return
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+    user, msg, uid, cid = update.effective_user, update.message, update.effective_user.id, update.effective_chat.id
+    if not msg.document: return
+    doc = msg.document
+    if doc.file_size > 15 * 1024 * 1024: return await msg.reply_text("❌ Файл слишком большой (>15MB).")
+    await context.bot.send_chat_action(chat_id=cid, action=ChatAction.TYPING)
     try:
         doc_file = await doc.get_file()
         file_bytes = await doc_file.download_as_bytearray()
+        text = ""
+        if doc.mime_type == 'application/pdf':
+            text = await asyncio.to_thread(extract_text, io.BytesIO(file_bytes))
+        else:
+            try: text = file_bytes.decode('utf-8')
+            except UnicodeDecodeError: text = file_bytes.decode('cp1251', errors='ignore')
+        
+        safe_caption = html.escape(msg.caption or "")
+        safe_name = html.escape(user.first_name or f"User {uid}")
+        
+        prompt = f"Проанализируй текст из файла `{doc.file_name}`. Мой комментарий: \"{safe_caption}\"\n\n```\n{text[:10000]}\n```"
+        full_prompt = f"{USER_ID_PREFIX_FORMAT.format(user_id=uid, user_name=safe_name)}{prompt}"
+        
+        raw_reply = await _generate_gemini_response(full_prompt, [], uid, cid, context, False)
+        sanitized_reply = sanitize_telegram_html(raw_reply or "🤖 Не удалось обработать документ.")
+
+        sent_msg = await send_reply(msg, sanitized_reply, context)
+        
+        history_prompt = f"{USER_ID_PREFIX_FORMAT.format(user_id=uid, user_name=safe_name)}{safe_caption or f'Прислал документ: {doc.file_name}'}"
+        await _add_to_history(context, "user", history_prompt, user_id=uid, message_id=msg.message_id, content_type="document", content_id=doc.file_id)
+        await _add_to_history(context, "model", sanitized_reply, bot_message_id=sent_msg.message_id if sent_msg else None)
+
     except Exception as e:
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Не удалось скачать документ '{doc.file_name}': {e}", exc_info=True)
-        await message.reply_text("❌ Не удалось загрузить файл."); return
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    text = None
-    if mime_type == 'application/pdf':
-        try: text = await asyncio.to_thread(extract_text, io.BytesIO(file_bytes))
-        except Exception as e_pdf:
-            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) Ошибка извлечения из PDF '{doc.file_name}': {e_pdf}", exc_info=True)
-            await update.message.reply_text(f"❌ Не удалось извлечь текст из PDF-файла `{doc.file_name}`."); return
-    else:
-        try: text = file_bytes.decode('utf-8')
-        except UnicodeDecodeError:
-            try: text = file_bytes.decode('cp1251')
-            except UnicodeDecodeError: await update.message.reply_text(f"❌ Не удалось прочитать текстовый файл `{doc.file_name}`. Попробуйте кодировку UTF-8 или CP1251."); return
-    if text is None: await update.message.reply_text(f"❌ Не удалось извлечь текст из файла `{doc.file_name}`."); return
-    safe_user_caption = html.escape(message.caption or "")
-    current_time_str_doc, time_prefix_for_prompt_doc = get_current_time_str(), f"(Текущая дата и время: {get_current_time_str()})\n"
-    file_context_for_prompt = f"Содержимое файла `{doc.file_name or 'файл'}`:\n```\n{text[:10000]}\n```"
-    safe_user_name = html.escape(user.first_name if user.first_name else "Пользователь")
-    user_prompt_doc_for_gemini = (f"{time_prefix_for_prompt_doc}"
-                                  f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name)}"
-                                  f"Проанализируй текст из файла. Мой комментарий: \"{safe_user_caption}\".\n{file_context_for_prompt}")
-    user_prompt_doc_for_gemini += REASONING_PROMPT_ADDITION
-    gemini_reply_doc = await _generate_gemini_response(user_prompt_text_initial=user_prompt_doc_for_gemini, chat_history_for_model_initial=[{"role": "user", "parts": [{"text": user_prompt_doc_for_gemini}]}], user_id=user_id, chat_id=chat_id, context=context, system_instruction=system_instruction_text, log_prefix="DocGen")
-    
-    doc_caption_for_history = safe_user_caption or f"Загружен документ: {doc.file_name}"
-    user_message_with_id_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name) + doc_caption_for_history
-    await _add_to_history(context, "user", user_message_with_id_for_history, user_id=user_id, message_id=message.message_id, content_type="document", content_id=doc.file_id)
-    
-    sent_message = await send_reply(message, gemini_reply_doc or "🤖 Не удалось обработать документ.", context)
-    await _add_to_history(context, "model", gemini_reply_doc or "🤖 Не удалось обработать документ.", bot_message_id=sent_message.message_id if sent_message else None)
+        logger.error(f"Ошибка обработки документа {doc.file_name}: {e}", exc_info=True)
+        await msg.reply_text(f"❌ Ошибка обработки файла: {str(e)[:150]}")
 
 async def setup_bot_and_server(stop_event: asyncio.Event):
-    persistence = None
-    if DATABASE_URL:
-        try:
-            persistence = PostgresPersistence(database_url=DATABASE_URL)
-            logger.info("Персистентность включена (PostgreSQL).")
-        except Exception as e:
-            logger.error(f"Не удалось инициализировать PostgresPersistence: {e}. Бот будет работать без сохранения состояния.", exc_info=True)
-            persistence = None
-    else: logger.warning("Переменная окружения DATABASE_URL не установлена. Бот будет работать без сохранения состояния.")
-    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
-    if persistence: builder.persistence(persistence)
-    application = builder.build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("transcribe", transcribe_command))
-    application.add_handler(CommandHandler("model", model_command))
-    application.add_handler(CommandHandler("clear", clear_history))
-    application.add_handler(CallbackQueryHandler(select_model_callback, pattern="^set_model_"))
-    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    try:
-        await application.initialize()
-        commands = [BotCommand("start", "Начать работу и инфо"), BotCommand("transcribe", "Превратить голосовое в текст"), BotCommand("model", "Выбрать модель Gemini"), BotCommand("clear", "Очистить историю чата")]
-        await application.bot.set_my_commands(commands)
-        logger.info("Команды меню бота успешно установлены.")
-        webhook_host_cleaned = WEBHOOK_HOST.rstrip('/')
-        webhook_path_segment = GEMINI_WEBHOOK_PATH.strip('/')
-        webhook_url = f"{webhook_host_cleaned}/{webhook_path_segment}"
-        logger.info(f"Попытка установки вебхука: {webhook_url}")
-        secret_token = os.getenv('WEBHOOK_SECRET_TOKEN')
-        await application.bot.set_webhook( url=webhook_url, allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, secret_token=secret_token if secret_token else None )
-        logger.info(f"Вебхук успешно установлен на {webhook_url}" + (" с секретным токеном." if secret_token else "."))
-        web_server_coro = run_web_server(application, stop_event)
-        return application, web_server_coro
-    except Exception as e:
-        logger.critical(f"Критическая ошибка при инициализации бота или установке вебхука: {e}", exc_info=True)
-        if persistence and isinstance(persistence, PostgresPersistence): persistence.close()
-        raise
+    persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
+    if not persistence: logger.warning("DATABASE_URL не установлена, бот работает без сохранения состояния.")
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).persistence(persistence).build()
+    
+    handlers = [
+        CommandHandler("start", start), CommandHandler("clear", clear_history),
+        CommandHandler("model", model_command), CommandHandler("transcribe", transcribe_command),
+        CallbackQueryHandler(select_model_callback, pattern="^set_model_"),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message),
+        MessageHandler(filters.VOICE, handle_voice), MessageHandler(filters.PHOTO, handle_photo),
+        MessageHandler(filters.Document.ALL, handle_document)
+    ]
+    for handler in handlers: application.add_handler(handler)
+    
+    await application.initialize()
+    commands = [BotCommand("start", "Инфо и старт"), BotCommand("clear", "Очистить историю"), BotCommand("model", "Выбрать модель"), BotCommand("transcribe", "Голос в текст")]
+    await application.bot.set_my_commands(commands)
+    
+    webhook_url = f"{WEBHOOK_HOST.rstrip('/')}/{GEMINI_WEBHOOK_PATH.strip('/')}"
+    await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES, secret_token=os.getenv('WEBHOOK_SECRET_TOKEN'))
+    logger.info(f"Вебхук установлен на {webhook_url}")
+    
+    return application, run_web_server(application, stop_event)
 
 async def run_web_server(application: Application, stop_event: asyncio.Event):
     app = aiohttp.web.Application()
-    async def health_check(request):
-        try:
-            bot_info = await application.bot.get_me()
-            if bot_info: return aiohttp.web.Response(text=f"OK: Bot {bot_info.username} is running.")
-            else: return aiohttp.web.Response(text="Error: Bot info unavailable", status=503)
-        except Exception as e: return aiohttp.web.Response(text=f"Error: Health check failed ({type(e).__name__})", status=503)
-    app.router.add_get('/', health_check)
     app['bot_app'] = application
-    webhook_path = '/' + GEMINI_WEBHOOK_PATH.strip('/')
-    app.router.add_post(webhook_path, handle_telegram_webhook)
-    logger.info(f"Вебхук будет слушаться на пути: {webhook_path}")
+    app.router.add_get('/', lambda r: aiohttp.web.Response(text="OK"))
+    app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), handle_telegram_webhook)
+    
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
-    port = int(os.getenv("PORT", "10000"))
-    host = os.getenv("HOST", "0.0.0.0")
-    site = aiohttp.web.TCPSite(runner, host, port)
-    try:
-        await site.start()
-        logger.info(f"Веб-сервер запущен на http://{host}:{port}")
-        await stop_event.wait()
-    except asyncio.CancelledError: logger.info("Задача веб-сервера отменена.")
-    finally:
-        logger.info("Начало остановки веб-сервера..."); await runner.cleanup(); logger.info("Веб-сервер успешно остановлен.")
+    site = aiohttp.web.TCPSite(runner, os.getenv("HOST", "0.0.0.0"), int(os.getenv("PORT", "10000")))
+    
+    await site.start()
+    logger.info("Веб-сервер запущен.")
+    await stop_event.wait()
+    await runner.cleanup()
+    logger.info("Веб-сервер остановлен.")
 
-async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
-    application = request.app.get('bot_app')
-    if not application: return aiohttp.web.Response(status=500, text="Internal Server Error: Bot application not configured.")
-    secret_token = os.getenv('WEBHOOK_SECRET_TOKEN')
-    if secret_token and request.headers.get('X-Telegram-Bot-Api-Secret-Token') != secret_token:
-        return aiohttp.web.Response(status=403, text="Forbidden: Invalid secret token.")
+async def handle_telegram_webhook(request: aiohttp.web.Request):
+    application = request.app['bot_app']
+    if (secret := os.getenv('WEBHOOK_SECRET_TOKEN')) and request.headers.get('X-Telegram-Bot-Api-Secret-Token') != secret:
+        return aiohttp.web.Response(status=403)
     try:
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.process_update(update)
-        return aiohttp.web.Response(text="OK", status=200)
+        await application.process_update(Update.de_json(await request.json(), application.bot))
+        return aiohttp.web.Response()
     except Exception as e:
-        logger.error(f"Критическая ошибка обработки вебхука: {e}", exc_info=True)
-        return aiohttp.web.Response(text="Internal Server Error", status=500)
+        logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
+        return aiohttp.web.Response(status=500)
 
 async def main():
-    log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
-    log_level = getattr(logging, log_level_str, logging.INFO)
-    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=log_level)
-    logger.setLevel(log_level)
+    logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=os.getenv("LOG_LEVEL", "INFO").upper())
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
-    def signal_handler():
+    
+    def shutdown_handler():
         if not stop_event.is_set(): stop_event.set()
+        
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try: loop.add_signal_handler(sig, signal_handler)
-        except NotImplementedError: signal.signal(sig, lambda s, f: signal_handler())
-    application, web_server_task, http_client_custom = None, None, None
+        try: loop.add_signal_handler(sig, shutdown_handler)
+        except NotImplementedError: signal.signal(sig, lambda s, f: shutdown_handler())
+        
+    application, web_server_task, http_client = None, None, None
     try:
-        logger.info(f"--- Запуск приложения Gemini Telegram Bot ---")
-        http_client_custom = httpx.AsyncClient()
+        http_client = httpx.AsyncClient()
         application, web_server_coro = await setup_bot_and_server(stop_event)
-        setattr(application, 'http_client', http_client_custom)
-        web_server_task = asyncio.create_task(web_server_coro, name="WebServerTask")
-        logger.info("Приложение настроено, веб-сервер запущен. Ожидание сигнала остановки...")
+        setattr(application, 'http_client', http_client)
+        web_server_task = asyncio.create_task(web_server_coro)
         await stop_event.wait()
-    except Exception as e: logger.critical(f"Критическая ошибка во время запуска или ожидания: {e}", exc_info=True)
+    except Exception as e:
+        logger.critical("Критическая ошибка на верхнем уровне", exc_info=True)
     finally:
         logger.info("--- Начало процесса штатной остановки ---")
-        if not stop_event.is_set(): stop_event.set()
-        if web_server_task and not web_server_task.done():
-             logger.info("Остановка веб-сервера...")
-             web_server_task.cancel()
-             try: await web_server_task
-             except asyncio.CancelledError: logger.info("Задача веб-сервера успешно отменена.")
-        if application:
-            logger.info("Остановка приложения Telegram бота...")
-            await application.shutdown()
-        if http_client_custom and not http_client_custom.is_closed:
-             logger.info("Закрытие HTTPX клиента..."); await http_client_custom.aclose()
-        persistence = getattr(application, 'persistence', None)
-        if persistence and isinstance(persistence, PostgresPersistence):
-            logger.info("Закрытие соединений с базой данных...")
-            persistence.close()
+        if web_server_task and not web_server_task.done(): web_server_task.cancel()
+        if application: await application.shutdown()
+        if http_client and not http_client.is_closed: await http_client.aclose()
+        if (p := getattr(application, 'persistence', None)) and isinstance(p, PostgresPersistence): p.close()
         logger.info("--- Приложение полностью остановлено ---")
 
 if __name__ == '__main__':
-    try: asyncio.run(main())
-    except KeyboardInterrupt: logger.info("Приложение прервано пользователем (KeyboardInterrupt).")
-    except Exception as e_top: logger.critical(f"Неперехваченная ошибка на верхнем уровне: {e_top}", exc_info=True)
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен вручную.")
