@@ -1085,39 +1085,104 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id, user = update.effective_chat.id, update.effective_user
-    if not user: logger.warning(f"ChatID: {chat_id} | handle_photo: Не удалось определить пользователя."); return
+    if not user:
+        logger.warning(f"ChatID: {chat_id} | handle_photo: Не удалось определить пользователя.")
+        return
     user_id, message, log_prefix_handler = user.id, update.message, "PhotoVision"
-    if not message or not message.photo: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) В handle_photo не найдено фото."); return
+    if not message or not message.photo:
+        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix_handler}) В handle_photo не найдено фото.")
+        return
+
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     photo_file_id = message.photo[-1].file_id
+
     try:
         photo_file = await context.bot.get_file(photo_file_id)
         file_bytes = await photo_file.download_as_bytearray()
-        if not file_bytes: await message.reply_text("❌ Не удалось загрузить изображение (файл пуст)."); return
+        if not file_bytes:
+            await message.reply_text("❌ Не удалось загрузить изображение (файл пуст).")
+            return
     except Exception as e:
         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось скачать фото по file_id: {photo_file_id}: {e}", exc_info=True)
-        await message.reply_text("❌ Не удалось загрузить изображение."); return
+        await message.reply_text("❌ Не удалось загрузить изображение.")
+        return
+
     safe_user_caption = html.escape(message.caption or "")
-    effective_context_photo = _get_effective_context_for_task("vision", context, user_id, chat_id, log_prefix_handler)
     safe_user_name = html.escape(user.first_name if user.first_name else "Пользователь")
-    current_time_str_photo = get_current_time_str()
-    prompt_text_vision = (f"(Текущая дата и время: {current_time_str_photo})\n"
-                          f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name)}Опиши это изображение. Подпись от пользователя: \"{safe_user_caption}\"")
-    prompt_text_vision += REASONING_PROMPT_ADDITION
-    try: b64_data = base64.b64encode(file_bytes).decode()
-    except Exception: await message.reply_text("❌ Ошибка обработки изображения."); return
-    mime_type = "image/jpeg" if file_bytes.startswith(b'\xff\xd8\xff') else "image/png"
-    parts_photo = [{"text": prompt_text_vision}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}]
-    raw_reply_photo = await _generate_gemini_response(user_prompt_text_initial=prompt_text_vision, chat_history_for_model_initial=[{"role": "user", "parts": parts_photo}], user_id=user_id, chat_id=chat_id, context=effective_context_photo, system_instruction=system_instruction_text, log_prefix="PhotoVisionGen")
+    effective_context_photo = _get_effective_context_for_task("vision", context, user_id, chat_id, log_prefix_handler)
+
+    # --- ЭТАП 1: Извлечение текста/ключевых слов для поиска ---
+    search_context_str = ""
+    search_performed = False
     
+    try:
+        b64_data = base64.b64encode(file_bytes).decode()
+    except Exception:
+        await message.reply_text("❌ Ошибка обработки изображения.")
+        return
+    mime_type = "image/jpeg" if file_bytes.startswith(b'\xff\xd8\xff') else "image/png"
+    
+    extraction_prompt = "Проанализируй это изображение. Если на нем есть хорошо читаемый текст (заголовок, вывеска, название), извлеки его. Если текста нет, опиши ключевые объекты одним-тремя словами. Ответ должен быть очень коротким и содержать только текст или ключевые слова, подходящие для веб-поиска."
+    parts_for_extraction = [{"text": extraction_prompt}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}]
+
+    # "Тихий" запрос к Gemini для извлечения поискового запроса
+    extracted_text = await _generate_gemini_response(
+        user_prompt_text_initial=extraction_prompt,
+        chat_history_for_model_initial=[{"role": "user", "parts": parts_for_extraction}],
+        user_id=user_id,
+        chat_id=chat_id,
+        context=effective_context_photo,
+        system_instruction="Ты — инструмент для извлечения данных.", # Упрощенная инструкция для этой задачи
+        log_prefix="PhotoExtract"
+    )
+
+    if extracted_text and not extracted_text.startswith(("🤖", "❌")) and len(extracted_text.strip()) > 2:
+        search_query_text = extracted_text.strip()
+        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (PhotoVision) Извлечено для поиска: '{search_query_text}'")
+
+        # --- ЭТАП 2: Веб-поиск по извлеченным данным ---
+        search_results, search_source = await perform_web_search(search_query_text, context)
+        if search_results:
+            search_context_str = f"\n\n==== РЕЗУЛЬТАТЫ ПОИСКА ({search_source}) по тексту/объектам с изображения ====\n{search_results}"
+            search_performed = True
+            await message.reply_text(f"🔍 Нашел на картинке «_{html.escape(search_query_text[:60])}..._», ищу информацию...", parse_mode=ParseMode.HTML)
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    # --- ЭТАП 3: Финальный анализ с учетом результатов поиска ---
+    current_time_str_photo = get_current_time_str()
+    final_prompt_text = (
+        f"(Текущая дата и время: {current_time_str_photo})\n"
+        f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name)}"
+        f"Подробно проанализируй изображение и ответь на комментарий пользователя: \"{safe_user_caption}\". "
+    )
+    if search_performed:
+        final_prompt_text += "Используй следующие результаты веб-поиска, чтобы дать более полный и актуальный ответ. Ссылайся на них, если это уместно."
+    else:
+        final_prompt_text += "Если на изображении есть текст, учти его в своем ответе."
+    
+    final_prompt_text += f"{search_context_str}{REASONING_PROMPT_ADDITION}"
+
+    parts_for_final_analysis = [{"text": final_prompt_text}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}]
+    
+    raw_reply_photo = await _generate_gemini_response(
+        user_prompt_text_initial=final_prompt_text,
+        chat_history_for_model_initial=[{"role": "user", "parts": parts_for_final_analysis}],
+        user_id=user_id,
+        chat_id=chat_id,
+        context=effective_context_photo,
+        system_instruction=system_instruction_text,
+        log_prefix="PhotoVisionGen",
+        is_text_request_with_search=search_performed
+    )
+    
+    # Сохранение в историю и отправка ответа пользователю
     user_text_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name) + (safe_user_caption or "Пользователь прислал фото.")
     await _add_to_history(context, "user", user_text_for_history, user_id=user_id, message_id=message.message_id, content_type="image", content_id=photo_file_id)
     
     sanitized_reply = sanitize_telegram_html(raw_reply_photo or "🤖 Не удалось проанализировать изображение.")
-    reply_for_user_display = f"{IMAGE_DESCRIPTION_PREFIX}{sanitized_reply}" if raw_reply_photo and not raw_reply_photo.startswith(("🤖", "❌")) else sanitized_reply
     
-    sent_message = await send_reply(message, reply_for_user_display, context)
-    await _add_to_history(context, "model", reply_for_user_display, bot_message_id=sent_message.message_id if sent_message else None)
+    sent_message = await send_reply(message, sanitized_reply, context)
+    await _add_to_history(context, "model", sanitized_reply, bot_message_id=sent_message.message_id if sent_message else None)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id, user = update.effective_chat.id, update.effective_user
