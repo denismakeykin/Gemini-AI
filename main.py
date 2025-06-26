@@ -15,7 +15,8 @@ from collections import defaultdict
 import psycopg2
 from psycopg2 import pool
 import io
-import html
+import html # <<< ИЗМЕНЕНИЕ: Добавлен импорт
+
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -313,29 +314,73 @@ def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value
 def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value):
     context.user_data[key] = value
 
+# <<< ИЗМЕНЕНИЕ: Новая функция вынесена за пределы send_reply >>>
+def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
+    """
+    Разделяет текст на части, безопасные для отправки с parse_mode=HTML.
+    Закрывает незакрытые теги в конце каждого чанка и открывает их снова в начале следующего.
+    """
+    chunks = []
+    open_tags = []
+    remaining_text = text_to_chunk
+    
+    # Поддерживаемые простые теги
+    tag_regex = re.compile(r'<(/?)(b|i|u|s|code|pre)>', re.IGNORECASE)
+
+    while remaining_text:
+        if len(remaining_text) <= chunk_size:
+            chunks.append(remaining_text)
+            break
+
+        # Ищем безопасную точку для разрыва
+        split_pos = remaining_text.rfind('\n', 0, chunk_size)
+        if split_pos == -1:
+            split_pos = remaining_text.rfind(' ', 0, chunk_size)
+        if split_pos == -1 or split_pos == 0:
+            split_pos = chunk_size
+
+        current_chunk = remaining_text[:split_pos]
+        
+        # Анализируем теги в текущем чанке
+        # Сначала сбрасываем теги с предыдущих итераций, чтобы отслеживать только те, что влияют на СЛЕДУЮЩИЙ чанк
+        open_tags.clear()
+        for match in tag_regex.finditer(current_chunk):
+            tag_name = match.group(2).lower()
+            is_closing = bool(match.group(1))
+            
+            if not is_closing:
+                open_tags.append(tag_name)
+            elif tag_name in open_tags:
+                # Удаляем последний соответствующий открытый тег
+                # (простая логика для не вложенных одинаковых тегов)
+                for i in range(len(open_tags) - 1, -1, -1):
+                    if open_tags[i] == tag_name:
+                        open_tags.pop(i)
+                        break
+
+        # Закрываем все незакрытые теги в конце чанка
+        closing_tags = ''
+        if open_tags:
+            for tag in reversed(open_tags):
+                closing_tags += f'</{tag}>'
+        
+        # Формируем следующий чанк, открывая теги заново
+        opening_tags = ''
+        if open_tags:
+            for tag in open_tags:
+                opening_tags += f'<{tag}>'
+
+        chunks.append(current_chunk + closing_tags)
+        remaining_text = opening_tags + remaining_text[split_pos:].lstrip()
+
+    return chunks
+
+# <<< ИЗМЕНЕНИЕ: Функция send_reply полностью заменена на новую версию >>>
 async def send_reply(target_message: Message, text: str, context: ContextTypes.DEFAULT_TYPE) -> Message | None:
     MAX_MESSAGE_LENGTH = 4096
 
-    def smart_chunker(text_to_chunk, chunk_size):
-        chunks = []
-        remaining_text = text_to_chunk
-        while len(remaining_text) > 0:
-            if len(remaining_text) <= chunk_size:
-                chunks.append(remaining_text)
-                break
-
-            split_pos = remaining_text.rfind('\n', 0, chunk_size)
-            if split_pos == -1:
-                split_pos = remaining_text.rfind(' ', 0, chunk_size)
-
-            if split_pos == -1 or split_pos == 0:
-                split_pos = chunk_size
-
-            chunks.append(remaining_text[:split_pos])
-            remaining_text = remaining_text[split_pos:].lstrip()
-        return chunks
-
-    reply_chunks = smart_chunker(text, MAX_MESSAGE_LENGTH)
+    reply_chunks = html_safe_chunker(text, MAX_MESSAGE_LENGTH)
+    
     sent_message = None
     chat_id = target_message.chat_id
     message_id = target_message.message_id
@@ -343,41 +388,37 @@ async def send_reply(target_message: Message, text: str, context: ContextTypes.D
 
     try:
         for i, chunk in enumerate(reply_chunks):
+            # Теперь мы более уверены в HTML, так что основной try-блок должен сработать
             if i == 0:
                 sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk, reply_to_message_id=message_id, parse_mode=ParseMode.HTML)
             else:
                 sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.1) # Небольшая задержка между сообщениями
         return sent_message
     except BadRequest as e_md:
+        # Этот блок теперь будет срабатывать гораздо реже, но оставим его как защиту
         if "Can't parse entities" in str(e_md) or "can't parse" in str(e_md).lower() or "reply message not found" in str(e_md).lower():
             problematic_chunk_preview = "N/A"
             if 'i' in locals() and i < len(reply_chunks):
                 problematic_chunk_preview = reply_chunks[i][:500].replace('\n', '\\n')
 
-            logger.warning(f"UserID: {current_user_id}, ChatID: {chat_id} | Ошибка парсинга Markdown или ответа на сообщение ({message_id}): {e_md}. Проблемный чанк (начало): '{problematic_chunk_preview}...'. Попытка отправить как обычный текст.")
-            try:
-                sent_message = None
-                full_text_plain = text
-                plain_chunks = [full_text_plain[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(full_text_plain), MAX_MESSAGE_LENGTH)]
+            logger.warning(f"UserID: {current_user_id}, ChatID: {chat_id} | Ошибка парсинга HTML ({message_id}): {e_md}. Проблемный чанк (начало): '{problematic_chunk_preview}...'. Попытка отправить как обычный текст.")
+            
+            # Используем html.escape для безопасного вывода "сырого" текста с тегами
+            full_text_escaped = html.escape(text)
+            plain_chunks = [full_text_escaped[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(full_text_escaped), MAX_MESSAGE_LENGTH)]
 
-                for i_plain, chunk_plain in enumerate(plain_chunks):
-                     if i_plain == 0:
-                         sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk_plain, reply_to_message_id=message_id)
-                     else:
-                         sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk_plain)
-                     await asyncio.sleep(0.1)
-                return sent_message
-            except Exception as e_plain:
-                logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Не удалось отправить даже как обычный текст: {e_plain}", exc_info=True)
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text="❌ Не удалось отправить ответ.")
-                except Exception as e_final_send:
-                    logger.critical(f"UserID: {current_user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке: {e_final_send}")
+            for i_plain, chunk_plain in enumerate(plain_chunks):
+                 if i_plain == 0:
+                     sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk_plain, reply_to_message_id=message_id)
+                 else:
+                     sent_message = await context.bot.send_message(chat_id=chat_id, text=chunk_plain)
+                 await asyncio.sleep(0.1)
+            return sent_message
         else:
-            logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Ошибка при отправке ответа (Markdown): {e_md}", exc_info=True)
+            logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Ошибка при отправке ответа (HTML): {e_md}", exc_info=True)
             try:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка при отправке ответа: {str(e_md)[:100]}...")
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка при отправке ответа: {html.escape(str(e_md)[:100])}...")
             except Exception as e_error_send:
                 logger.error(f"UserID: {current_user_id}, ChatID: {chat_id} | Не удалось отправить сообщение об ошибке отправки: {e_error_send}")
     except Exception as e_other:
@@ -546,8 +587,9 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
     user_id = user.id
-    first_name = user.first_name
-    user_mention = f"{first_name}" if first_name else f"User {user_id}"
+    # <<< ИЗМЕНЕНИЕ: Добавлено экранирование >>>
+    safe_first_name = html.escape(user.first_name) if user.first_name else None
+    user_mention = f"{safe_first_name}" if safe_first_name else f"User {user_id}"
     
     # 1. Очищаем состояние в оперативной памяти
     context.chat_data.clear()
@@ -563,8 +605,9 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
-    first_name = user.first_name
-    user_mention = f"{first_name}" if first_name else f"User {user_id}"
+    # <<< ИЗМЕНЕНИЕ: Добавлено экранирование >>>
+    safe_first_name = html.escape(user.first_name) if user.first_name else None
+    user_mention = f"{safe_first_name}" if safe_first_name else f"User {user_id}"
     current_model = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
     keyboard = []
     sorted_models = sorted(AVAILABLE_MODELS.items())
@@ -573,8 +616,6 @@ async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
          keyboard.append([InlineKeyboardButton(button_text, callback_data=f"set_model_{m}")])
     current_model_name = AVAILABLE_MODELS.get(current_model, current_model)
     await update.message.reply_text(f"{user_mention}, выбери модель (сейчас у тебя: {current_model_name}):", reply_markup=InlineKeyboardMarkup(keyboard))
-
-# <<< НАЧАЛО: НОВЫЙ БЛОК ДЛЯ КОМАНДЫ ТРАНСКРИПЦИИ >>>
 
 async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -635,17 +676,18 @@ async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # 5. Отправляем результат пользователю
     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Транскрипция успешна.")
-    await message.reply_text(f"📝 <b>Транскрипт:</b>\n\n{transcribed_text}", parse_mode=ParseMode.HTML)
+    # <<< ИЗМЕНЕНИЕ: Используем html.escape для безопасного отображения транскрипта >>>
+    await message.reply_text(f"📝 <b>Транскрипт:</b>\n\n{html.escape(transcribed_text)}", parse_mode=ParseMode.HTML)
 
-# <<< КОНЕЦ: НОВЫЙ БЛОК ДЛЯ КОМАНДЫ ТРАНСКРИПЦИИ >>>
 
 async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
     user_id = user.id
     chat_id = query.message.chat_id
-    first_name = user.first_name
-    user_mention = f"{first_name}" if first_name else f"User {user_id}"
+    # <<< ИЗМЕНЕНИЕ: Добавлено экранирование >>>
+    safe_first_name = html.escape(user.first_name) if user.first_name else None
+    user_mention = f"{safe_first_name}" if safe_first_name else f"User {user_id}"
     await query.answer()
     callback_data = query.data
     if callback_data and callback_data.startswith("set_model_"):
@@ -653,7 +695,8 @@ async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
         if selected in AVAILABLE_MODELS:
             set_user_setting(context, 'selected_model', selected)
             model_name = AVAILABLE_MODELS[selected]
-            reply_text = f"Ок, {user_mention}, твоя модель установлена: **{model_name}**"
+            # <<< ИЗМЕНЕНИЕ: Заменена Markdown разметка на HTML >>>
+            reply_text = f"Ок, {user_mention}, твоя модель установлена: <b>{model_name}</b>"
             logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Модель установлена на {model_name} для {user_mention}.")
             try:
                 await query.edit_message_text(reply_text, parse_mode=ParseMode.HTML)
@@ -662,9 +705,11 @@ async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
                      logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Пользователь {user_mention} выбрал ту же модель: {model_name}")
                      await query.answer(f"Модель {model_name} уже выбрана.", show_alert=False)
                  else:
-                     logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение (Markdown) для {user_mention}: {e_md}. Отправляю новое.")
+                     logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение (HTML) для {user_mention}: {e_md}. Отправляю новое.")
+                     # В случае ошибки парсинга, удаляем теги
+                     plain_reply_text = re.sub('<[^<]+?>', '', reply_text)
                      try:
-                         await query.edit_message_text(reply_text.replace('**', ''))
+                         await query.edit_message_text(plain_reply_text)
                      except Exception as e_edit_plain:
                           logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось изменить сообщение даже как простой текст для {user_mention}: {e_edit_plain}. Отправляю новое.")
                           await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.HTML)
@@ -868,12 +913,15 @@ async def reanalyze_image_from_id(file_id: str, old_bot_response: str, user_ques
 
     b64_data = base64.b64encode(file_bytes).decode()
     effective_context = _get_effective_context_for_task("vision", context, user_id, chat_id, log_prefix)
-    user_name = context.user_data.get('first_name', 'Пользователь')
+    
+    # <<< ИЗМЕНЕНИЕ: Добавлено экранирование >>>
+    safe_user_name = html.escape(context.user_data.get('first_name', 'Пользователь'))
+    safe_user_question = html.escape(user_question)
 
     prompt_text = (
         f"Это уточняющий вопрос к изображению, которое ты уже видела.\n"
         f"ТВОЙ ПРЕДЫДУЩИЙ ОТВЕТ:\n---\n{old_bot_response}\n---\n\n"
-        f"НОВЫЙ ВОПРОС ОТ {user_name}: \"{user_question}\"\n\n"
+        f"НОВЫЙ ВОПРОС ОТ {safe_user_name}: \"{safe_user_question}\"\n\n"
         f"ЗАДАЧА: Внимательно посмотри на изображение ещё раз и ответь на новый вопрос. Будь краткой и точной."
     )
     parts = [{"text": prompt_text}, {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}}]
@@ -900,12 +948,15 @@ async def reanalyze_document_from_id(file_id: str, old_bot_response: str, user_q
         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка скачивания/чтения {file_id}: {e}")
         return f"❌ Ошибка при получении документа: {e}"
 
-    user_name = context.user_data.get('first_name', 'Пользователь')
+    # <<< ИЗМЕНЕНИЕ: Добавлено экранирование >>>
+    safe_user_name = html.escape(context.user_data.get('first_name', 'Пользователь'))
+    safe_user_question = html.escape(user_question)
+
     prompt_text = (
         f"Это уточняющий вопрос к документу, который ты уже читала.\n"
         f"ТВОЙ ПРЕДЫДУЩИЙ ОТВЕТ:\n---\n{old_bot_response}\n---\n\n"
         f"СОДЕРЖИМОЕ ДОКУМЕНТА (для справки):\n---\n{text[:5000]}\n---\n\n"
-        f"НОВЫЙ ВОПРОС ОТ {user_name}: \"{user_question}\"\n\n"
+        f"НОВЫЙ ВОПРОС ОТ {safe_user_name}: \"{safe_user_question}\"\n\n"
         f"ЗАДАЧА: Внимательно перечитай документ и ответь на новый вопрос."
     )
     
@@ -948,8 +999,6 @@ def build_context_for_model(chat_history: list) -> list:
     # Возвращаем в правильном хронологическом порядке
     history_for_model.reverse()
     return history_for_model
-
-# <<< НАЧАЛО БЛОКА ИСПРАВЛЕНИЯ >>>
 
 async def perform_google_search(query: str, api_key: str, cse_id: str, num_results: int, session: httpx.AsyncClient) -> list[str] | None:
     # Эта функция остается без изменений, она работает хорошо.
@@ -1012,15 +1061,6 @@ async def perform_web_search(query: str, context: ContextTypes.DEFAULT_TYPE) -> 
         
     return None, None
 
-# Было (упрощенная схема)
-# 1. user_message_for_history = "Привет"
-# 2. search_context_str = "Результаты поиска..."
-# 3. final_user_prompt = "Время... Привет... Результаты поиска..."
-# 4. chat_history.append({"text": "Привет"}) # Добавили в историю "чистый" текст
-# 5. context_for_model = build_context_for_model(chat_history)
-# 6. context_for_model[-1]["parts"][0]["text"] = final_user_prompt # Подменили последнее сообщение
-
-# Станет (новая, более чистая логика)
 async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text_to_process: str):
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -1028,7 +1068,9 @@ async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
     user_id = user.id
     
     chat_history = context.chat_data.setdefault("history", [])
-    user_name = user.first_name if user.first_name else "Пользователь"
+    
+    # <<< ИЗМЕНЕНИЕ: Добавлено экранирование >>>
+    safe_user_name = html.escape(user.first_name) if user.first_name else "Пользователь"
     
     # --- Сначала готовим ВСЕ части промпта ---
     search_context_str = ""
@@ -1040,10 +1082,10 @@ async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
         
     current_time_str = get_current_time_str()
     time_prefix_for_prompt = f"(Текущая дата и время: {current_time_str})\n"
-    user_message_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name)
+    user_message_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name)
     
     # --- Собираем ИТОГОВЫЙ промпт, который пойдет в модель И в историю ---
-    final_user_prompt_for_model_and_history = f"{time_prefix_for_prompt}{user_message_prefix}{text_to_process}{search_context_str}"
+    final_user_prompt_for_model_and_history = f"{time_prefix_for_prompt}{user_message_prefix}{html.escape(text_to_process)}{search_context_str}"
 
     history_entry_user = {
         "role": "user", "parts": [{"text": final_user_prompt_for_model_and_history}], # Используем итоговый промпт
@@ -1057,8 +1099,6 @@ async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # --- Теперь история и данные для модели идентичны ---
     context_for_model = build_context_for_model(chat_history)
     
-    # Больше не нужно модифицировать context_for_model[-1]
-
     gemini_reply_text = await _generate_gemini_response(
         user_prompt_text_initial=final_user_prompt_for_model_and_history, # Передаем тот же самый текст для логов
         chat_history_for_model_initial=context_for_model,
@@ -1078,6 +1118,7 @@ async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     while len(chat_history) > MAX_HISTORY_MESSAGES:
         chat_history.pop(0)
+
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -1141,7 +1182,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # --- 1. Обработка уточняющих вопросов (re-analyze) ---
     if message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id and not original_text.startswith('/'):
-        # Логика re-analyze остается без изменений
         replied_to_id = message.reply_to_message.message_id
         old_bot_response = message.reply_to_message.text or ""
         for i in range(len(chat_history) - 1, -1, -1):
@@ -1156,8 +1196,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if content_type == "image": new_reply_text = await reanalyze_image_from_id(content_id, old_bot_response, original_text, context)
                         elif content_type == "document": new_reply_text = await reanalyze_document_from_id(content_id, old_bot_response, original_text, context)
                         if new_reply_text:
-                            user_name = user.first_name or "Пользователь"
-                            chat_history.append({"role": "user", "parts": [{"text": USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name) + original_text}], "user_id": user_id, "message_id": message.message_id})
+                            safe_user_name = html.escape(user.first_name or "Пользователь")
+                            # <<< ИЗМЕНЕНИЕ: Добавлено экранирование >>>
+                            user_message_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name) + html.escape(original_text)
+                            chat_history.append({"role": "user", "parts": [{"text": user_message_for_history}], "user_id": user_id, "message_id": message.message_id})
                             sent_message = await send_reply(message, new_reply_text, context)
                             chat_history.append({"role": "model", "parts": [{"text": new_reply_text}], "bot_message_id": sent_message.message_id if sent_message else None})
                             if context.application.persistence: await context.application.persistence.update_chat_data(chat_id, context.chat_data)
@@ -1168,9 +1210,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     youtube_id = extract_youtube_id(original_text)
     if youtube_id:
         log_prefix = "YouTubeHandler"
-        user_name = user.first_name or "Пользователь"
+        safe_user_name = html.escape(user.first_name or "Пользователь")
         logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Обнаружена ссылка YouTube (ID: {youtube_id}).")
-        await message.reply_text(f"Окей, {user_name}, сейчас гляну видео (ID: ...{youtube_id[-4:]}) и сделаю конспект...")
+        await message.reply_text(f"Окей, {safe_user_name}, сейчас гляну видео (ID: ...{youtube_id[-4:]}) и сделаю конспект...")
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         
         transcript_text = None
@@ -1188,14 +1230,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("❌ Произошла ошибка при попытке получить субтитры из видео.")
             return
 
+        # <<< ИЗМЕНЕНИЕ: Добавлено экранирование >>>
+        safe_original_text = html.escape(original_text)
         summary_prompt = (
             f"Проанализируй следующую расшифровку видео с YouTube и сделай из нее информативный конспект. "
-            f"Оригинальный запрос пользователя был: '{original_text}'. Ответь на русском языке.\n\n"
+            f"Оригинальный запрос пользователя был: '{safe_original_text}'. Ответь на русском языке.\n\n"
             f"--- НАЧАЛО РАСШИФРОВКИ ---\n{transcript_text[:20000]}\n--- КОНЕЦ РАСШИФРОВКИ ---"
         )
-        # Обрезаем до 20к символов на всякий случай
         
-        # Передаем задачу на обработку основной функции
         await process_text_query(update, context, summary_prompt)
         return
 
@@ -1227,13 +1269,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Не удалось скачать фото по file_id: {photo_file_id}: {e}", exc_info=True)
         await message.reply_text("❌ Не удалось загрузить изображение."); return
 
-    user_caption = message.caption or ""
+    # <<< ИЗМЕНЕНИЕ: Добавлено экранирование >>>
+    safe_user_caption = html.escape(message.caption or "")
     
     effective_context_photo = _get_effective_context_for_task("vision", context, user_id, chat_id, log_prefix_handler)
-    user_name = user.first_name if user.first_name else "Пользователь"
+    safe_user_name = html.escape(user.first_name if user.first_name else "Пользователь")
     current_time_str_photo = get_current_time_str()
     prompt_text_vision = (f"(Текущая дата и время: {current_time_str_photo})\n"
-                          f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name)}Опиши это изображение. Подпись от пользователя: \"{user_caption}\"")
+                          f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name)}Опиши это изображение. Подпись от пользователя: \"{safe_user_caption}\"")
     prompt_text_vision += REASONING_PROMPT_ADDITION
     
     try:
@@ -1253,7 +1296,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_history = context.chat_data.setdefault("history", [])
     
-    user_text_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name) + (user_caption or "Пользователь прислал фото.")
+    user_text_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name) + (safe_user_caption or "Пользователь прислал фото.")
     
     history_entry_user = {
         "role": "user",
@@ -1338,16 +1381,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Не удалось извлечь текст из файла `{doc.file_name}`.")
         return
 
-    user_caption_original = message.caption or ""
+    # <<< ИЗМЕНЕНИЕ: Добавлено экранирование >>>
+    safe_user_caption = html.escape(message.caption or "")
     current_time_str_doc = get_current_time_str()
     time_prefix_for_prompt_doc = f"(Текущая дата и время: {current_time_str_doc})\n"
 
     file_context_for_prompt = f"Содержимое файла `{doc.file_name or 'файл'}`:\n```\n{text[:10000]}\n```"
 
-    user_name = user.first_name if user.first_name else "Пользователь"
+    safe_user_name = html.escape(user.first_name if user.first_name else "Пользователь")
     user_prompt_doc_for_gemini = (f"{time_prefix_for_prompt_doc}"
-                                  f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name)}"
-                                  f"Проанализируй текст из файла. Мой комментарий: \"{user_caption_original}\".\n{file_context_for_prompt}")
+                                  f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name)}"
+                                  f"Проанализируй текст из файла. Мой комментарий: \"{safe_user_caption}\".\n{file_context_for_prompt}")
     user_prompt_doc_for_gemini += REASONING_PROMPT_ADDITION
 
     gemini_reply_doc = await _generate_gemini_response(
@@ -1362,8 +1406,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_history = context.chat_data.setdefault("history", [])
 
-    doc_caption_for_history = user_caption_original or f"Загружен документ: {doc.file_name}"
-    user_message_with_id_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=user_name) + doc_caption_for_history
+    doc_caption_for_history = safe_user_caption or f"Загружен документ: {doc.file_name}"
+    user_message_with_id_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name) + doc_caption_for_history
 
     history_entry_user = {
         "role": "user",
