@@ -40,6 +40,7 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest, TelegramError
 import google.generativeai as genai
+from google.generativeai.tool import Tool
 from duckduckgo_search import DDGS
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from youtube_transcript_api._errors import RequestBlocked
@@ -932,37 +933,63 @@ async def perform_web_search(query: str, context: ContextTypes.DEFAULT_TYPE) -> 
 async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text_to_process: str, content_type: str | None = None, content_id: str | None = None):
     chat_id, user, message, user_id = update.effective_chat.id, update.effective_user, update.message, update.effective_user.id
     safe_user_name = html.escape(user.first_name) if user.first_name else "Пользователь"
-    search_context_str, search_actually_performed = "", False
-    search_results, search_source = await perform_web_search(text_to_process, context)
-    if search_results:
-        search_context_str = f"\n\n==== РЕЗУЛЬТАТЫ ПОИСКА ({search_source}) ====\n{search_results}"
-        search_actually_performed = True
+    
+    # --- ЭТАП 1: Подготовка данных для модели ---
+    # Мы больше не генерируем поисковый запрос. Модель сделает это сама.
+    # Просто добавляем последнее сообщение пользователя в историю.
+    
     current_time_str = get_current_time_str()
     time_prefix_for_prompt = f"(Текущая дата и время: {current_time_str})\n"
     user_message_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name)
-    final_user_prompt_for_model_and_history = f"{time_prefix_for_prompt}{user_message_prefix}{html.escape(text_to_process)}{search_context_str}"
+    prompt_for_history = f"{time_prefix_for_prompt}{user_message_prefix}{html.escape(text_to_process)}"
 
     # Определяем тип контента для истории: приоритет у явно переданного, затем голос, иначе - ничего
     final_content_type = content_type if content_type else ("voice" if message.voice else None)
     final_content_id = content_id if content_id else (message.voice.file_id if message.voice else None)
-
+    
     await _add_to_history(
         context,
         "user",
-        final_user_prompt_for_model_and_history,
+        prompt_for_history, # В историю кладём чистый промпт без результатов поиска
         user_id=user_id,
         message_id=message.message_id,
         content_type=final_content_type,
         content_id=final_content_id,
     )
-    
-    context_for_model = build_context_for_model(context.chat_data.get("history", []))
-    raw_gemini_reply = await _generate_gemini_response(user_prompt_text_initial=final_user_prompt_for_model_and_history, chat_history_for_model_initial=context_for_model, user_id=user_id, chat_id=chat_id, context=context, system_instruction=system_instruction_text, is_text_request_with_search=search_actually_performed)
-    
+
+    # --- ЭТАП 2: Вызов модели с активированным поиском Google ---
+    logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Вызов Gemini с нативным Google Search Grounding.")
+
+    # Собираем историю для модели. Она важна для контекста поиска.
+    history_for_model = build_context_for_model(context.chat_data.get("history", []))
+
+    try:
+        # Создаем модель, включая инструмент поиска
+        model_with_search = genai.GenerativeModel(
+            model_name=get_user_setting(context, 'selected_model', DEFAULT_MODEL),
+            safety_settings=SAFETY_SETTINGS_BLOCK_NONE,
+            system_instruction=system_instruction_text,
+            tools=[Tool.from_google_search_retrieval()] # Активируем магию!
+        )
+        
+        # Генерируем ответ. Модель сама решит, использовать поиск или нет.
+        response_obj = await asyncio.to_thread(
+            model_with_search.generate_content,
+            history_for_model,
+            generation_config=genai.GenerationConfig(temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS)
+        )
+        
+        raw_gemini_reply = _get_text_from_response(response_obj, user_id, chat_id, "GoogleGroundedGen")
+
+    except Exception as e:
+        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка при вызове модели с Google Search: {e}", exc_info=True)
+        raw_gemini_reply = f"❌ Произошла ошибка при обращении к модели с поиском: {e}"
+
+    # --- ЭТАП 3: Отправка ответа и сохранение в историю ---
     sanitized_reply = sanitize_telegram_html(raw_gemini_reply or "🤖 Модель не дала ответ.")
     sent_message = await send_reply(message, sanitized_reply, context)
     await _add_to_history(context, "model", sanitized_reply, bot_message_id=sent_message.message_id if sent_message else None)
-
+    
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id, user, message = update.effective_chat.id, update.effective_user, update.message
     if not user or not message or not message.voice: return
