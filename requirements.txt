@@ -1,4 +1,4 @@
---upgrade pip
+pip
 python-telegram-bot[webhooks]
 google-generativeai
 duckduckgo-search
