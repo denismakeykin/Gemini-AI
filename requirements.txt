@@ -1,14 +1,10 @@
-pip
 python-telegram-bot[webhooks]
 google-generativeai>=0.9.0
 duckduckgo-search
 pytz
-chardet
 psycopg2-binary
 sqlalchemy
 youtube-transcript-api
 pdfminer.six
-aiohttp
 httpx
 beautifulsoup4
-
