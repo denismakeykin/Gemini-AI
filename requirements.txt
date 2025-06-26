@@ -1,3 +1,4 @@
+--upgrade pip
 python-telegram-bot[webhooks]
 google-generativeai
 duckduckgo-search
@@ -9,3 +10,5 @@ youtube-transcript-api
 pdfminer.six
 aiohttp
 httpx
+beautifulsoup4
+
