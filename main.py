@@ -17,12 +17,16 @@ from psycopg2 import pool
 import io
 import html
 
+# Новые импорты для веб-скрапинга
+import httpx
+from bs4 import BeautifulSoup
+
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 import aiohttp
 import aiohttp.web
-import httpx
+# httpx уже импортирован выше
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, BotCommand
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
@@ -751,6 +755,27 @@ async def _generate_gemini_response(user_prompt_text_initial: str, chat_history_
             if reply is None : reply = f"❌ Ошибка при обращении к модели после {attempt + 1} попыток."; break
     return reply
 
+async def fetch_webpage_content(url: str, session: httpx.AsyncClient) -> str | None:
+    """Получает и очищает основной текстовый контент с веб-страницы."""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        response = await session.get(url, timeout=15.0, headers=headers, follow_redirects=True)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        for element in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            element.decompose()
+
+        text = ' '.join(soup.stripped_strings)
+        return text
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Ошибка статуса HTTP при получении контента с {url}: {e}")
+        return f"Не удалось загрузить страницу: HTTP {e.response.status_code}."
+    except Exception as e:
+        logger.error(f"Ошибка при получении контента с {url}: {e}", exc_info=True)
+        return "Произошла непредвиденная ошибка при загрузке страницы."
+
 async def reanalyze_image_from_id(file_id: str, old_bot_response: str, user_question: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
     user_id = context.user_data.get('id', 'Unknown')
     chat_id = context.chat_data.get('id', 'Unknown')
@@ -791,6 +816,46 @@ async def reanalyze_document_from_id(file_id: str, old_bot_response: str, user_q
                    f"СОДЕРЖИМОЕ ДОКУМЕНТА (для справки):\n---\n{text[:5000]}\n---\n\n"
                    f"НОВЫЙ ВОПРОС ОТ {safe_user_name}: \"{safe_user_question}\"\n\n"
                    f"ЗАДАЧА: Внимательно перечитай документ и ответь на новый вопрос.")
+    return await _generate_gemini_response(user_prompt_text_initial=prompt_text, chat_history_for_model_initial=[{"role": "user", "parts": [{"text": prompt_text}]}], user_id=user_id, chat_id=chat_id, context=context, system_instruction=system_instruction_text, log_prefix=log_prefix)
+
+async def reanalyze_youtube_from_id(video_id: str, old_bot_response: str, user_question: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    user_id, chat_id = context.user_data.get('id', 'Unknown'), context.chat_data.get('id', 'Unknown')
+    log_prefix = "ReanalyzeYouTubeV1"
+    try:
+        transcript_list = await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, video_id, languages=['ru', 'en'])
+        transcript_text = " ".join([d['text'] for d in transcript_list])
+    except Exception as e:
+        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка при повторном получении транскрипта {video_id}: {e}")
+        return f"❌ Не удалось получить исходный транскрипт видео: {e}"
+
+    safe_user_name = html.escape(context.user_data.get('first_name', 'Пользователь'))
+    safe_user_question = html.escape(user_question)
+    prompt_text = (f"Это уточняющий вопрос к видео, которое ты уже анализировал(а).\n"
+                   f"ТВОЙ ПРЕДЫДУЩИЙ ОТВЕТ:\n---\n{old_bot_response}\n---\n\n"
+                   f"ПОЛНЫЙ ТРАНСКРИПТ ВИДЕО (для справки):\n---\n{transcript_text[:15000]}\n---\n\n"
+                   f"НОВЫЙ ВОПРОС ОТ {safe_user_name}: \"{safe_user_question}\"\n\n"
+                   f"ЗАДАЧА: Внимательно перечитай транскрипт и ответь на новый вопрос.")
+    return await _generate_gemini_response(user_prompt_text_initial=prompt_text, chat_history_for_model_initial=[{"role": "user", "parts": [{"text": prompt_text}]}], user_id=user_id, chat_id=chat_id, context=context, system_instruction=system_instruction_text, log_prefix=log_prefix)
+
+async def reanalyze_webpage_from_url(url: str, old_bot_response: str, user_question: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    user_id, chat_id = context.user_data.get('id', 'Unknown'), context.chat_data.get('id', 'Unknown')
+    log_prefix = "ReanalyzeWebpageV1"
+    session = getattr(context.application, 'http_client', None)
+    if not session or session.is_closed:
+        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) HTTP клиент не доступен.")
+        return "❌ Ошибка: отсутствует HTTP клиент для выполнения запроса."
+
+    web_content = await fetch_webpage_content(url, session)
+    if not web_content or web_content.startswith("Не удалось") or web_content.startswith("Произошла"):
+        return f"❌ Не удалось получить содержимое страницы для повторного анализа. {web_content}"
+
+    safe_user_name = html.escape(context.user_data.get('first_name', 'Пользователь'))
+    safe_user_question = html.escape(user_question)
+    prompt_text = (f"Это уточняющий вопрос к веб-странице, которую ты уже читал(а).\n"
+                   f"ТВОЙ ПРЕДЫДУЩИЙ ОТВЕТ:\n---\n{old_bot_response}\n---\n\n"
+                   f"ПОЛНОЕ СОДЕРЖИМОЕ СТРАНИЦЫ (для справки):\n---\n{web_content[:15000]}\n---\n\n"
+                   f"НОВЫЙ ВОПРОС ОТ {safe_user_name}: \"{safe_user_question}\"\n\n"
+                   f"ЗАДАЧА: Внимательно перечитай текст страницы и ответь на новый вопрос.")
     return await _generate_gemini_response(user_prompt_text_initial=prompt_text, chat_history_for_model_initial=[{"role": "user", "parts": [{"text": prompt_text}]}], user_id=user_id, chat_id=chat_id, context=context, system_instruction=system_instruction_text, log_prefix=log_prefix)
 
 def build_context_for_model(chat_history: list) -> list:
@@ -864,7 +929,7 @@ async def perform_web_search(query: str, context: ContextTypes.DEFAULT_TYPE) -> 
         return search_str, "DuckDuckGo"
     return None, None
 
-async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text_to_process: str):
+async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text_to_process: str, content_type: str | None = None, content_id: str | None = None):
     chat_id, user, message, user_id = update.effective_chat.id, update.effective_user, update.message, update.effective_user.id
     safe_user_name = html.escape(user.first_name) if user.first_name else "Пользователь"
     search_context_str, search_actually_performed = "", False
@@ -877,7 +942,19 @@ async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
     user_message_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name)
     final_user_prompt_for_model_and_history = f"{time_prefix_for_prompt}{user_message_prefix}{html.escape(text_to_process)}{search_context_str}"
 
-    await _add_to_history(context, "user", final_user_prompt_for_model_and_history, user_id=user_id, message_id=message.message_id, content_type="voice" if message.voice else None, content_id=message.voice.file_id if message.voice else None)
+    # Определяем тип контента для истории: приоритет у явно переданного, затем голос, иначе - ничего
+    final_content_type = content_type if content_type else ("voice" if message.voice else None)
+    final_content_id = content_id if content_id else (message.voice.file_id if message.voice else None)
+
+    await _add_to_history(
+        context,
+        "user",
+        final_user_prompt_for_model_and_history,
+        user_id=user_id,
+        message_id=message.message_id,
+        content_type=final_content_type,
+        content_id=final_content_id,
+    )
     
     context_for_model = build_context_for_model(context.chat_data.get("history", []))
     raw_gemini_reply = await _generate_gemini_response(user_prompt_text_initial=final_user_prompt_for_model_and_history, chat_history_for_model_initial=context_for_model, user_id=user_id, chat_id=chat_id, context=context, system_instruction=system_instruction_text, is_text_request_with_search=search_actually_performed)
@@ -915,54 +992,95 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    if not message or (not message.text and not message.caption): return
+    if not message or (not message.text and not message.caption):
+        return
+
     chat_id, user, user_id = update.effective_chat.id, update.effective_user, update.effective_user.id
     original_text = (message.text or message.caption).strip()
     chat_history = context.chat_data.setdefault("history", [])
     context.user_data['id'], context.user_data['first_name'], context.chat_data['id'] = user_id, user.first_name, chat_id
+    safe_user_name = html.escape(user.first_name or "Пользователь")
+
+    # --- БЛОК 1: ОБРАБОТКА ОТВЕТА НА СООБЩЕНИЕ БОТА ---
     if message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id and not original_text.startswith('/'):
-        replied_to_id, old_bot_response = message.reply_to_message.message_id, message.reply_to_message.text or ""
+        replied_to_id = message.reply_to_message.message_id
+        old_bot_response = message.reply_to_message.text or ""
+
         for i in range(len(chat_history) - 1, -1, -1):
             if chat_history[i].get("role") == "model" and chat_history[i].get("bot_message_id") == replied_to_id:
                 if i > 0 and chat_history[i-1].get("role") == "user":
                     prev_user_entry = chat_history[i-1]
-                    content_type, content_id = prev_user_entry.get("content_type"), prev_user_entry.get("content_id")
+                    content_type = prev_user_entry.get("content_type")
+                    content_id = prev_user_entry.get("content_id")
+
                     if content_type and content_id:
                         new_reply_text = None
                         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-                        if content_type == "image": new_reply_text = await reanalyze_image_from_id(content_id, old_bot_response, original_text, context)
-                        elif content_type == "document": new_reply_text = await reanalyze_document_from_id(content_id, old_bot_response, original_text, context)
+
+                        if content_type == "image":
+                            new_reply_text = await reanalyze_image_from_id(content_id, old_bot_response, original_text, context)
+                        elif content_type == "document":
+                            new_reply_text = await reanalyze_document_from_id(content_id, old_bot_response, original_text, context)
+                        elif content_type == "youtube":
+                            new_reply_text = await reanalyze_youtube_from_id(content_id, old_bot_response, original_text, context)
+                        elif content_type == "webpage":
+                            new_reply_text = await reanalyze_webpage_from_url(content_id, old_bot_response, original_text, context)
+                        
                         if new_reply_text:
-                            safe_user_name = html.escape(user.first_name or "Пользователь")
                             user_message_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name) + html.escape(original_text)
                             await _add_to_history(context, "user", user_message_for_history, user_id=user_id, message_id=message.message_id)
                             sanitized_reply = sanitize_telegram_html(new_reply_text)
                             sent_message = await send_reply(message, sanitized_reply, context)
                             await _add_to_history(context, "model", sanitized_reply, bot_message_id=sent_message.message_id if sent_message else None)
-                            return
-                break
+                            return # Важно: выходим, так как запрос обработан
+                break # Выходим из цикла, как только нашли соответствующее сообщение
+    
+    # --- БЛОК 2: ОБРАБОТКА НОВОГО СООБЩЕНИЯ СО ССЫЛКОЙ ---
     youtube_id = extract_youtube_id(original_text)
+    general_url = extract_general_url(original_text)
+    session = getattr(context.application, 'http_client', None)
+
+    # Приоритет YouTube
     if youtube_id:
         log_prefix = "YouTubeHandler"
-        safe_user_name = html.escape(user.first_name or "Пользователь")
         logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Обнаружена ссылка YouTube (ID: {youtube_id}).")
         await message.reply_text(f"Окей, {safe_user_name}, сейчас гляну видео (ID: ...{youtube_id[-4:]}) и сделаю конспект...")
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        transcript_text = None
+        
         try:
             transcript_list = await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, youtube_id, languages=['ru', 'en'])
             transcript_text = " ".join([d['text'] for d in transcript_list])
-        except (TranscriptsDisabled, NoTranscriptFound): await message.reply_text("❌ К сожалению, для этого видео нет субтитров, поэтому я не могу сделать конспект."); return
-        except RequestBlocked: await message.reply_text("❌ Ой, похоже, YouTube временно заблокировал мои запросы. Попробуйте позже."); return
+        except (TranscriptsDisabled, NoTranscriptFound): await message.reply_text("❌ К сожалению, для этого видео нет субтитров."); return
+        except RequestBlocked: await message.reply_text("❌ YouTube временно заблокировал мои запросы. Попробуйте позже."); return
         except Exception as e_transcript:
-            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка при получении расшифровки для {youtube_id}: {e_transcript}", exc_info=True)
-            await message.reply_text("❌ Произошла ошибка при попытке получить субтитры из видео."); return
-        safe_original_text = html.escape(original_text)
-        summary_prompt = (f"Проанализируй следующую расшифровку видео с YouTube и сделай из нее информативный конспект. "
-                        f"Оригинальный запрос пользователя был: '{safe_original_text}'. Ответь на русском языке.\n\n"
-                        f"--- НАЧАЛО РАСШИФРОВКИ ---\n{transcript_text[:20000]}\n--- КОНЕЦ РАСШИФРОВКИ ---")
-        await process_text_query(update, context, summary_prompt)
+            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка: {e_transcript}", exc_info=True)
+            await message.reply_text("❌ Ошибка при получении субтитров."); return
+
+        summary_prompt = (f"Сделай информативный конспект по расшифровке видео с YouTube. "
+                          f"Запрос пользователя: '{html.escape(original_text)}'.\n\n"
+                          f"--- РАСШИФРОВКА ---\n{transcript_text[:20000]}\n--- КОНЕЦ ---")
+        await process_text_query(update, context, summary_prompt, content_type="youtube", content_id=youtube_id)
         return
+
+    # Затем общие веб-страницы
+    elif general_url and session and not session.is_closed:
+        log_prefix = "WebpageHandler"
+        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Обнаружена ссылка на веб-страницу: {general_url}")
+        await message.reply_text(f"Минуточку, {safe_user_name}, читаю страницу...")
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+        web_content = await fetch_webpage_content(general_url, session)
+        if not web_content or web_content.startswith("Не удалось") or web_content.startswith("Произошла"):
+            await message.reply_text(f"Не удалось обработать страницу. {web_content}")
+            return
+
+        summary_prompt = (f"Проанализируй текст с веб-страницы и ответь на запрос пользователя. "
+                          f"Запрос пользователя: '{html.escape(original_text)}'.\n\n"
+                          f"--- ТЕКСТ СТРАНИЦЫ ---\n{web_content[:20000]}\n--- КОНЕЦ ---")
+        await process_text_query(update, context, summary_prompt, content_type="webpage", content_id=general_url)
+        return
+
+    # --- БЛОК 3: ОБРАБОТКА ОБЫЧНОГО ТЕКСТОВОГО СООБЩЕНИЯ ---
     await process_text_query(update, context, original_text)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
