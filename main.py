@@ -243,7 +243,7 @@ def sanitize_telegram_html(raw_html: str) -> str:
 
 def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
     chunks, tag_stack, remaining_text = [], [], text_to_chunk
-    tag_regex = re.compile(r'<(/?)(b|i|u|s|code|pre|a|tg-spoiler)>', re.IGNORECASE) # <br> обрабатывается санитайзером
+    tag_regex = re.compile(r'<(/?)(b|i|u|s|code|pre|a|tg-spoiler)>', re.IGNORECASE)
     while len(remaining_text) > chunk_size:
         split_pos = remaining_text.rfind('\n', 0, chunk_size)
         if split_pos == -1: split_pos = remaining_text.rfind(' ', 0, chunk_size)
@@ -252,7 +252,7 @@ def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
         temp_stack = list(tag_stack)
         for match in tag_regex.finditer(current_chunk):
             tag_name, is_closing = match.group(2).lower(), bool(match.group(1))
-            if tag_name == 'a': continue # Не отслеживаем теги <a>, т.к. они сложные
+            if tag_name == 'a': continue
             if not is_closing: temp_stack.append(tag_name)
             elif temp_stack and temp_stack[-1] == tag_name: temp_stack.pop()
         closing_tags = ''.join(f'</{tag}>' for tag in reversed(temp_stack))
@@ -320,6 +320,28 @@ def _get_effective_context_for_task(task_type: str, original_context: ContextTyp
 
 def get_current_time_str() -> str: return datetime.datetime.now(pytz.timezone(TARGET_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
 def extract_youtube_id(url: str) -> str | None: return (m.group(1) if (m := re.search(r"(?:v=|\/)([a-zA-Z0-9_-]{11}).*", url)) else None)
+
+# <<< ВОССТАНОВЛЕННАЯ ФУНКЦИЯ >>>
+def build_context_for_model(chat_history: list) -> list:
+    clean_history = []
+    for entry in chat_history:
+        if entry.get("role") in ("user", "model") and isinstance(entry.get("parts"), list):
+            clean_entry = {"role": entry["role"], "parts": []}
+            for part in entry["parts"]:
+                if isinstance(part, dict) and "text" in part:
+                    clean_entry["parts"].append({"text": part["text"]})
+            if clean_entry["parts"]: clean_history.append(clean_entry)
+    history_for_model = []
+    current_chars = 0
+    for entry in reversed(clean_history):
+        entry_text = "".join(p.get("text", "") for p in entry.get("parts", []))
+        if current_chars + len(entry_text) > MAX_CONTEXT_CHARS:
+            logger.info(f"Обрезка истории по символам. Учтено {len(history_for_model)} сообщений из {len(clean_history)}.")
+            break
+        history_for_model.append(entry)
+        current_chars += len(entry_text)
+    history_for_model.reverse()
+    return history_for_model
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for key, value in {'selected_model': DEFAULT_MODEL, 'search_enabled': True, 'temperature': 1.0, 'detailed_reasoning_enabled': True}.items():
@@ -433,14 +455,13 @@ async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE,
     await _add_to_history(context, "model", sanitized_reply, bot_message_id=sent_msg.message_id if sent_msg else None)
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # This logic just transcribes and then passes to the main text processor.
     user, msg, uid, cid = update.effective_user, update.message, update.effective_user.id, update.effective_chat.id
     await context.bot.send_chat_action(chat_id=cid, action=ChatAction.TYPING)
     try:
         voice_file = await msg.voice.get_file()
         file_bytes = await voice_file.download_as_bytearray()
         prompt = "Расшифруй это аудиосообщение и верни только текст расшифровки."
-        model = genai.GenerativeModel(get_user_setting(context, 'selected_model', DEFAULT_MODEL))
+        model = genai.GenerativeModel(_get_effective_context_for_task("audio", context, uid, cid, "VoiceHandler").user_data['selected_model'])
         response = await asyncio.to_thread(model.generate_content, [prompt, {"mime_type": "audio/ogg", "data": bytes(file_bytes)}])
         if (transcribed_text := _get_text_from_response(response, uid, cid, "VoiceHandler")):
             await process_text_query(update, context, transcribed_text)
@@ -497,10 +518,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         safe_caption = html.escape(msg.caption or "")
         safe_name = html.escape(user.first_name or f"User {uid}")
         
+        effective_context = _get_effective_context_for_task("vision", context, uid, cid, "PhotoHandler")
         prompt_text = f"{USER_ID_PREFIX_FORMAT.format(user_id=uid, user_name=safe_name)}Опиши изображение. Подпись: \"{safe_caption}\""
         parts = [{"text": prompt_text}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}]
         
-        model = genai.GenerativeModel(get_user_setting(context, 'selected_model', DEFAULT_MODEL))
+        model = genai.GenerativeModel(effective_context.user_data['selected_model'])
         response = await asyncio.to_thread(model.generate_content, parts)
         raw_reply = _get_text_from_response(response, uid, cid, "PhotoHandler")
         sanitized_reply = sanitize_telegram_html(f"{IMAGE_DESCRIPTION_PREFIX}{raw_reply}" if raw_reply else "🤖 Не удалось проанализировать изображение.")
@@ -534,10 +556,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         safe_caption = html.escape(msg.caption or "")
         safe_name = html.escape(user.first_name or f"User {uid}")
         
+        history = build_context_for_model(context.chat_data.get("history", []))
         prompt = f"Проанализируй текст из файла `{doc.file_name}`. Мой комментарий: \"{safe_caption}\"\n\n```\n{text[:10000]}\n```"
         full_prompt = f"{USER_ID_PREFIX_FORMAT.format(user_id=uid, user_name=safe_name)}{prompt}"
         
-        raw_reply = await _generate_gemini_response(full_prompt, [], uid, cid, context, False)
+        raw_reply = await _generate_gemini_response(full_prompt, history, uid, cid, context, False)
         sanitized_reply = sanitize_telegram_html(raw_reply or "🤖 Не удалось обработать документ.")
 
         sent_msg = await send_reply(msg, sanitized_reply, context)
