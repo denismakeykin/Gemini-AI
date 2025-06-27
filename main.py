@@ -111,7 +111,7 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 
 # <<< НАЧАЛО: ВАШИ МОДЕЛИ ВОЗВРАЩЕНЫ
 AVAILABLE_MODELS = {'gemini-2.5-flash': '2.5 Flash'}
-DEFAULT_MODEL = 'gemini-2.5-flash' if 'gemini-2.5-flash' in AVAILABLE_MODELS
+DEFAULT_MODEL = 'gemini-2.5-flash'
 # <<< КОНЕЦ: ВАШИ МОДЕЛИ ВОЗВРАЩЕНЫ
 
 MAX_OUTPUT_TOKENS = 8192
