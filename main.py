@@ -243,7 +243,7 @@ async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> 
         return final_text
     except Exception as e:
         logger.error(f"Ошибка стриминга: {e}", exc_info=True)
-        await message_to_edit.edit_text(f"❌ Ошибка стриминга: {str(e)[:500]}") # Обрезаем текст ошибки
+        await message_to_edit.edit_text(f"❌ Ошибка стриминга: {str(e)[:500]}")
         return ""
 
 async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list, content_type: str = None, content_id: str = None):
@@ -277,7 +277,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 
     except Exception as e:
         logger.error(f"Критическая ошибка в process_query: {e}", exc_info=True)
-        await placeholder_message.edit_text(f"❌ Произошла серьезная ошибка: {str(e)[:500]}") # Обрезаем текст ошибки
+        await placeholder_message.edit_text(f"❌ Произошла серьезная ошибка: {str(e)[:500]}")
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
