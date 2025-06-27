@@ -401,6 +401,10 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
     if persistence: builder.persistence(persistence)
     application = builder.build()
     
+    # Сначала инициализируем приложение, чтобы загрузить данные из БД.
+    await application.initialize()
+    
+    # Теперь добавляем "живые" клиенты, которые не хранятся в БД.
     application.bot_data['gemini_client'] = genai.Client()
     application.bot_data['http_client'] = httpx.AsyncClient()
 
@@ -420,7 +424,6 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
     application.add_handler(MessageHandler(filters.Document.TEXT | filters.Document.PDF, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_and_replies))
     
-    await application.initialize()
     await application.bot.set_my_commands(commands_to_register)
     
     webhook_url = f"{WEBHOOK_HOST.rstrip('/')}/{GEMINI_WEBHOOK_PATH.strip('/')}"
