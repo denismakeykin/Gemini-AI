@@ -1,20 +1,27 @@
 services:
   - type: web
-    name: gemini_ai_new_bot # Можете дать любое имя
+    name: gemini-ai-bot # Можете дать любое имя
     env: python
     plan: free # Важно для бесплатных лимитов
     buildCommand: "python -m pip install --upgrade pip && pip install -r requirements.txt --upgrade"
-    startCommand: "python ./main.py"
+    startCommand: "python main.py"
     envVars:
+      # --- Секреты, которые вы вводите при создании сервиса ---
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: GOOGLE_API_KEY
         sync: false
-      - key: GOOGLE_CSE_ID
-        sync: false
+      
+      # --- Переменные для ручного ввода в панели управления Render ---
       - key: WEBHOOK_HOST
         sync: false
       - key: GEMINI_WEBHOOK_PATH
         sync: false
       - key: DATABASE_URL
         sync: false
+
+databases:
+  - name: gemini-db
+    plan: free
+    databaseName: gemini_bot_db
+    user: gemini_bot_user
