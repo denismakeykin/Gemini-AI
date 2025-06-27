@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: gemini-ai-bot # Можете дать любое имя
+    name: gemini-ai-new-bot # Можете дать любое имя
     env: python
     plan: free # Важно для бесплатных лимитов
     buildCommand: "python -m pip install --upgrade pip && pip install -r requirements.txt --upgrade"
