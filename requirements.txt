@@ -1,11 +1,9 @@
 python-telegram-bot[webhooks]
-google-generativeai
-duckduckgo-search
+google-genai
 pytz
 psycopg2-binary
-sqlalchemy
 youtube-transcript-api
 pdfminer.six
 httpx
 beautifulsoup4
-aiohttp
+pydantic
