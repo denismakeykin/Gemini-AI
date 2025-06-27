@@ -55,24 +55,51 @@ except FileNotFoundError:
 class PostgresPersistence(BasePersistence):
     def __init__(self, database_url: str):
         super().__init__()
-        self.db_pool = None; self.dsn = database_url
-        try: self._connect(); self._initialize_db()
-        except psycopg2.Error as e: logger.critical(f"PostgresPersistence: Не удалось подключиться к БД: {e}"); raise
+        self.db_pool = None
+        self.dsn = database_url
+        try:
+            self._connect()
+            self._initialize_db()
+        except psycopg2.Error as e:
+            logger.critical(f"PostgresPersistence: Не удалось подключиться к БД: {e}")
+            raise
+
     def _connect(self):
         if self.db_pool:
-            try: self.db_pool.closeall()
-            except Exception as e: logger.warning(f"Ошибка при закрытии старого пула: {e}")
-        self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=self.dsn)
-    def _execute(self, query: str, params: tuple = None, fetch: str = None):
-        if not self.db_pool: raise ConnectionError("Пул соединений не инициализирован.")
-        conn = self.db_pool.getconn()
+            try:
+                self.db_pool.closeall()
+            except Exception as e:
+                logger.warning(f"Ошибка при закрытии старого пула: {e}")
+        # Добавляем параметры keepalives в DSN (строку подключения)
+        keepalive_args = "keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=5"
+        dsn_with_keepalives = f"{self.dsn} {keepalive_args}" if 'keepalives' not in self.dsn else self.dsn
+        self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=dsn_with_keepalives)
+        logger.info("Пул соединений с БД (пере)создан с параметрами keepalive.")
+
+    def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=1):
+        if not self.db_pool:
+            raise ConnectionError("Пул соединений не инициализирован.")
         try:
-            with conn.cursor() as cur:
-                cur.execute(query, params)
-                if fetch == "one": return cur.fetchone()
-                if fetch == "all": return cur.fetchall()
-                conn.commit()
-        finally: self.db_pool.putconn(conn)
+            conn = self.db_pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(query, params)
+                    if fetch == "one":
+                        return cur.fetchone()
+                    if fetch == "all":
+                        return cur.fetchall()
+                    conn.commit()
+            finally:
+                self.db_pool.putconn(conn)
+        except psycopg2.OperationalError as e:
+            logger.warning(f"Ошибка соединения с БД: {e}. Попытка переподключения...")
+            if retries > 0:
+                self._connect()  # Пересоздаем пул соединений
+                return self._execute(query, params, fetch, retries - 1)  # Повторяем запрос
+            else:
+                logger.error("Не удалось выполнить запрос после переподключения.")
+                raise e  # Если и вторая попытка не удалась - выбрасываем ошибку
+
     def _initialize_db(self): self._execute("CREATE TABLE IF NOT EXISTS persistence_data (key TEXT PRIMARY KEY, data BYTEA NOT NULL);")
     def _get_pickled(self, key: str) -> object | None:
         res = self._execute("SELECT data FROM persistence_data WHERE key = %s;", (key,), fetch="one")
