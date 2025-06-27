@@ -224,13 +224,13 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     
     model_name = DEFAULT_MODEL
     client = context.bot_data['gemini_client']
-    model = client.models.get(f'models/{model_name}')
-
+    
     placeholder_message = await message.reply_text("...")
     
     try:
-        stream = model.generate_content_stream(
-            context.chat_data.get("history", []),
+        stream = client.models.generate_content_stream(
+            model=f'models/{model_name}',
+            contents=context.chat_data.get("history", []),
             generation_config=types.GenerationConfig(temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS),
             system_instruction=system_instruction_text,
             tools=[types.Tool(google_search=types.GoogleSearch())]
@@ -278,12 +278,12 @@ async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     file_bytes = await (await replied_message.voice.get_file()).download_as_bytearray()
     
     client = context.bot_data['gemini_client']
-    model = client.models.get(f'models/{DEFAULT_MODEL}')
     
     try:
         response = await asyncio.to_thread(
-            model.generate_content,
-            [{"text": "Расшифруй это аудио и верни только текст."}, types.Part(inline_data=types.Blob(mime_type=replied_message.voice.mime_type, data=file_bytes))]
+            client.models.generate_content,
+            model=f'models/{DEFAULT_MODEL}',
+            contents=[{"text": "Расшифруй это аудио и верни только текст."}, types.Part(inline_data=types.Blob(mime_type=replied_message.voice.mime_type, data=file_bytes))]
         )
         await update.message.reply_text(f"<b>Транскрипт:</b>\n{html.escape(response.text)}", parse_mode=ParseMode.HTML)
     except Exception as e:
