@@ -1,5 +1,5 @@
 python-telegram-bot[webhooks]
-google-generativeai>=0.7.0
+google.generativeai
 duckduckgo-search
 pytz
 psycopg2-binary
