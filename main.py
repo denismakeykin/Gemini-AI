@@ -150,6 +150,7 @@ AVAILABLE_MODELS = {'gemini-2.5-flash': '2.5 Flash'}
 DEFAULT_MODEL = 'gemini-2.5-flash'
 MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
+MAX_CONTEXT_CHARS = 30000
 USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow"
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -186,6 +187,23 @@ async def _add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: 
     history.append(entry)
     while len(history) > MAX_HISTORY_MESSAGES:
         history.pop(0)
+
+def build_context_for_model(chat_history: list) -> list:
+    """Собирает контекст для модели, обрезая старые сообщения по лимиту символов."""
+    context_for_model = []
+    current_chars = 0
+    for entry in reversed(chat_history):
+        entry_text = "".join(p.get("text", "") for p in entry.get("parts", []) if isinstance(p, dict))
+        entry_chars = len(entry_text)
+        
+        if current_chars + entry_chars > MAX_CONTEXT_CHARS and context_for_model:
+            logger.info(f"Контекст обрезан. Учтено {len(context_for_model)} из {len(chat_history)} сообщений.")
+            break
+            
+        context_for_model.insert(0, entry)
+        current_chars += entry_chars
+        
+    return context_for_model
 
 # --- НОВЫЙ МЕХАНИЗМ СТРИМИНГА И ОБРАБОТКИ ---
 async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> str:
@@ -228,6 +246,8 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     placeholder_message = await message.reply_text("...")
     
     try:
+        context_for_model = build_context_for_model(context.chat_data.get("history", []))
+        
         request_config = types.GenerateContentConfig(
             temperature=1.0,
             max_output_tokens=MAX_OUTPUT_TOKENS,
@@ -237,7 +257,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 
         stream = await client.aio.models.generate_content_stream(
             model=f'models/{model_name}',
-            contents=context.chat_data.get("history", []),
+            contents=context_for_model,
             config=request_config
         )
         full_reply_text = await stream_and_send_reply(placeholder_message, stream)
