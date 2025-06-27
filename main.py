@@ -68,10 +68,21 @@ class PostgresPersistence(BasePersistence):
         if self.db_pool:
             try: self.db_pool.closeall()
             except Exception as e: logger.warning(f"Ошибка при закрытии старого пула: {e}")
-        keepalive_args = "keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=5"
-        dsn_with_keepalives = f"{self.dsn} {keepalive_args}" if 'keepalives' not in self.dsn else self.dsn
+
+        dsn = self.dsn
+        keepalive_options = "keepalives=1&keepalives_idle=60&keepalives_interval=10&keepalives_count=5"
+
+        if "keepalives" not in dsn:
+            if "?" in dsn:
+                dsn_with_keepalives = f"{dsn}&{keepalive_options}"
+            else:
+                dsn_with_keepalives = f"{dsn}?{keepalive_options}"
+        else:
+            dsn_with_keepalives = dsn
+
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=dsn_with_keepalives)
-        logger.info("Пул соединений с БД (пере)создан с параметрами keepalive.")
+        logger.info(f"Пул соединений с БД (пере)создан. DSN: ...{dsn_with_keepalives[-70:]}")
+
 
     def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=1):
         if not self.db_pool: raise ConnectionError("Пул соединений не инициализирован.")
