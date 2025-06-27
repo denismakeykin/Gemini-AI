@@ -3,11 +3,11 @@ services:
     name: gemini_ai_new_bot # Можете дать любое имя
     env: python
     plan: free # Важно для бесплатных лимитов
-    buildCommand: "python -m pip install --upgrade pip && python -m pip install --index-url https://pypi.org/simple/ -r requirements.txt"
+    buildCommand: "python -m pip install --upgrade pip && python pip install -r requirements.txt"
     startCommand: "python ./main.py"
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.9
+        value: >=3.11.9
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: GOOGLE_API_KEY
