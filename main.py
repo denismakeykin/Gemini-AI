@@ -13,6 +13,7 @@ import io
 import html
 import time
 from typing import Coroutine
+import mimetypes
 
 import httpx
 from bs4 import BeautifulSoup
@@ -134,16 +135,13 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     logger.critical("Отсутствуют обязательные переменные окружения!")
     exit(1)
 
-genai.configure(api_key=GOOGLE_API_KEY)
-AVAILABLE_MODELS = {'gemini-1.5-flash-latest': '1.5 Flash'}
-DEFAULT_MODEL = 'gemini-1.5-flash-latest'
-MAX_HISTORY_MESSAGES = 50
+AVAILABLE_MODELS = {'gemini-2.5-flash': '2.5 Flash'}
+DEFAULT_MODEL = 'gemini-2.5-flash'
+MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
 USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow"
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value): return context.user_data.get(key, default_value)
-def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value): context.user_data[key] = value
 def get_current_time_str() -> str: return datetime.datetime.now(pytz.timezone(TARGET_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
 def extract_youtube_id(url_text: str) -> str | None:
     match = re.search(r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})", url_text)
@@ -166,10 +164,8 @@ async def fetch_webpage_content(url: str, session: httpx.AsyncClient) -> str | N
         return None
 def sanitize_telegram_html(raw_html: str) -> str:
     if not raw_html: return ""
-    # Заменяем <br> на переносы строк и преобразуем списки
     s = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
     s = re.sub(r'<li>', '• ', s, flags=re.IGNORECASE)
-    # Удаляем все теги, кроме разрешенных Telegram
     s = re.sub(r'</?(?!b>|i>|u>|s>|code>|pre>|a>|tg-spoiler>)\w+\s*[^>]*>', '', s)
     return s.strip()
 
@@ -204,7 +200,7 @@ async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> 
         sanitized_final = sanitize_telegram_html(final_text)
         if sanitized_final != message_to_edit.text.removesuffix(" ▌"):
              await message_to_edit.edit_text(sanitized_final)
-        return final_text # Возвращаем несанитизированный текст для сохранения в историю
+        return final_text
     except Exception as e:
         logger.error(f"Ошибка стриминга: {e}", exc_info=True)
         await message_to_edit.edit_text(f"❌ Ошибка стриминга: {e}")
@@ -212,20 +208,16 @@ async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> 
 
 async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list, content_type: str = None, content_id: str = None):
     message, user = update.message, update.effective_user
-    safe_user_name = html.escape(user.first_name or "Пользователь")
     
-    # Добавляем сообщение пользователя в историю
     await _add_to_history(context, "user", prompt_parts, user_id=user.id, message_id=message.message_id, content_type=content_type, content_id=content_id)
     
-    # Готовимся к генерации
-    model_name = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
+    model_name = DEFAULT_MODEL
     client = context.bot_data['gemini_client']
     model = client.models.get(f'models/{model_name}')
 
     placeholder_message = await message.reply_text("...")
     
     try:
-        # Используем stateless streaming
         stream = model.generate_content_stream(
             context.chat_data.get("history", []),
             generation_config=types.GenerationConfig(temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS),
@@ -234,7 +226,6 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         )
         full_reply_text = await stream_and_send_reply(placeholder_message, stream)
         
-        # Добавляем ответ модели в историю
         await _add_to_history(context, "model", [{"text": full_reply_text}], bot_message_id=placeholder_message.message_id)
 
     except Exception as e:
@@ -243,40 +234,29 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    await update.message.reply_text(
-        "Меня зовут Женя, я ваш персональный ассистент на базе Google Gemini 1.5 Flash.\n\n"
+    start_message = (
+        "Меня зовут Женя, я ваш ассистент на базе Google Gemini 2.5 Flash.\n\n"
         "<b>Что я умею:</b>\n"
-        "• 💬 Вести диалог и помнить контекст\n"
-        "• 🖼️ Анализировать изображения\n"
+        "• 🌐 Отвечать, используя огромный объем знаний до 2025 года и поиск Google\n"
         "• 🎤 Понимать голосовые сообщения\n"
-        "• 📄 Читать текстовые файлы и PDF\n"
-        "• 🌐 Искать актуальную информацию в Google\n\n"
-        "<b>Полезные команды:</b>\n"
-        "/start - Это сообщение\n"
-        "/clear - Очистить историю чата\n"
-        "/model - Выбрать другую модель Gemini\n"
-        "/transcribe - <i>(в ответе на голосовое)</i> Просто расшифровать аудио\n"
+        "• 🖼️ Анализировать изображения\n"
+        "• 📄 Читать текстовые файлы, PDF и веб-страницы\n"
+        "• 💬 Вести диалог и помнить весь контекст\n\n"
+        "<b>Команды:</b>\n"
+        "/transcribe - <i>(в ответе на голосовое)</i> Расшифровать аудио\n"
         "/summarize_yt <i><ссылка></i> - Сделать конспект видео с YouTube\n"
-        "/summarize_url <i><ссылка></i> - Сделать выжимку из статьи по ссылке\n\n"
-        "Просто напишите мне, прикрепите файл или отправьте голосовое!",
-        parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        "/summarize_url <i><ссылка></i> - Сделать выжимку из статьи по ссылке\n"
+        "/clear - Очистить историю чата\n\n"
+        "(!) Пользуясь данным ботом, вы автоматически соглашаетесь на отправку ваших сообщений через Google Gemini API для получения ответов."
+    )
+    await update.message.reply_text(
+        start_message,
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    )
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.clear()
     await update.message.reply_text("🧹 История этого чата очищена.")
-
-async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    current_model = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    keyboard = [[InlineKeyboardButton(f"{'✅ ' if m == current_model else ''}{name}", callback_data=f"set_model_{m}")] for m, name in sorted(AVAILABLE_MODELS.items())]
-    await update.message.reply_text("Выберите модель:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    selected = query.data.replace("set_model_", "")
-    if selected in AVAILABLE_MODELS:
-        set_user_setting(context, 'selected_model', selected)
-        await query.edit_message_text(f"Модель установлена: <b>{AVAILABLE_MODELS[selected]}</b>.", parse_mode=ParseMode.HTML)
 
 async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     replied_message = update.message.reply_to_message
@@ -287,7 +267,7 @@ async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     file_bytes = await (await replied_message.voice.get_file()).download_as_bytearray()
     
     client = context.bot_data['gemini_client']
-    model = client.models.get(f'models/{DEFAULT_MODEL}') # Используем модель по умолчанию для этой задачи
+    model = client.models.get(f'models/{DEFAULT_MODEL}')
     
     try:
         response = await asyncio.to_thread(
@@ -328,7 +308,6 @@ async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_
     original_text = (message.text or "").strip()
     if not original_text: return
     
-    # Логика для ответов на сообщения бота (повторный анализ)
     if message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id:
         history = context.chat_data.get("history", [])
         for i in range(len(history) - 1, -1, -1):
@@ -339,20 +318,18 @@ async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_
                     content_id = prev_user_turn.get("content_id")
                     
                     if content_type and content_id:
-                        # Запускаем повторный анализ
-                        prompt = f"Это уточняющий вопрос к предыдущему контенту. Пользователь спрашивает: '{original_text}'. Проанализируй исходный материал еще раз и ответь на этот вопрос."
-                        
-                        # Загружаем исходный контент в parts
-                        parts = [{"text": prompt}]
+                        prompt_text = f"Это уточняющий вопрос к предыдущему контенту. Пользователь спрашивает: '{original_text}'. Проанализируй исходный материал еще раз и ответь."
+                        parts = [{"text": prompt_text}]
                         try:
                             if content_type in ["image", "video", "voice"]:
                                 file_bytes = await(await context.bot.get_file(content_id)).download_as_bytearray()
-                                mime = mimetypes.guess_type(content_id)[0] or 'application/octet-stream'
+                                mime, _ = mimetypes.guess_type(content_id, strict=False)
+                                if not mime and content_type == 'voice': mime = 'audio/ogg'
+                                elif not mime and content_type == 'image': mime = 'image/jpeg'
                                 parts.append(types.Part(inline_data=types.Blob(mime_type=mime, data=file_bytes)))
                             elif content_type == "document":
                                 file_bytes = await(await context.bot.get_file(content_id)).download_as_bytearray()
                                 parts[0]["text"] += f"\n\nТЕКСТ ДОКУМЕНТА:\n{file_bytes.decode('utf-8', 'ignore')[:15000]}"
-                            # и т.д. для других типов...
                             
                             await process_query(update, context, parts, content_type=content_type, content_id=content_id)
                             return
@@ -360,7 +337,6 @@ async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_
                             await message.reply_text(f"❌ Не удалось получить исходный контент для повторного анализа: {e}")
                             return
 
-    # Обычный текстовый запрос
     time_prefix = f"(Текущая дата и время: {get_current_time_str()})\n"
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user.id, user_name=html.escape(user.first_name or ''))
     await process_query(update, context, [{"text": f"{time_prefix}{user_prefix}{html.escape(original_text)}"}])
@@ -414,26 +390,21 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
     if persistence: builder.persistence(persistence)
     application = builder.build()
     
-    # Добавляем клиенты в bot_data
     application.bot_data['gemini_client'] = genai.Client()
     application.bot_data['http_client'] = httpx.AsyncClient()
 
-    # Регистрируем обработчики
     commands_to_register = [
         BotCommand("start", "Инфо и помощь"),
         BotCommand("clear", "Очистить историю"),
-        BotCommand("model", "Выбрать модель"),
         BotCommand("transcribe", "Расшифровать аудио (ответом на него)"),
         BotCommand("summarize_yt", "Конспект видео YouTube"),
         BotCommand("summarize_url", "Выжимка из статьи по ссылке")
     ]
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("clear", clear_history))
-    application.add_handler(CommandHandler("model", model_command))
     application.add_handler(CommandHandler("transcribe", transcribe_command))
     application.add_handler(CommandHandler("summarize_url", summarize_url_command))
     application.add_handler(CommandHandler("summarize_yt", summarize_yt_command))
-    application.add_handler(CallbackQueryHandler(select_model_callback, pattern="^set_model_"))
     application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.VOICE, handle_media))
     application.add_handler(MessageHandler(filters.Document.TEXT | filters.Document.PDF, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_and_replies))
