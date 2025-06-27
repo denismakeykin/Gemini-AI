@@ -1,5 +1,3 @@
-# Полностью замените содержимое файла main.py на это:
-
 import logging
 import os
 import asyncio
@@ -53,7 +51,7 @@ except FileNotFoundError:
     logger.critical("Критическая ошибка: файл system_prompt.md не найден!")
     exit(1)
 
-# --- БАЗА ДАННЫХ (без изменений) ---
+# --- БАЗА ДАННЫХ (полная версия) ---
 class PostgresPersistence(BasePersistence):
     def __init__(self, database_url: str):
         super().__init__()
@@ -92,7 +90,15 @@ class PostgresPersistence(BasePersistence):
         user_data = defaultdict(dict); [user_data.update({int(k.split('_')[-1]): pickle.loads(d)}) for k, d in all_data or []]
         return user_data
     async def update_user_data(self, user_id: int, data: dict) -> None: await asyncio.to_thread(self._set_pickled, f"user_data_{user_id}", data)
+    async def drop_user_data(self, user_id: int) -> None: await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"user_data_{user_id}",))
     async def drop_chat_data(self, chat_id: int) -> None: await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"chat_data_{chat_id}",))
+    async def get_callback_data(self) -> dict | None: return None
+    async def update_callback_data(self, data: dict) -> None: pass
+    async def get_conversations(self, name: str) -> dict: return {}
+    async def update_conversation(self, name: str, key: tuple, new_state: object | None) -> None: pass
+    async def refresh_bot_data(self, bot_data: dict) -> None: data = await self.get_bot_data(); bot_data.update(data)
+    async def refresh_chat_data(self, chat_id: int, chat_data: dict) -> None: data = await asyncio.to_thread(self._get_pickled, f"chat_data_{chat_id}") or {}; chat_data.update(data)
+    async def refresh_user_data(self, user_id: int, user_data: dict) -> None: data = await asyncio.to_thread(self._get_pickled, f"user_data_{user_id}") or {}; user_data.update(data)
     async def flush(self) -> None: pass
     def close(self):
         if self.db_pool: self.db_pool.closeall()
@@ -103,8 +109,11 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     logger.critical("Отсутствуют обязательные переменные окружения!")
     exit(1)
 
-AVAILABLE_MODELS = {'gemini-1.5-flash-latest': '1.5 Flash', 'gemini-1.5-pro-latest': '1.5 Pro'}
-DEFAULT_MODEL = 'gemini-1.5-flash-latest'
+# <<< НАЧАЛО: ВАШИ МОДЕЛИ ВОЗВРАЩЕНЫ
+AVAILABLE_MODELS = {'gemini-2.5-flash': '2.5 Flash'}
+DEFAULT_MODEL = 'gemini-2.5-flash' if 'gemini-2.5-flash' in AVAILABLE_MODELS
+# <<< КОНЕЦ: ВАШИ МОДЕЛИ ВОЗВРАЩЕНЫ
+
 MAX_OUTPUT_TOKENS = 8192
 USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow"
 
@@ -178,10 +187,29 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text
         await placeholder_message.edit_text(f"❌ Произошла серьезная ошибка: {e}")
 
 # --- ОБРАБОТЧИКИ СООБЩЕНИЙ TELEGRAM ---
+# <<< НАЧАЛО: ВАШЕ СТАРТОВОЕ СООБЩЕНИЕ ВОЗВРАЩЕНО
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_user_setting(context, 'selected_model', get_user_setting(context, 'selected_model', DEFAULT_MODEL))
-    start_message = "Привет! Я Женя, ассистент на базе Gemini. Могу анализировать текст, фото, видео, ссылки, а также использовать поиск и инструменты (например, спроси 'который час' или попроси решить математическую задачу)."
-    await update.message.reply_text(start_message, disable_web_page_preview=True)
+    user = update.effective_user
+    if 'selected_model' not in context.user_data: set_user_setting(context, 'selected_model', DEFAULT_MODEL)
+    if 'search_enabled' not in context.user_data: set_user_setting(context, 'search_enabled', True)
+    if 'temperature' not in context.user_data: set_user_setting(context, 'temperature', 1.0)
+    if 'detailed_reasoning_enabled' not in context.user_data: set_user_setting(context, 'detailed_reasoning_enabled', True)
+    bot_core_model_key = DEFAULT_MODEL
+    raw_bot_core_model_display_name = AVAILABLE_MODELS.get(bot_core_model_key, bot_core_model_key)
+    author_channel_link_raw = "https://t.me/denisobovsyom"
+    date_knowledge_text_raw = "до начала 2025 года"
+    start_message_plain_parts = [
+        f"Меня зовут Женя, работаю на Google Gemini {raw_bot_core_model_display_name} с настройками автора бота: {author_channel_link_raw}",
+        f"- обладаю огромным объемом знаний {date_knowledge_text_raw} и поиском Google,",
+        f"- читаю и понимаю голосовые сообщения, изображения, txt, pdf и веб-страницы,",
+        f"- знаю ваше имя, помню историю чата. Пишите лично и добавляйте меня в группы.",
+        f"(!) Пользуясь данным ботом, вы автоматически соглашаетесь на отправку ваших сообщений через Google (Search + Gemini API) для получения ответов."]
+    start_message_plain = "\n".join(start_message_plain_parts)
+    try:
+        await update.message.reply_text(start_message_plain, disable_web_page_preview=True)
+    except Exception as e: logger.error(f"Failed to send start_message (Plain Text): {e}", exc_info=True)
+# <<< КОНЕЦ: ВАШЕ СТАРТОВОЕ СООБЩЕНИЕ ВОЗВРАЩЕНО
+
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'chat_session' in context.chat_data:
         del context.chat_data['chat_session']
