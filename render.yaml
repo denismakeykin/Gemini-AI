@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: gemini-telegram-bot # Можете дать любое имя
+    name: gemini_ai_new_bot # Можете дать любое имя
     env: python
     plan: free # Важно для бесплатных лимитов
     buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
@@ -10,7 +10,6 @@ services:
         value: 3.11.9
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-        # Указываем, что секрет будет введен в дашборде
       - key: GOOGLE_API_KEY
         sync: false
       - key: GOOGLE_CSE_ID
@@ -20,6 +19,4 @@ services:
       - key: GEMINI_WEBHOOK_PATH
         sync: false
       - key: DATABASE_URL
-        sync: false
-      - key: WEBHOOK_SECRET_TOKEN
         sync: false
