@@ -82,12 +82,24 @@ class PostgresPersistence(BasePersistence):
     async def update_bot_data(self, data: dict) -> None: await asyncio.to_thread(self._set_pickled, "bot_data", data)
     async def get_chat_data(self) -> defaultdict[int, dict]:
         all_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'chat_data_%';", fetch="all")
-        chat_data = defaultdict(dict); [chat_data.update({int(k.split('_')[-1]): pickle.loads(d)}) for k, d in all_data or []]
+        chat_data = defaultdict(dict)
+        for k, d in all_data or []:
+            try:
+                chat_id = int(k.split('_')[-1])
+                chat_data[chat_id] = pickle.loads(d)
+            except (ValueError, IndexError):
+                logger.warning(f"Обнаружен некорректный ключ чата в БД: '{k}'. Запись пропущена.")
         return chat_data
     async def update_chat_data(self, chat_id: int, data: dict) -> None: await asyncio.to_thread(self._set_pickled, f"chat_data_{chat_id}", data)
     async def get_user_data(self) -> defaultdict[int, dict]:
         all_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'user_data_%';", fetch="all")
-        user_data = defaultdict(dict); [user_data.update({int(k.split('_')[-1]): pickle.loads(d)}) for k, d in all_data or []]
+        user_data = defaultdict(dict)
+        for k, d in all_data or []:
+            try:
+                user_id = int(k.split('_')[-1])
+                user_data[user_id] = pickle.loads(d)
+            except (ValueError, IndexError):
+                logger.warning(f"Обнаружен некорректный ключ пользователя в БД: '{k}'. Запись пропущена.")
         return user_data
     async def update_user_data(self, user_id: int, data: dict) -> None: await asyncio.to_thread(self._set_pickled, f"user_data_{user_id}", data)
     async def drop_user_data(self, user_id: int) -> None: await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"user_data_{user_id}",))
@@ -109,11 +121,8 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     logger.critical("Отсутствуют обязательные переменные окружения!")
     exit(1)
 
-# <<< НАЧАЛО: ВАШИ МОДЕЛИ ВОЗВРАЩЕНЫ
 AVAILABLE_MODELS = {'gemini-2.5-flash': '2.5 Flash'}
 DEFAULT_MODEL = 'gemini-2.5-flash'
-# <<< КОНЕЦ: ВАШИ МОДЕЛИ ВОЗВРАЩЕНЫ
-
 MAX_OUTPUT_TOKENS = 8192
 USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow"
 
@@ -132,6 +141,12 @@ async def fetch_webpage_content(url: str, session: httpx.AsyncClient) -> str | N
         soup = BeautifulSoup(response.text, 'html.parser'); [s.decompose() for s in soup(['script', 'style', 'nav', 'footer', 'header', 'aside'])]
         return ' '.join(soup.stripped_strings)
     except Exception as e: logger.error(f"Ошибка скрапинга {url}: {e}"); return None
+def extract_youtube_id(url: str) -> str | None:
+    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
+    return match.group(1) if match else None
+def extract_general_url(text: str) -> str | None:
+    match = re.search(r'https?://[^\s/$.?#].[^\s]*', text)
+    return match.group(0) if match else None
 
 # --- НОВЫЙ МЕХАНИЗМ СТРИМИНГА ОТВЕТА В TELEGRAM ---
 async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> str:
@@ -164,43 +179,34 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text
     model_name = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
 
     if 'chat_session' not in context.chat_data:
-        # Создаем сессию чата без конфигурации. Просто контейнер.
         context.chat_data['chat_session'] = client.chats.create(model=f'models/{model_name}')
     
     chat_session = context.chat_data['chat_session']
 
-    # --- Ключевой момент: Конфигурация создается здесь, перед каждым вызовом ---
     tools = [get_current_time, types.Tool(code_execution=types.ToolCodeExecution())]
     if get_user_setting(context, 'search_enabled', True):
         tools.append(types.Tool(google_search=types.GoogleSearch()))
 
-    # Используем правильный класс `GenerateContentConfig`
     request_config = types.GenerateContentConfig(
         system_instruction=system_instruction_text,
         tools=tools,
         temperature=1.0,
         max_output_tokens=MAX_OUTPUT_TOKENS
     )
-    # --- Конец блока конфигурации ---
-
+    
     placeholder_message = await update.message.reply_text("...")
     
     prompt_text = f"(Текущая дата: {datetime.datetime.now(pytz.timezone(TARGET_TIMEZONE)).strftime('%Y-%m-%d')})\n{USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))}{html.escape(text_to_process)}"
     message_parts = [prompt_text] + kwargs.get('content_parts', [])
 
     try:
-        # Передаем конфигурацию (`request_config`) вместе с сообщением
-        stream = chat_session.send_message_stream(
-            message=message_parts,
-            config=request_config
-        )
+        stream = chat_session.send_message_stream(message=message_parts, config=request_config)
         await stream_and_send_reply(placeholder_message, stream)
     except Exception as e:
         logger.error(f"Критическая ошибка в process_query: {e}", exc_info=True)
         await placeholder_message.edit_text(f"❌ Произошла серьезная ошибка: {e}")
 
 # --- ОБРАБОТЧИКИ СООБЩЕНИЙ TELEGRAM ---
-# <<< НАЧАЛО: ВАШЕ СТАРТОВОЕ СООБЩЕНИЕ ВОЗВРАЩЕНО
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if 'selected_model' not in context.user_data: set_user_setting(context, 'selected_model', DEFAULT_MODEL)
@@ -221,7 +227,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text(start_message_plain, disable_web_page_preview=True)
     except Exception as e: logger.error(f"Failed to send start_message (Plain Text): {e}", exc_info=True)
-# <<< КОНЕЦ: ВАШЕ СТАРТОВОЕ СООБЩЕНИЕ ВОЗВРАЩЕНО
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'chat_session' in context.chat_data:
