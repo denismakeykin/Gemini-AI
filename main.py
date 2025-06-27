@@ -160,19 +160,28 @@ async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> 
 
 # --- ГЛАВНЫЙ ОБРАБОТЧИК ЗАПРОСОВ К GEMINI (ИСПОЛЬЗУЕТ НАТИВНЫЙ ЧАТ) ---
 async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text_to_process: str, **kwargs):
-    client = context.application.gemini_client
-    
+    client = context.bot_data['gemini_client']
+    model_name = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
+
     if 'chat_session' not in context.chat_data:
-        model_name = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
-        tools = [get_current_time, types.Tool(code_execution=types.ToolCodeExecution())]
-        if get_user_setting(context, 'search_enabled', True):
-            tools.append(types.Tool(google_search=types.GoogleSearch()))
-        context.chat_data['chat_session'] = client.chats.create(
-            model=f'models/{model_name}',
-            history=[],
-            config=types.CreateChatConfig(system_instruction=system_instruction_text, tools=tools, temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS)
-        )
+        # Создаем сессию чата без конфигурации. Просто контейнер.
+        context.chat_data['chat_session'] = client.chats.create(model=f'models/{model_name}')
+    
     chat_session = context.chat_data['chat_session']
+
+    # --- Ключевой момент: Конфигурация создается здесь, перед каждым вызовом ---
+    tools = [get_current_time, types.Tool(code_execution=types.ToolCodeExecution())]
+    if get_user_setting(context, 'search_enabled', True):
+        tools.append(types.Tool(google_search=types.GoogleSearch()))
+
+    # Используем правильный класс `GenerateContentConfig`
+    request_config = types.GenerateContentConfig(
+        system_instruction=system_instruction_text,
+        tools=tools,
+        temperature=1.0,
+        max_output_tokens=MAX_OUTPUT_TOKENS
+    )
+    # --- Конец блока конфигурации ---
 
     placeholder_message = await update.message.reply_text("...")
     
@@ -180,7 +189,11 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text
     message_parts = [prompt_text] + kwargs.get('content_parts', [])
 
     try:
-        stream = chat_session.send_message_stream(message=message_parts)
+        # Передаем конфигурацию (`request_config`) вместе с сообщением
+        stream = chat_session.send_message_stream(
+            message=message_parts,
+            config=request_config
+        )
         await stream_and_send_reply(placeholder_message, stream)
     except Exception as e:
         logger.error(f"Критическая ошибка в process_query: {e}", exc_info=True)
@@ -242,7 +255,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     general_url = extract_general_url(text)
     if general_url:
         await update.message.reply_text("🌐 Читаю страницу...")
-        content = await fetch_webpage_content(general_url, context.application.http_client)
+        content = await fetch_webpage_content(general_url, context.bot_data['http_client'])
         if content: await process_query(update, context, f"Анализ страницы. Запрос: '{text}'.\nТекст:\n{content[:30000]}", content_type="webpage", content_id=general_url)
         else: await update.message.reply_text("❌ Не удалось получить содержимое.")
         return
@@ -291,7 +304,7 @@ async def setup_bot_and_server(stop_event: asyncio.Event, client: genai.client.C
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
     if persistence: builder.persistence(persistence)
     application = builder.build()
-    application.gemini_client = client
+    application.bot_data['gemini_client'] = client
 
     handlers = [
         CommandHandler("start", start), CommandHandler("model", model_command), CommandHandler("clear", clear_history),
@@ -342,7 +355,7 @@ async def main():
     try:
         http_client = httpx.AsyncClient()
         application, web_task = await setup_bot_and_server(stop_event, client)
-        application.http_client = http_client
+        application.bot_data['http_client'] = http_client
         await stop_event.wait()
     finally:
         logger.info("--- Остановка приложения ---")
