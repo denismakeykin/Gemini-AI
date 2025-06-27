@@ -43,6 +43,8 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest, TelegramError, RetryAfter
 import google.generativeai as genai
+import google.generativeai.tool
+import google.generativeai.types
 from google.generativeai.tool import Tool
 from google.generativeai.types import content_types
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
