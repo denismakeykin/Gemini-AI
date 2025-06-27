@@ -1,13 +1,10 @@
-# main.txt
+# Полностью замените содержимое файла main.py на это:
+
 import logging
 import os
 import asyncio
 import signal
-from urllib.parse import urlencode
 import base64
-import pprint
-import json
-import time
 import re
 import datetime
 import pytz
@@ -17,17 +14,15 @@ import psycopg2
 from psycopg2 import pool
 import io
 import html
-from typing import AsyncGenerator
+import time
+from typing import Coroutine
 
-# Новые импорты
 import httpx
 from bs4 import BeautifulSoup
 
-# --- Базовая настройка логирования ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Импорты Telegram и Gemini ---
 import aiohttp
 import aiohttp.web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message, BotCommand
@@ -41,531 +36,308 @@ from telegram.ext import (
     filters,
     BasePersistence
 )
-from telegram.error import BadRequest, TelegramError, RetryAfter
-import google.generativeai as genai
-from google.generativeai.tool import Tool
-from google.generativeai.types import content_types
+from telegram.error import BadRequest
+
+# --- ИМПОРТЫ ДЛЯ НОВОГО GOOGLE GEN AI SDK ---
+from google import genai
+from google.genai import types
+
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from youtube_transcript_api._errors import RequestBlocked
 from pdfminer.high_level import extract_text
 
-# --- Загрузка системного промпта ---
 try:
     with open('system_prompt.md', 'r', encoding='utf-8') as f:
         system_instruction_text = f.read()
+    logger.info("Системный промпт успешно загружен.")
 except FileNotFoundError:
-    logger.critical("Критическая ошибка: system_prompt.md не найден!")
+    logger.critical("Критическая ошибка: файл system_prompt.md не найден!")
     exit(1)
 
-# --- Переменные окружения и константы ---
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
-WEBHOOK_HOST = os.getenv('WEBHOOK_HOST')
-GEMINI_WEBHOOK_PATH = os.getenv('GEMINI_WEBHOOK_PATH')
-DATABASE_URL = os.getenv('DATABASE_URL')
-WEATHER_API_KEY = os.getenv('WEATHER_API_KEY') # Для Function Calling
-
-# Проверка обязательных переменных
-required_vars = {"TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, "GOOGLE_API_KEY": GOOGLE_API_KEY, "WEBHOOK_HOST": WEBHOOK_HOST, "GEMINI_WEBHOOK_PATH": GEMINI_WEBHOOK_PATH}
-if not all(required_vars.values()):
-    logger.critical(f"Отсутствуют переменные окружения: {[k for k, v in required_vars.items() if not v]}")
-    exit(1)
-
-# --- Настройки моделей (Июнь 2025) ---
-# Принимаем твою реальность: модель gemini-2.5-flash
-# Код написан с предположением, что API будет совместимым.
-AVAILABLE_MODELS = {'gemini-2.5-flash': '2.5 Flash'}
-DEFAULT_MODEL = 'gemini-2.5-flash'
-TARGET_TIMEZONE = "Europe/Moscow"
-USER_ID_PREFIX_FORMAT = "[User {user_id}; Name: {user_name}]: "
-
-# --- Конфигурация Gemini API ---
-genai.configure(api_key=GOOGLE_API_KEY)
-SAFETY_SETTINGS_BLOCK_NONE = [
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-]
-
-# --- Класс для работы с БД (без изменений) ---
+# --- БАЗА ДАННЫХ (без изменений) ---
 class PostgresPersistence(BasePersistence):
-    # ... (весь код PostgresPersistence остается здесь без изменений)
     def __init__(self, database_url: str):
         super().__init__()
-        self.db_pool = None
-        self.dsn = database_url
-        try:
-            self._connect()
-            self._initialize_db()
-            logger.info("PostgresPersistence: Соединение с базой данных установлено и таблица проверена.")
-        except psycopg2.Error as e:
-            logger.critical(f"PostgresPersistence: Не удалось подключиться к базе данных PostgreSQL: {e}")
-            raise
-
+        self.db_pool = None; self.dsn = database_url
+        try: self._connect(); self._initialize_db()
+        except psycopg2.Error as e: logger.critical(f"PostgresPersistence: Не удалось подключиться к БД: {e}"); raise
     def _connect(self):
         if self.db_pool:
-            try:
-                self.db_pool.closeall()
-            except Exception as e:
-                logger.warning(f"PostgresPersistence: Ошибка при закрытии старого пула: {e}")
+            try: self.db_pool.closeall()
+            except Exception as e: logger.warning(f"Ошибка при закрытии старого пула: {e}")
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=self.dsn)
-        logger.info("PostgresPersistence: Пул соединений успешно (пере)создан.")
-
     def _execute(self, query: str, params: tuple = None, fetch: str = None):
-        if not self.db_pool:
-            raise ConnectionError("PostgresPersistence: Пул соединений не инициализирован.")
-        conn = None
+        if not self.db_pool: raise ConnectionError("Пул соединений не инициализирован.")
+        conn = self.db_pool.getconn()
         try:
-            conn = self.db_pool.getconn()
             with conn.cursor() as cur:
                 cur.execute(query, params)
-                if fetch == "one":
-                    return cur.fetchone()
-                if fetch == "all":
-                    return cur.fetchall()
+                if fetch == "one": return cur.fetchone()
+                if fetch == "all": return cur.fetchall()
                 conn.commit()
-                return True
-        except psycopg2.Error as e:
-            logger.error(f"PostgresPersistence: Ошибка SQL: {e}")
-            if conn:
-                conn.rollback()
-            return None
-        finally:
-            if conn:
-                self.db_pool.putconn(conn)
-
-    def _initialize_db(self):
-        create_table_query = "CREATE TABLE IF NOT EXISTS persistence_data (key TEXT PRIMARY KEY, data BYTEA NOT NULL);"
-        self._execute(create_table_query)
-
+        finally: self.db_pool.putconn(conn)
+    def _initialize_db(self): self._execute("CREATE TABLE IF NOT EXISTS persistence_data (key TEXT PRIMARY KEY, data BYTEA NOT NULL);")
     def _get_pickled(self, key: str) -> object | None:
-        result = self._execute("SELECT data FROM persistence_data WHERE key = %s;", (key,), fetch="one")
-        return pickle.loads(result[0]) if result and result[0] else None
-
-    def _set_pickled(self, key: str, data: object) -> None:
-        pickled_data = pickle.dumps(data)
-        query = "INSERT INTO persistence_data (key, data) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET data = %s;"
-        self._execute(query, (key, pickled_data, pickled_data))
-
+        res = self._execute("SELECT data FROM persistence_data WHERE key = %s;", (key,), fetch="one")
+        return pickle.loads(res[0]) if res and res[0] else None
+    def _set_pickled(self, key: str, data: object) -> None: self._execute("INSERT INTO persistence_data (key, data) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET data = %s;", (key, pickle.dumps(data), pickle.dumps(data)))
     async def get_bot_data(self) -> dict: return await asyncio.to_thread(self._get_pickled, "bot_data") or {}
     async def update_bot_data(self, data: dict) -> None: await asyncio.to_thread(self._set_pickled, "bot_data", data)
     async def get_chat_data(self) -> defaultdict[int, dict]:
-        all_chat_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'chat_data_%';", fetch="all")
-        chat_data = defaultdict(dict)
-        if all_chat_data:
-            for key, data in all_chat_data:
-                try: chat_data[int(key.split('_')[-1])] = pickle.loads(data)
-                except (ValueError, IndexError): logger.warning(f"Не удалось распарсить ключ чата: {key}")
+        all_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'chat_data_%';", fetch="all")
+        chat_data = defaultdict(dict); [chat_data.update({int(k.split('_')[-1]): pickle.loads(d)}) for k, d in all_data or []]
         return chat_data
     async def update_chat_data(self, chat_id: int, data: dict) -> None: await asyncio.to_thread(self._set_pickled, f"chat_data_{chat_id}", data)
     async def get_user_data(self) -> defaultdict[int, dict]:
-        all_user_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'user_data_%';", fetch="all")
-        user_data = defaultdict(dict)
-        if all_user_data:
-            for key, data in all_user_data:
-                try: user_data[int(key.split('_')[-1])] = pickle.loads(data)
-                except (ValueError, IndexError): logger.warning(f"Не удалось распарсить ключ пользователя: {key}")
+        all_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'user_data_%';", fetch="all")
+        user_data = defaultdict(dict); [user_data.update({int(k.split('_')[-1]): pickle.loads(d)}) for k, d in all_data or []]
         return user_data
     async def update_user_data(self, user_id: int, data: dict) -> None: await asyncio.to_thread(self._set_pickled, f"user_data_{user_id}", data)
     async def drop_chat_data(self, chat_id: int) -> None: await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"chat_data_{chat_id}",))
-    async def drop_user_data(self, user_id: int) -> None: await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"user_data_{user_id}",))
-    async def get_callback_data(self) -> dict | None: return None
-    async def update_callback_data(self, data: dict) -> None: pass
-    async def get_conversations(self, name: str) -> dict: return {}
-    async def update_conversation(self, name: str, key: tuple, new_state: object | None) -> None: pass
-    async def refresh_bot_data(self, bot_data: dict) -> None: data = await self.get_bot_data(); bot_data.update(data)
-    async def refresh_chat_data(self, chat_id: int, chat_data: dict) -> None: data = await asyncio.to_thread(self._get_pickled, f"chat_data_{chat_id}") or {}; chat_data.update(data)
-    async def refresh_user_data(self, user_id: int, user_data: dict) -> None: data = await asyncio.to_thread(self._get_pickled, f"user_data_{user_id}") or {}; user_data.update(data)
     async def flush(self) -> None: pass
     def close(self):
-        if self.db_pool:
-            self.db_pool.closeall()
+        if self.db_pool: self.db_pool.closeall()
 
+# --- КОНФИГУРАЦИЯ БОТА ---
+TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PATH, DATABASE_URL = map(os.getenv, ['TELEGRAM_BOT_TOKEN', 'GOOGLE_API_KEY', 'WEBHOOK_HOST', 'GEMINI_WEBHOOK_PATH', 'DATABASE_URL'])
+if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PATH]):
+    logger.critical("Отсутствуют обязательные переменные окружения!")
+    exit(1)
 
-# --- НОВЫЕ ИНСТРУМЕНТЫ БОТА (FUNCTION CALLING & GROUNDING) ---
+AVAILABLE_MODELS = {'gemini-1.5-flash-latest': '1.5 Flash', 'gemini-1.5-pro-latest': '1.5 Pro'}
+DEFAULT_MODEL = 'gemini-1.5-flash-latest'
+MAX_OUTPUT_TOKENS = 8192
+USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow"
 
-async def get_current_weather(city: str) -> dict:
-    """Получает текущую погоду для указанного города, используя OpenWeatherMap API."""
-    logger.info(f"Вызов функции погоды для города: {city}")
-    if not WEATHER_API_KEY:
-        return {"error": "API ключ для погоды не настроен на стороне бота."}
-    
-    url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_API_KEY}&units=metric&lang=ru"
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url)
-            response.raise_for_status()
-            data = response.json()
-            return { "city": city, "temperature": f"{data['main']['temp']}°C", "description": data['weather'][0]['description'].capitalize() }
-        except Exception as e:
-            logger.error(f"Ошибка API погоды: {e}")
-            return {"error": "Не удалось получить данные о погоде."}
-
-# Собираем все "скиллы" в один список
-google_search_tool = Tool.from_google_search_retrieval()
-weather_tool = Tool.from_functions([get_current_weather])
-AVAILABLE_TOOLS = [google_search_tool, weather_tool]
-
+# --- ИНСТРУМЕНТЫ ДЛЯ FUNCTION CALLING ---
+def get_current_time(timezone: str = "Europe/Moscow") -> str:
+    """Возвращает текущую дату и время для указанной временной зоны."""
+    try: return f"Текущее время в {timezone}: {datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S')}"
+    except pytz.UnknownTimeZoneError: return f"Ошибка: Неизвестная временная зона '{timezone}'."
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-
-def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value):
-    return context.user_data.get(key, default_value)
-
-def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value):
-    context.user_data[key] = value
-
-async def _add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list, **kwargs):
-    """Добавляет запись в историю чата, поддерживая сложную структуру."""
-    chat_id = context.chat_data.get('id', 'Unknown')
-    history = context.chat_data.setdefault("history", [])
-    entry = {"role": role, "parts": parts, **kwargs}
-    history.append(entry)
-    while len(history) > 50: # Ограничиваем историю
-        history.pop(0)
-    await context.application.persistence.update_chat_data(chat_id, context.chat_data)
-
-def build_context_for_model(chat_history: list) -> list:
-    """Собирает историю для отправки в модель, отсекая старое."""
-    # Просто возвращаем последние 20 сообщений
-    return chat_history[-20:]
-
-def get_current_time_str() -> str:
-    return datetime.datetime.now(pytz.timezone(TARGET_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
-
-def extract_youtube_id(url_text: str) -> str | None:
-    match = re.search(r"(?:v=|\/v\/|youtu\.be\/|embed\/)([a-zA-Z0-9_-]{11})", url_text)
-    return match.group(1) if match else None
-
-def extract_general_url(text: str) -> str | None:
-    match = re.search(r'https?:\/\/[^\s<>"\'`]+', text)
-    return match.group(0) if match else None
-
+def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value): return context.user_data.get(key, default_value)
+def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value): context.user_data[key] = value
 async def fetch_webpage_content(url: str, session: httpx.AsyncClient) -> str | None:
     try:
-        response = await session.get(url, timeout=15.0, follow_redirects=True)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        for e in soup(['script', 'style', 'nav', 'footer', 'header']): e.decompose()
+        response = await session.get(url, timeout=15.0, follow_redirects=True); response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser'); [s.decompose() for s in soup(['script', 'style', 'nav', 'footer', 'header', 'aside'])]
         return ' '.join(soup.stripped_strings)
+    except Exception as e: logger.error(f"Ошибка скрапинга {url}: {e}"); return None
+
+# --- НОВЫЙ МЕХАНИЗМ СТРИМИНГА ОТВЕТА В TELEGRAM ---
+async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> str:
+    full_text, buffer, last_edit_time = "", "", 0
+    try:
+        async for chunk in stream:
+            if text_part := getattr(chunk, 'text', ''): buffer += text_part
+            if time.time() - last_edit_time > 1.5 or len(buffer) > 100:
+                new_text_portion = full_text + buffer
+                if new_text_portion != message_to_edit.text:
+                    try:
+                        await message_to_edit.edit_text(new_text_portion + " ▌")
+                        full_text = new_text_portion; buffer = ""
+                        last_edit_time = time.time()
+                    except BadRequest as e:
+                        if "Message is not modified" not in str(e): logger.warning(f"Ошибка редактирования: {e}")
+        
+        final_text = full_text + buffer
+        if final_text != message_to_edit.text: await message_to_edit.edit_text(final_text)
+        return final_text
     except Exception as e:
-        logger.error(f"Ошибка при получении контента с {url}: {e}")
-        return None
+        logger.error(f"Ошибка стриминга: {e}", exc_info=True)
+        final_text_on_error = full_text + buffer + f"\n\n❌ Ошибка: {e}"
+        await message_to_edit.edit_text(final_text_on_error)
+        return final_text_on_error
 
-# --- ГЛАВНЫЙ ОРКЕСТРАТОР ВЗАИМОДЕЙСТВИЯ С GEMINI ---
+# --- ГЛАВНЫЙ ОБРАБОТЧИК ЗАПРОСОВ К GEMINI (ИСПОЛЬЗУЕТ НАТИВНЫЙ ЧАТ) ---
+async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text_to_process: str, **kwargs):
+    client = context.application.gemini_client
+    chat_id = update.effective_chat.id
+    
+    # Получаем или создаем нативную сессию чата
+    if 'chat_session' not in context.chat_data:
+        model_name = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
+        
+        # <<< НОВОЕ: Сборка инструментов
+        tools = [get_current_time, types.Tool(code_execution=types.ToolCodeExecution())]
+        if get_user_setting(context, 'search_enabled', True):
+            tools.append(types.Tool(google_search=types.GoogleSearch()))
 
-async def stream_and_send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, response_stream: AsyncGenerator) -> tuple[Message | None, list]:
-    """Обрабатывает стрим ответа, редактируя сообщение для "эффекта печатания"."""
-    sent_message, full_text, buffer, last_sent_time = None, "", "", time.time()
-    final_parts = []
+        # Создаем чат с системной инструкцией и инструментами
+        context.chat_data['chat_session'] = client.chats.create(
+            model=f'models/{model_name}',
+            history=[],
+            config=types.CreateChatConfig(
+                system_instruction=system_instruction_text,
+                tools=tools,
+                temperature=1.0,
+                max_output_tokens=MAX_OUTPUT_TOKENS,
+            )
+        )
+    chat_session = context.chat_data['chat_session']
+
+    placeholder_message = await update.message.reply_text("...")
+    
+    # Формируем `contents` для отправки
+    prompt_text = f"(Текущая дата: {datetime.datetime.now(pytz.timezone(TARGET_TIMEZONE)).strftime('%Y-%m-%d')})\n{USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))}{html.escape(text_to_process)}"
+    message_parts = [prompt_text] + kwargs.get('content_parts', [])
 
     try:
-        sent_message = await update.message.reply_text("✍️...")
-        async for chunk in response_stream:
-            if not chunk.candidates: continue
-            
-            # Собираем все части из чанка (текст, вызовы функций и т.д.)
-            final_parts.extend(chunk.candidates[0].content.parts)
-            
-            if text_part := chunk.text:
-                buffer += text_part
-                full_text += text_part
-
-            current_time = time.time()
-            if (current_time - last_sent_time > 1.5 and buffer) or len(buffer) > 200:
-                try:
-                    await sent_message.edit_text(text=full_text + " พิมพ์", parse_mode=ParseMode.HTML)
-                    buffer = ""
-                    last_sent_time = current_time
-                except (BadRequest, RetryAfter) as e:
-                    if isinstance(e, RetryAfter): await asyncio.sleep(e.retry_after)
-                    if "Message is not modified" not in str(e): logger.warning(f"Ошибка редактирования: {e}")
-
-        if sent_message and full_text:
-            await sent_message.edit_text(text=full_text, parse_mode=ParseMode.HTML)
+        # <<< ИЗМЕНЕНО: Используем send_message_stream из объекта чата
+        stream = chat_session.send_message_stream(message=message_parts)
+        final_text = await stream_and_send_reply(placeholder_message, stream)
     except Exception as e:
-        logger.error(f"Ошибка в stream_and_send_reply: {e}", exc_info=True)
-        if sent_message: await sent_message.edit_text(f"❌ Ошибка: {e}")
-        else: await update.message.reply_text(f"❌ Ошибка: {e}")
-            
-    return sent_message, final_parts
+        logger.error(f"Критическая ошибка в process_query: {e}", exc_info=True)
+        final_text = f"❌ Произошла серьезная ошибка: {e}"
+        await placeholder_message.edit_text(final_text)
 
-async def orchestrate_gemini_interaction(update: Update, context: ContextTypes.DEFAULT_TYPE, initial_parts: list, use_cache: str | None = None):
-    """
-    Центральная функция для общения с Gemini.
-    Поддерживает стриминг, Function Calling и кэширование.
-    """
-    chat_id, user, user_id = update.effective_chat.id, update.effective_user, update.effective_user.id
-    history = build_context_for_model(context.chat_data.get("history", []))
-    history.append({"role": "user", "parts": initial_parts})
-    await _add_to_history(context, "user", initial_parts, message_id=update.message.message_id, user_id=user_id, cache_name=use_cache)
-
-    model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    
-    # Выбор модели: из кэша или стандартная
-    if use_cache:
-        logger.info(f"Используем кэш '{use_cache}' для запроса.")
-        cached_content = genai.caching.CachedContent(use_cache)
-        model = genai.GenerativeModel.from_cached_content(cached_content)
-    else:
-        model = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, system_instruction=system_instruction_text, tools=AVAILABLE_TOOLS)
-
-    while True:
-        logger.info(f"Отправка запроса в Gemini... История: {len(history)} сообщений.")
-        response_stream = await asyncio.to_thread(model.generate_content, history, stream=True)
-        
-        # Получаем полный ответ и все его части (включая вызовы функций)
-        sent_message, response_parts = await stream_and_send_reply(update, context, response_stream)
-        
-        # Ищем вызов функции в ответе
-        function_calls = [part.function_call for part in response_parts if part.function_call]
-
-        if not function_calls:
-            await _add_to_history(context, "model", response_parts, bot_message_id=sent_message.message_id if sent_message else None)
-            break # Если вызовов нет, диалог закончен
-
-        # Если есть вызов функции
-        logger.info(f"Модель запросила вызов функций: {[fc.name for fc in function_calls]}")
-        history.append({"role": "model", "parts": response_parts})
-        
-        function_responses = []
-        for fc in function_calls:
-            if fc.name == "get_current_weather":
-                result = await get_current_weather(**dict(fc.args))
-                function_responses.append({"function_response": {"name": fc.name, "response": result}})
-            else:
-                logger.warning(f"Запрошена неизвестная функция: {fc.name}")
-
-        if function_responses:
-            history.append({"role": "function", "parts": function_responses})
-        # Цикл продолжается, модель получит результат и даст финальный ответ
-
-
-# --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
-
+# --- ОБРАБОТЧИКИ СООБЩЕНИЙ TELEGRAM ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    await update.message.reply_text("Привет! Я Женя, твой ассистент на базе Gemini 2.5 Flash. Умею искать в Google, узнавать погоду, работать с файлами и фото. Спрашивай!")
-
+    set_user_setting(context, 'selected_model', get_user_setting(context, 'selected_model', DEFAULT_MODEL))
+    start_message = "Привет! Я Женя, ассистент на базе Gemini. Могу анализировать текст, фото, видео, ссылки, а также использовать поиск и инструменты (например, спроси 'который час' или попроси решить математическую задачу)."
+    await update.message.reply_text(start_message, disable_web_page_preview=True)
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data.clear()
-    await context.application.persistence.drop_chat_data(update.effective_chat.id)
-    await update.message.reply_text("🧹 История этого чата очищена.")
+    if 'chat_session' in context.chat_data:
+        del context.chat_data['chat_session'] # Удаляем нативную сессию, чтобы следующая началась с чистого листа
+    await update.message.reply_text("🧹 История чата и сессия сброшены.")
+async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current_model = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
+    keyboard = [[InlineKeyboardButton(f"{'✅ ' if m == current_model else ''}{name}", callback_data=f"set_model_{m}")] for m, name in sorted(AVAILABLE_MODELS.items())]
+    await update.message.reply_text("Выберите модель (сбросит текущую сессию):", reply_markup=InlineKeyboardMarkup(keyboard))
+async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    selected = query.data.replace("set_model_", "")
+    if selected in AVAILABLE_MODELS:
+        set_user_setting(context, 'selected_model', selected)
+        if 'chat_session' in context.chat_data: del context.chat_data['chat_session'] # Сбрасываем сессию при смене модели
+        await query.edit_message_text(f"Модель установлена: <b>{AVAILABLE_MODELS[selected]}</b>. Сессия сброшена.", parse_mode=ParseMode.HTML)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    text = (message.text or message.caption or "").strip()
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
     if not text: return
     
-    # Проверяем, не ответ ли это на сообщение с кэшированным документом
-    use_cache = None
-    if message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id:
-        history = context.chat_data.get("history", [])
-        for entry in reversed(history):
-            if entry.get("bot_message_id") == message.reply_to_message.message_id:
-                if "cache_name" in entry:
-                    use_cache = entry["cache_name"]
-                break
-    
-    # Собираем части для отправки в модель
-    parts = [{"text": f"Текущее время: {get_current_time_str()}. Мой запрос: {text}"}]
-    
-    # Проверяем URL
-    url = extract_general_url(text)
     youtube_id = extract_youtube_id(text)
-    
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    
-    try:
-        if youtube_id:
-            transcript = " ".join([d['text'] for d in YouTubeTranscriptApi.get_transcript(youtube_id, languages=['ru', 'en'])])
-            parts.append({"text": f"\n\n--- ТРАНСКРИПТ ВИДЕО ---\n{transcript[:15000]}"})
-        elif url:
-            content = await fetch_webpage_content(url, context.application.http_client)
-            if content:
-                parts.append({"text": f"\n\n--- КОНТЕНТ СТРАНИЦЫ ---\n{content[:15000]}"})
-    except Exception as e:
-        logger.warning(f"Не удалось получить контент по URL: {e}")
+    if youtube_id:
+        await update.message.reply_text("📺 Анализирую видео...")
+        try:
+            transcript = " ".join([d['text'] for d in await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, youtube_id, languages=['ru', 'en'])])
+            await process_query(update, context, f"Конспект видео. Запрос: '{text}'.\nТранскрипт:\n{transcript[:30000]}", content_type="youtube", content_id=youtube_id)
+        except Exception as e: await update.message.reply_text(f"❌ Ошибка YouTube: {e}"); return
+        return
 
-    await orchestrate_gemini_interaction(update, context, parts, use_cache)
+    general_url = extract_general_url(text)
+    if general_url:
+        await update.message.reply_text("🌐 Читаю страницу...")
+        content = await fetch_webpage_content(general_url, context.application.http_client)
+        if content: await process_query(update, context, f"Анализ страницы. Запрос: '{text}'.\nТекст:\n{content[:30000]}", content_type="webpage", content_id=general_url)
+        else: await update.message.reply_text("❌ Не удалось получить содержимое.")
+        return
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await process_query(update, context, text)
+
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    photo_file = await message.photo[-1].get_file()
-    file_bytes = await photo_file.download_as_bytearray()
+    caption = message.caption or "Опиши, что на этом медиафайле."
     
-    prompt = message.caption or "Опиши это изображение и найди в интернете информацию о том, что на нем."
+    file_id, mime_type, content_type_str = None, None, None
+    if message.photo:
+        await message.reply_text("🖼️ Анализирую фото..."); file_id, mime_type, content_type_str = message.photo[-1].file_id, 'image/jpeg', "image"
+    elif message.video:
+        await message.reply_text("🎬 Анализирую видео..."); file_id, mime_type, content_type_str = message.video.file_id, message.video.mime_type, "video"
+    elif message.voice:
+        await message.reply_text("🎤 Слушаю..."); file_id, mime_type, content_type_str = message.voice.file_id, message.voice.mime_type, "voice"
+        caption = "Расшифруй это голосовое сообщение и ответь на него."
     
-    parts = [
-        {"text": prompt},
-        {"inline_data": content_types.Blob(mime_type="image/jpeg", data=bytes(file_bytes))}
-    ]
-    await orchestrate_gemini_interaction(update, context, parts)
+    if not file_id: return
+    
+    file_bytes = await (await context.bot.get_file(file_id)).download_as_bytearray()
+    media_part = types.Part(inline_data=types.Blob(mime_type=mime_type, data=file_bytes))
+    await process_query(update, context, caption, content_parts=[media_part], content_type=content_type_str, content_id=file_id)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    doc = message.document
-    if doc.file_size > 10 * 1024 * 1024:
-        await message.reply_text("❌ Файл слишком большой (> 10 MB).")
-        return
-        
-    await message.reply_text("Анализирую файл... Это может занять время.")
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
+    doc = update.message.document
+    if doc.file_size > 15 * 1024 * 1024: await update.message.reply_text("❌ Файл слишком большой."); return
+    await update.message.reply_text("📄 Изучаю документ...")
+    file_bytes = await (await doc.get_file()).download_as_bytearray()
     
-    doc_file = await doc.get_file()
-    file_bytes = await doc_file.download_as_bytearray()
-    
-    text = ""
-    try:
-        if doc.mime_type == 'application/pdf':
-            text = await asyncio.to_thread(extract_text, io.BytesIO(file_bytes))
-        else:
-            text = file_bytes.decode('utf-8', errors='ignore')
-    except Exception as e:
-        await message.reply_text(f"❌ Не удалось извлечь текст из файла: {e}")
-        return
-
-    if not text:
-        await message.reply_text("❌ Файл пуст или не удалось извлечь текст.")
-        return
-
-    # Кэшируем контент
-    try:
-        cache_model_name = f'models/{get_user_setting(context, "selected_model", DEFAULT_MODEL)}'
-        doc_cache = genai.caching.CachedContent.create(
-            model=cache_model_name,
-            display_name=f"doc_{doc.file_id}",
-            contents=[{'parts': [{'text': text}]}],
-            ttl=datetime.timedelta(hours=1)
-        )
-        logger.info(f"Документ '{doc.file_name}' успешно закэширован: {doc_cache.name}")
-        
-        initial_prompt = message.caption or f"Сделай краткий обзор этого документа: {doc.file_name}"
-        await orchestrate_gemini_interaction(update, context, [{"text": initial_prompt}], use_cache=doc_cache.name)
-
-    except Exception as e:
-        logger.error(f"Ошибка кэширования документа: {e}", exc_info=True)
-        # Если кэширование не удалось, работаем по старинке
-        parts = [{"text": f"Запрос: {message.caption or 'Обзор файла'}\n\n--- ТЕКСТ ФАЙЛА ---\n{text[:20000]}"}]
-        await orchestrate_gemini_interaction(update, context, parts)
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    voice_file = await update.message.voice.get_file()
-    file_bytes = await voice_file.download_as_bytearray()
-    
-    model = genai.GenerativeModel(DEFAULT_MODEL)
-    logger.info("Отправка аудио на транскрипцию...")
-    response = await asyncio.to_thread(
-        model.generate_content,
-        ["Расшифруй это аудиосообщение.", content_types.Blob(mime_type="audio/ogg", data=bytes(file_bytes))]
-    )
-    
-    transcribed_text = response.text
-    if transcribed_text:
-        logger.info(f"Аудио расшифровано: '{transcribed_text}'")
-        # Отправляем расшифрованный текст на дальнейшую обработку
-        parts = [{"text": f"Пользователь сказал голосом: {transcribed_text}"}]
-        await orchestrate_gemini_interaction(update, context, parts)
+    text = None
+    if doc.mime_type == 'application/pdf':
+        try: text = await asyncio.to_thread(extract_text, io.BytesIO(file_bytes))
+        except Exception as e: await update.message.reply_text(f"❌ Ошибка PDF: {e}"); return
     else:
-        await update.message.reply_text("Не удалось распознать речь.")
+        try: text = file_bytes.decode('utf-8')
+        except UnicodeDecodeError: text = file_bytes.decode('cp1251', errors='ignore')
 
-# --- ЗАПУСК БОТА И ВЕБ-СЕРВЕРА ---
+    if text: await process_query(update, context, f"Анализ файла '{doc.file_name}'. Запрос: {update.message.caption or ''}\nТекст:\n{text[:30000]}", content_type="document", content_id=doc.file_id)
+    else: await update.message.reply_text("❌ Не удалось прочитать файл.")
 
-async def setup_bot_and_server(stop_event: asyncio.Event):
-    # ... (Этот блок остается без изменений, он настраивает вебхук)
-    persistence = None
-    if DATABASE_URL:
-        try:
-            persistence = PostgresPersistence(database_url=DATABASE_URL)
-        except Exception as e:
-            logger.error(f"Не удалось инициализировать PostgresPersistence: {e}. Бот будет работать без сохранения состояния.", exc_info=True)
-            persistence = None
-    
+# --- НАСТРОЙКА И ЗАПУСК БОТА ---
+async def setup_bot_and_server(stop_event: asyncio.Event, client: genai.client.Client):
+    persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
-    if persistence:
-        builder.persistence(persistence)
-    
+    if persistence: builder.persistence(persistence)
     application = builder.build()
+    application.gemini_client = client
+
+    handlers = [
+        CommandHandler("start", start), CommandHandler("model", model_command), CommandHandler("clear", clear_history),
+        CallbackQueryHandler(select_model_callback, pattern="^set_model_"),
+        MessageHandler(filters.PHOTO | filters.VIDEO | filters.VOICE, handle_media),
+        MessageHandler(filters.Document.TEXT | filters.Document.PDF, handle_document),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text),
+    ]
+    application.add_handlers(handlers)
     
-    # Добавляем http_client в приложение
-    application.http_client = httpx.AsyncClient()
-
-    # Регистрация обработчиков
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("clear", clear_history))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
-
     await application.initialize()
-    await application.bot.set_my_commands([
-        BotCommand("start", "Начать работу"),
-        BotCommand("clear", "Очистить историю чата")
-    ])
+    await application.bot.set_my_commands([BotCommand("start", "Инфо"), BotCommand("model", "Выбор модели"), BotCommand("clear", "Сброс сессии")])
     
     webhook_url = f"{WEBHOOK_HOST.rstrip('/')}/{GEMINI_WEBHOOK_PATH.strip('/')}"
-    await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
-    logger.info(f"Вебхук установлен на {webhook_url}")
-    
-    web_server_coro = run_web_server(application, stop_event)
-    return application, web_server_coro
+    await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES, secret_token=os.getenv('WEBHOOK_SECRET_TOKEN'))
+    logger.info(f"Вебхук установлен: {webhook_url}")
+    return application, asyncio.create_task(run_web_server(application, stop_event))
 
 async def run_web_server(application: Application, stop_event: asyncio.Event):
-    # ... (Этот блок остается без изменений, он запускает aiohttp)
     app = aiohttp.web.Application()
-    
-    async def health_check(request):
-        return aiohttp.web.Response(text="OK")
-
-    async def telegram_webhook(request: aiohttp.web.Request):
-        try:
-            data = await request.json()
-            update = Update.de_json(data, application.bot)
-            await application.process_update(update)
-            return aiohttp.web.Response(status=200)
-        except Exception as e:
-            logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
-            return aiohttp.web.Response(status=500)
-
-    app.router.add_get('/', health_check)
-    app.router.add_post(f'/{GEMINI_WEBHOOK_PATH.strip("/")}', telegram_webhook)
+    async def webhook_handler(request: aiohttp.web.Request):
+        secret = os.getenv('WEBHOOK_SECRET_TOKEN')
+        if secret and request.headers.get('X-Telegram-Bot-Api-Secret-Token') != secret: return aiohttp.web.Response(status=403)
+        try: await application.process_update(Update.de_json(await request.json(), application.bot)); return aiohttp.web.Response(status=200)
+        except Exception as e: logger.error(f"Ошибка вебхука: {e}", exc_info=True); return aiohttp.web.Response(status=500)
+            
+    app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), webhook_handler)
+    app.router.add_get('/', lambda r: aiohttp.web.Response(text="Bot is running"))
     
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
-    port = int(os.getenv("PORT", "8080"))
-    site = aiohttp.web.TCPSite(runner, '0.0.0.0', port)
+    site = aiohttp.web.TCPSite(runner, os.getenv("HOST", "0.0.0.0"), int(os.getenv("PORT", "10000")))
     
-    await site.start()
-    logger.info(f"Веб-сервер запущен на порту {port}")
-    await stop_event.wait()
-    await runner.cleanup()
-    logger.info("Веб-сервер остановлен.")
+    try: await site.start(); await stop_event.wait()
+    finally: await runner.cleanup()
 
 async def main():
+    if not os.getenv('GOOGLE_API_KEY'):
+        logger.critical("Переменная GOOGLE_API_KEY не установлена!")
+        exit(1)
+        
+    client = genai.Client()
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGINT, stop_event.set)
-    loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+    for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, stop_event.set)
 
-    application, web_server_task = None, None
+    application, web_task, http_client = None, None, None
     try:
-        logger.info("--- Запуск Gemini Telegram Bot ---")
-        application, web_server_coro = await setup_bot_and_server(stop_event)
-        web_server_task = asyncio.create_task(web_server_coro)
+        http_client = httpx.AsyncClient()
+        application, web_task = await setup_bot_and_server(stop_event, client)
+        application.http_client = http_client
         await stop_event.wait()
-    except Exception as e:
-        logger.critical(f"Критическая ошибка на верхнем уровне: {e}", exc_info=True)
     finally:
-        logger.info("--- Начало процесса остановки ---")
-        if web_server_task and not web_server_task.done():
-            web_server_task.cancel()
-        if application:
-            if hasattr(application, 'http_client'):
-                await application.http_client.aclose()
-            await application.shutdown()
+        logger.info("--- Остановка приложения ---")
+        if web_task and not web_task.done(): web_task.cancel()
+        if application: await application.shutdown()
+        if http_client and not http_client.is_closed: await http_client.aclose()
+        if application and hasattr(application, 'persistence') and application.persistence: application.persistence.close()
         logger.info("--- Приложение полностью остановлено ---")
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try: asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit): logger.info("Приложение остановлено пользователем.")
