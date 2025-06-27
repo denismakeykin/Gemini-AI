@@ -235,7 +235,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
             tools=[types.Tool(google_search=types.GoogleSearch())]
         )
 
-        stream = client.models.generate_content_stream(
+        stream = await client.aio.models.generate_content_stream(
             model=f'models/{model_name}',
             contents=context.chat_data.get("history", []),
             config=request_config
