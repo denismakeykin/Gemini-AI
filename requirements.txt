@@ -7,3 +7,4 @@ pdfminer.six
 httpx
 beautifulsoup4
 pydantic
+aiohttp  # <<< ДОБАВЛЕНА НЕДОСТАЮЩАЯ БИБЛИОТЕКА ДЛЯ ВЕБ-СЕРВЕРА
