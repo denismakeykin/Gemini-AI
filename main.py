@@ -228,12 +228,16 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     placeholder_message = await message.reply_text("...")
     
     try:
+        request_options = {
+            "generation_config": types.GenerationConfig(temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS),
+            "system_instruction": system_instruction_text,
+            "tools": [types.Tool(google_search=types.GoogleSearch())]
+        }
+
         stream = client.models.generate_content_stream(
             model=f'models/{model_name}',
             contents=context.chat_data.get("history", []),
-            generation_config=types.GenerationConfig(temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS),
-            system_instruction=system_instruction_text,
-            tools=[types.Tool(google_search=types.GoogleSearch())]
+            request_options=request_options
         )
         full_reply_text = await stream_and_send_reply(placeholder_message, stream)
         
