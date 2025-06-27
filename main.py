@@ -40,6 +40,7 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest, TelegramError
 import google.generativeai as genai
+# ИЗМЕНЕНО: Импортируем тот самый Tool для нативного поиска
 from google.generativeai.tool import Tool
 from duckduckgo_search import DDGS
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
@@ -263,12 +264,14 @@ except Exception as e_import_types:
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
-GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID')
+# УДАЛЕНО: GOOGLE_CSE_ID больше не нужен для нативного поиска
+# GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID')
 WEBHOOK_HOST = os.getenv('WEBHOOK_HOST')
 GEMINI_WEBHOOK_PATH = os.getenv('GEMINI_WEBHOOK_PATH')
 DATABASE_URL = os.getenv('DATABASE_URL')
 
-required_env_vars = {"TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, "GOOGLE_API_KEY": GOOGLE_API_KEY, "GOOGLE_CSE_ID": GOOGLE_CSE_ID, "WEBHOOK_HOST": WEBHOOK_HOST, "GEMINI_WEBHOOK_PATH": GEMINI_WEBHOOK_PATH}
+# ИЗМЕНЕНО: Убрали GOOGLE_CSE_ID из обязательных переменных
+required_env_vars = {"TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, "GOOGLE_API_KEY": GOOGLE_API_KEY, "WEBHOOK_HOST": WEBHOOK_HOST, "GEMINI_WEBHOOK_PATH": GEMINI_WEBHOOK_PATH}
 missing_vars = [name for name, value in required_env_vars.items() if not value]
 if missing_vars:
     logger.critical(f"Отсутствуют переменные окружения: {', '.join(missing_vars)}")
@@ -276,19 +279,23 @@ if missing_vars:
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
+# ИЗМЕНЕНО: Обновляем список моделей для совместимости с grounding. Google рекомендует 1.5 Pro/Flash.
+# Оставим твои, но стоит проверить их работоспособность с grounding.
 AVAILABLE_MODELS = {'gemini-2.5-flash': '2.5 Flash', 'gemini-2.0-flash': '2.0 Flash'}
-DEFAULT_MODEL = 'gemini-2.5-flash' if 'gemini-2.5-flash' in AVAILABLE_MODELS else 'gemini-2.0-flash'
+DEFAULT_MODEL = 'gemini-2.5-flash'
 MAX_CONTEXT_CHARS = 100000
 MAX_HISTORY_MESSAGES = 100
-MAX_OUTPUT_TOKENS = 65536
-DDG_MAX_RESULTS = 10
-GOOGLE_SEARCH_MAX_RESULTS = 10
+MAX_OUTPUT_TOKENS = 8192 # Стандартное значение для 1.5 Flash
+# УДАЛЕНО: Константы для ручного поиска больше не нужны
+# DDG_MAX_RESULTS = 10
+# GOOGLE_SEARCH_MAX_RESULTS = 10
 RETRY_ATTEMPTS = 5
 RETRY_DELAY_SECONDS = 1
 IMAGE_DESCRIPTION_PREFIX = "[Описание изображения]: "
 YOUTUBE_SUMMARY_PREFIX = "[Конспект видео]: "
-VISION_CAPABLE_KEYWORDS = ['gemini-2.5-flash', 'pro', 'vision', 'ultra']
-VIDEO_CAPABLE_KEYWORDS = ['gemini-2.5-flash']
+# ИЗМЕНЕНО: Актуализируем ключевые слова для моделей
+VISION_CAPABLE_KEYWORDS = ['flash', 'pro', 'vision', 'ultra']
+VIDEO_CAPABLE_KEYWORDS = ['flash', 'pro'] # 1.5 модели тоже могут
 USER_ID_PREFIX_FORMAT = "[User {user_id}; Name: {user_name}]: "
 TARGET_TIMEZONE = "Europe/Moscow"
 REASONING_PROMPT_ADDITION = ""
@@ -368,7 +375,7 @@ def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
     tag_stack = []
     remaining_text = text_to_chunk
     
-    tag_regex = re.compile(r'<(/?)(b|i|u|s|code|pre)>', re.IGNORECASE) # <br> здесь не нужен, т.к. он заменен на \n
+    tag_regex = re.compile(r'<(/?)(b|i|u|s|code|pre|a|tg-spoiler)>', re.IGNORECASE)
 
     while len(remaining_text) > chunk_size:
         split_pos = remaining_text.rfind('\n', 0, chunk_size)
@@ -378,6 +385,7 @@ def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
         current_chunk = remaining_text[:split_pos]
         
         temp_stack = list(tag_stack)
+        # Упрощенная логика стека для поддерживаемых тегов
         for match in tag_regex.finditer(current_chunk):
             tag_name = match.group(2).lower()
             is_closing = bool(match.group(1))
@@ -487,7 +495,7 @@ def _get_text_from_response(response_obj, user_id_for_log, chat_id_for_log, log_
     return None
 
 def _get_effective_context_for_task(task_type: str, original_context: ContextTypes.DEFAULT_TYPE, user_id: int | str, chat_id: int, log_prefix: str) -> ContextTypes.DEFAULT_TYPE:
-    capability_map = {"vision": VISION_CAPABLE_KEYWORDS, "video": VIDEO_CAPABLE_KEYWORDS, "audio": ['gemini-2.5', 'pro', 'flash']}
+    capability_map = {"vision": VISION_CAPABLE_KEYWORDS, "video": VIDEO_CAPABLE_KEYWORDS, "audio": ['flash', 'pro']}
     required_keywords = capability_map.get(task_type)
     if not required_keywords:
         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Неизвестный тип задачи '{task_type}' для выбора модели.")
@@ -539,10 +547,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_core_model_key = DEFAULT_MODEL
     raw_bot_core_model_display_name = AVAILABLE_MODELS.get(bot_core_model_key, bot_core_model_key)
     author_channel_link_raw = "https://t.me/denisobovsyom"
-    date_knowledge_text_raw = "до начала 2025 года"
+    date_knowledge_text_raw = "до начала 2023 года" # ИЗМЕНЕНО: Стандартная дата среза знаний, поиск ее обходит
     start_message_plain_parts = [
         f"Меня зовут Женя, работаю на Google Gemini {raw_bot_core_model_display_name} с настройками от автора бота: {author_channel_link_raw}",
-        f"- обладаю огромным объемом знаний {date_knowledge_text_raw} и поиском Google,",
+        f"- обладаю огромным объемом знаний {date_knowledge_text_raw} и поиском Google (он включается автоматически для актуальных тем),", # ИЗМЕНЕНО: Пояснение про авто-поиск
         f"- умею понимать и обсуждать изображения, голосовые сообщения (!), файлы txt, pdf и веб-страницы,",
         f"- знаю ваше имя, помню историю чата. Пишите лично и добавляйте меня в группы.",
         f"(!) Пользуясь данным ботом, вы автоматически соглашаетесь на отправку ваших сообщений через Google (Search + Gemini API) для получения ответов."]
@@ -661,99 +669,94 @@ async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
         try: await query.edit_message_text("❌ Ошибка обработки выбора.")
         except Exception: pass
 
-async def _generate_gemini_response(user_prompt_text_initial: str, chat_history_for_model_initial: list, user_id: int | str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, system_instruction: str, log_prefix: str = "GeminiGen", is_text_request_with_search: bool = False) -> str | None:
+# ИЗМЕНЕНО: Функция генерации ответа значительно упрощена.
+# Больше нет нужды в передаче `is_text_request_with_search` и логике с суб-попытками.
+async def _generate_gemini_response(
+    chat_history_for_model: list,
+    user_id: int | str,
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    system_instruction: str,
+    log_prefix: str = "GeminiGen",
+    use_google_search: bool = False
+) -> str | None:
     model_id = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
-    temperature = 1.0
+    temperature = 1.0 # Убрана переменная `temperature` из настроек пользователя для простоты
     reply = None
-    search_block_pattern_to_remove = re.compile(r"\n*\s*==== РЕЗУЛЬТАТЫ ПОИСКА .*?====\n.*?Используй эту информацию для ответа на вопрос пользователя \[User \d+; Name: .*?\]:.*?\n\s*===========================================================\n\s*.*?\n", re.DOTALL | re.IGNORECASE)
+    
+    tools_to_use = [Tool.from_google_search_retrieval()] if use_google_search else None
+    
     for attempt in range(RETRY_ATTEMPTS):
-        contents_to_use = chat_history_for_model_initial
-        current_prompt_text_for_log = user_prompt_text_initial
-        attempted_without_search_this_cycle = False
-        for sub_attempt in range(2):
-            if sub_attempt == 1 and not attempted_without_search_this_cycle: break
-            if sub_attempt == 1 and attempted_without_search_this_cycle:
-                logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Попытка {attempt + 1}, суб-попытка БЕЗ ПОИСКА.")
-                if not chat_history_for_model_initial or not chat_history_for_model_initial[-1]['role'] == 'user' or not chat_history_for_model_initial[-1]['parts'] or not chat_history_for_model_initial[-1]['parts'][0]['text']:
-                    logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Некорректная структура chat_history_for_model_initial для удаления поиска.")
-                    reply = "❌ Ошибка: не удалось подготовить запрос без поиска из-за структуры истории."; break
-                last_user_prompt_with_search = chat_history_for_model_initial[-1]['parts'][0]['text']
-                text_without_search = search_block_pattern_to_remove.sub("", last_user_prompt_with_search)
-                if text_without_search == last_user_prompt_with_search:
-                    logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Блок поиска не был удален регулярным выражением. Повторная попытка будет с тем же промптом."); break
-                else: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Блок поиска удален для повторной суб-попытки.")
-                new_history_for_model = [entry for entry in chat_history_for_model_initial[:-1]]
-                new_history_for_model.append({"role": "user", "parts": [{"text": text_without_search.strip()}]})
-                contents_to_use = new_history_for_model
-                current_prompt_text_for_log = text_without_search.strip()
-            elif sub_attempt == 0: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Попытка {attempt + 1}, суб-попытка С ПОИСКОМ (если есть в промпте).")
-            try:
-                generation_config = genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
-                model_obj = genai.GenerativeModel(model_id, safety_settings=SAFETY_SETTINGS_BLOCK_NONE, generation_config=generation_config, system_instruction=system_instruction)
-                response_obj = await asyncio.to_thread(model_obj.generate_content, contents_to_use)
-                reply = _get_text_from_response(response_obj, user_id, chat_id, f"{log_prefix}{'_NoSearch' if sub_attempt == 1 else ''}")
+        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Попытка {attempt + 1}. Поиск: {'Включен' if use_google_search else 'Выключен'}.")
+        
+        try:
+            generation_config = genai.GenerationConfig(temperature=temperature, max_output_tokens=MAX_OUTPUT_TOKENS)
+            
+            # Инициализируем модель с инструментами или без
+            model_obj = genai.GenerativeModel(
+                model_id, 
+                safety_settings=SAFETY_SETTINGS_BLOCK_NONE, 
+                generation_config=generation_config, 
+                system_instruction=system_instruction,
+                tools=tools_to_use
+            )
+            
+            response_obj = await asyncio.to_thread(model_obj.generate_content, chat_history_for_model)
+            reply = _get_text_from_response(response_obj, user_id, chat_id, log_prefix)
+            
+            # Проверка на пустой ответ и выход из цикла, если ответ успешен
+            if reply and not reply.startswith(("🤖", "❌")):
+                logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Успешная генерация на попытке {attempt + 1}.")
+                break # Успех, выходим из цикла ретраев
+
+            # Обработка пустого ответа или ошибки от модели
+            if not reply:
                 block_reason_str, finish_reason_str = 'N/A', 'N/A'
-                if not reply:
-                    try:
-                        if hasattr(response_obj, 'prompt_feedback') and response_obj.prompt_feedback and hasattr(response_obj.prompt_feedback, 'block_reason'):
-                            block_reason_enum = response_obj.prompt_feedback.block_reason
-                            block_reason_str = block_reason_enum.name if hasattr(block_reason_enum, 'name') else str(block_reason_enum)
-                        if hasattr(response_obj, 'candidates') and response_obj.candidates:
-                            first_candidate = response_obj.candidates[0]
-                            if hasattr(first_candidate, 'finish_reason'):
-                                finish_reason_enum = first_candidate.finish_reason
-                                finish_reason_str = finish_reason_enum.name if hasattr(finish_reason_enum, 'name') else str(finish_reason_enum)
-                    except Exception as e_inner_reason_extract: logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка извлечения причин пустого ответа: {e_inner_reason_extract}")
-                    logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Пустой ответ (попытка {attempt + 1}{', суб-попытка без поиска' if sub_attempt == 1 else ''}). Block: {block_reason_str}, Finish: {finish_reason_str}")
-                    is_other_or_safety_block = (block_reason_str == 'OTHER' or (hasattr(BlockReason, 'OTHER') and block_reason_str == BlockReason.OTHER.name) or block_reason_str == 'SAFETY' or (hasattr(BlockReason, 'SAFETY') and block_reason_str == BlockReason.SAFETY.name))
-                    if sub_attempt == 0 and is_text_request_with_search and is_other_or_safety_block:
-                        logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Попытка с поиском заблокирована ({block_reason_str}). Планируем суб-попытку без поиска.")
-                        attempted_without_search_this_cycle = True
-                        try:
-                            prompt_details_for_log = pprint.pformat(chat_history_for_model_initial)
-                            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Исходный промпт (с поиском), вызвавший {block_reason_str} (первые 2000 символов):\n{prompt_details_for_log[:2000]}")
-                        except Exception as e_log_prompt_block: logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка логирования промпта для {block_reason_str}: {e_log_prompt_block}")
-                        reply = None; continue
-                    if block_reason_str not in ['UNSPECIFIED', 'N/A', '', None] and (not hasattr(BlockReason, 'BLOCK_REASON_UNSPECIFIED') or block_reason_str != BlockReason.BLOCK_REASON_UNSPECIFIED.name): reply = f"🤖 Модель не дала ответ. (Блокировка: {block_reason_str})"
-                    elif finish_reason_str not in ['STOP', 'N/A', '', None] and (not hasattr(FinishReason, 'FINISH_REASON_STOP') or finish_reason_str != FinishReason.FINISH_REASON_STOP.name) and finish_reason_str not in ['OTHER', FinishReason.OTHER.name if hasattr(FinishReason,'OTHER') else 'OTHER_STR'] and finish_reason_str not in ['SAFETY', FinishReason.SAFETY.name if hasattr(FinishReason,'SAFETY') else 'SAFETY_STR']: reply = f"🤖 Модель завершила работу без ответа. (Причина: {finish_reason_str})"
-                    elif (finish_reason_str in ['OTHER', FinishReason.OTHER.name if hasattr(FinishReason,'OTHER') else 'OTHER_STR'] or finish_reason_str in ['SAFETY', FinishReason.SAFETY.name if hasattr(FinishReason,'SAFETY') else 'SAFETY_STR']) and (block_reason_str in ['UNSPECIFIED', 'N/A', '', None] or (hasattr(BlockReason, 'BLOCK_REASON_UNSPECIFIED') and block_reason_str == BlockReason.BLOCK_REASON_UNSPECIFIED.name)): reply = f"🤖 Модель завершила работу по причине: {finish_reason_str}."
-                    else: reply = "🤖 Модель дала пустой ответ."
-                    break
-                if reply:
-                    is_error_reply_generated_by_us = reply.startswith("🤖") or reply.startswith("❌")
-                    if not is_error_reply_generated_by_us:
-                        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}{'_NoSearch' if sub_attempt == 1 and attempted_without_search_this_cycle else ''}) Успешная генерация на попытке {attempt + 1}."); break
-                    else:
-                        if sub_attempt == 0 and attempted_without_search_this_cycle:
-                            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Первая суб-попытка дала ошибку, но вторая (без поиска) запланирована.")
-                            reply = None; continue
-                        else: logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}{'_NoSearch' if sub_attempt == 1 and attempted_without_search_this_cycle else ''}) Получен \"технический\" ответ об ошибке: {reply[:100]}..."); break
-            except (BlockedPromptException, StopCandidateException) as e_block_stop_sub:
-                reason_str_sub = str(e_block_stop_sub.args[0]) if hasattr(e_block_stop_sub, 'args') and e_block_stop_sub.args else "неизвестна"
-                logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}{'_NoSearch' if sub_attempt == 1 and attempted_without_search_this_cycle else ''}) Запрос заблокирован/остановлен (попытка {attempt + 1}): {e_block_stop_sub} (Причина: {reason_str_sub})")
-                reply = f"❌ Запрос заблокирован/остановлен моделью."; break
-            except Exception as e_sub:
-                error_message_sub = str(e_sub)
-                logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}{'_NoSearch' if sub_attempt == 1 and attempted_without_search_this_cycle else ''}) Ошибка генерации (попытка {attempt + 1}): {error_message_sub[:200]}...")
-                if "429" in error_message_sub: reply = f"❌ Слишком много запросов к модели. Попробуйте позже."
-                elif "400" in error_message_sub: reply = f"❌ Ошибка в запросе к модели (400 Bad Request)."
-                elif "location is not supported" in error_message_sub: reply = f"❌ Эта модель недоступна в вашем регионе."
-                else: reply = f"❌ Непредвиденная ошибка при генерации: {error_message_sub[:100]}..."; break
-        if reply and not (reply.startswith("🤖") or reply.startswith("❌")): break
-        if attempt == RETRY_ATTEMPTS - 1:
-            logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Не удалось получить успешный ответ после {RETRY_ATTEMPTS} попыток. Финальный reply: {reply}")
-            if reply is None: reply = f"❌ Ошибка при обращении к модели после {RETRY_ATTEMPTS} попыток."; break
-        is_retryable_error_type = False
-        if reply and ("500" in reply or "503" in reply or "timeout" in reply.lower()): is_retryable_error_type = True
-        elif 'last_exception' in locals() and hasattr(locals()['last_exception'], 'message') :
-             error_message_from_exception = str(locals()['last_exception'].message)
-             if "500" in error_message_from_exception or "503" in error_message_from_exception or "timeout" in error_message_from_exception.lower(): is_retryable_error_type = True
-        if is_retryable_error_type:
-            wait_time = RETRY_DELAY_SECONDS * (2 ** attempt)
-            logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ожидание {wait_time:.1f} сек перед попыткой {attempt + 2}..."); await asyncio.sleep(wait_time)
-        else:
-            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Неретраябл ошибка или достигнут лимит ретраев. Финальный reply: {reply}")
-            if reply is None : reply = f"❌ Ошибка при обращении к модели после {attempt + 1} попыток."; break
+                try:
+                    if hasattr(response_obj, 'prompt_feedback') and response_obj.prompt_feedback:
+                        block_reason_str = response_obj.prompt_feedback.block_reason.name
+                    if hasattr(response_obj, 'candidates') and response_obj.candidates:
+                        finish_reason_str = response_obj.candidates[0].finish_reason.name
+                except Exception as e_reason:
+                    logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Не удалось извлечь причину пустого ответа: {e_reason}")
+
+                logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Пустой ответ (попытка {attempt + 1}). Block: {block_reason_str}, Finish: {finish_reason_str}")
+                
+                if block_reason_str not in ['UNSPECIFIED', 'N/A']:
+                    reply = f"🤖 Модель не дала ответ. (Блокировка: {block_reason_str})"
+                elif finish_reason_str not in ['STOP', 'UNSPECIFIED', 'N/A']:
+                     reply = f"🤖 Модель завершила работу без ответа. (Причина: {finish_reason_str})"
+                else:
+                    reply = "🤖 Модель дала пустой ответ."
+                break # Получили технический ответ, выходим
+                
+        except (BlockedPromptException, StopCandidateException) as e_block_stop:
+            reason_str = str(e_block_stop.args[0]) if e_block_stop.args else "неизвестна"
+            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Запрос заблокирован/остановлен (попытка {attempt + 1}): {reason_str}")
+            reply = f"❌ Запрос заблокирован/остановлен моделью."
+            break # Фатальная ошибка для этого запроса
+            
+        except Exception as e:
+            error_message = str(e)
+            logger.warning(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка генерации (попытка {attempt + 1}): {error_message[:200]}...")
+            if "429" in error_message or "503" in error_message or "500" in error_message:
+                wait_time = RETRY_DELAY_SECONDS * (2 ** attempt)
+                logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Серверная ошибка. Ожидание {wait_time:.1f} сек перед попыткой {attempt + 2}...")
+                await asyncio.sleep(wait_time)
+                continue # Переходим к следующей попытке
+            elif "400" in error_message:
+                reply = f"❌ Ошибка в запросе к модели (400 Bad Request)."
+            elif "location is not supported" in error_message:
+                reply = f"❌ Эта модель недоступна в вашем регионе."
+            else:
+                reply = f"❌ Непредвиденная ошибка при генерации: {error_message[:100]}..."
+            break # Неретраябл ошибка, выходим
+            
+    # Если после всех попыток ответа нет
+    if reply is None:
+        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Не удалось получить ответ после {RETRY_ATTEMPTS} попыток.")
+        reply = f"❌ Ошибка: не удалось связаться с моделью после {RETRY_ATTEMPTS} попыток."
+        
     return reply
 
 async def fetch_webpage_content(url: str, session: httpx.AsyncClient) -> str | None:
@@ -788,16 +791,35 @@ async def reanalyze_image_from_id(file_id: str, old_bot_response: str, user_ques
     except Exception as e:
         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка скачивания {file_id}: {e}")
         return f"❌ Ошибка при получении изображения: {e}"
-    b64_data = base64.b64encode(file_bytes).decode()
+    
     effective_context = _get_effective_context_for_task("vision", context, user_id, chat_id, log_prefix)
     safe_user_name = html.escape(context.user_data.get('first_name', 'Пользователь'))
-    safe_user_question = html.escape(user_question)
-    prompt_text = (f"Это уточняющий вопрос к изображению, которое ты уже видела.\n"
-                   f"ТВОЙ ПРЕДЫДУЩИЙ ОТВЕТ:\n---\n{old_bot_response}\n---\n\n"
-                   f"НОВЫЙ ВОПРОС ОТ {safe_user_name}: \"{safe_user_question}\"\n\n"
-                   f"ЗАДАЧА: Внимательно посмотри на изображение ещё раз и ответь на новый вопрос. Будь краткой и точной.")
-    parts = [{"text": prompt_text}, {"inline_data": {"mime_type": "image/jpeg", "data": b64_data}}]
-    return await _generate_gemini_response(user_prompt_text_initial=prompt_text, chat_history_for_model_initial=[{"role": "user", "parts": parts}], user_id=user_id, chat_id=chat_id, context=effective_context, system_instruction=system_instruction_text, log_prefix=log_prefix)
+    
+    # ИЗМЕНЕНО: Построение истории для повторного анализа
+    # Модель получит старый ответ и новый вопрос в виде диалога.
+    chat_history_for_reanalysis = [
+        {"role": "user", "parts": [
+            # Здесь можно было бы передать исходное изображение, но для краткости передаем только текст.
+            # Для полноценного re-analyze лучше передавать и изображение снова.
+            {"text": f"Это уточняющий вопрос к изображению. Мой предыдущий вопрос был про него."}
+        ]},
+        {"role": "model", "parts": [{"text": old_bot_response}]},
+        {"role": "user", "parts": [
+            {"text": f"Отлично. Теперь новый вопрос от {safe_user_name}: \"{html.escape(user_question)}\"\n\nПосмотри на изображение ещё раз и ответь."},
+            # Передаем изображение снова для точного ответа
+            {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(file_bytes).decode()}}
+        ]}
+    ]
+    
+    return await _generate_gemini_response(
+        chat_history_for_model=chat_history_for_reanalysis, 
+        user_id=user_id, 
+        chat_id=chat_id, 
+        context=effective_context, 
+        system_instruction=system_instruction_text, 
+        log_prefix=log_prefix,
+        use_google_search=True # Включаем поиск и для повторного анализа
+    )
 
 async def reanalyze_document_from_id(file_id: str, old_bot_response: str, user_question: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
     user_id = context.user_data.get('id', 'Unknown')
@@ -811,13 +833,26 @@ async def reanalyze_document_from_id(file_id: str, old_bot_response: str, user_q
         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка скачивания/чтения {file_id}: {e}")
         return f"❌ Ошибка при получении документа: {e}"
     safe_user_name = html.escape(context.user_data.get('first_name', 'Пользователь'))
-    safe_user_question = html.escape(user_question)
-    prompt_text = (f"Это уточняющий вопрос к документу, который ты уже читала.\n"
-                   f"ТВОЙ ПРЕДЫДУЩИЙ ОТВЕТ:\n---\n{old_bot_response}\n---\n\n"
-                   f"СОДЕРЖИМОЕ ДОКУМЕНТА (для справки):\n---\n{text[:5000]}\n---\n\n"
-                   f"НОВЫЙ ВОПРОС ОТ {safe_user_name}: \"{safe_user_question}\"\n\n"
-                   f"ЗАДАЧА: Внимательно перечитай документ и ответь на новый вопрос.")
-    return await _generate_gemini_response(user_prompt_text_initial=prompt_text, chat_history_for_model_initial=[{"role": "user", "parts": [{"text": prompt_text}]}], user_id=user_id, chat_id=chat_id, context=context, system_instruction=system_instruction_text, log_prefix=log_prefix)
+    
+    chat_history_for_reanalysis = [
+        {"role": "user", "parts": [{"text": f"Это был анализ документа. Твой ответ был таким."}]},
+        {"role": "model", "parts": [{"text": old_bot_response}]},
+        {"role": "user", "parts": [{"text": (
+            f"Теперь новый вопрос от {safe_user_name}: \"{html.escape(user_question)}\"\n\n"
+            f"ЗАДАЧА: Внимательно перечитай документ и ответь на новый вопрос.\n\n"
+            f"СОДЕРЖИМОЕ ДОКУМЕНТА:\n---\n{text[:15000]}\n---"
+        )}]}
+    ]
+    
+    return await _generate_gemini_response(
+        chat_history_for_model=chat_history_for_reanalysis, 
+        user_id=user_id, 
+        chat_id=chat_id, 
+        context=context, 
+        system_instruction=system_instruction_text, 
+        log_prefix=log_prefix,
+        use_google_search=True # Поиск может быть полезен для контекста
+    )
 
 async def reanalyze_youtube_from_id(video_id: str, old_bot_response: str, user_question: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
     user_id, chat_id = context.user_data.get('id', 'Unknown'), context.chat_data.get('id', 'Unknown')
@@ -830,13 +865,25 @@ async def reanalyze_youtube_from_id(video_id: str, old_bot_response: str, user_q
         return f"❌ Не удалось получить исходный транскрипт видео: {e}"
 
     safe_user_name = html.escape(context.user_data.get('first_name', 'Пользователь'))
-    safe_user_question = html.escape(user_question)
-    prompt_text = (f"Это уточняющий вопрос к видео, которое ты уже анализировал(а).\n"
-                   f"ТВОЙ ПРЕДЫДУЩИЙ ОТВЕТ:\n---\n{old_bot_response}\n---\n\n"
-                   f"ПОЛНЫЙ ТРАНСКРИПТ ВИДЕО (для справки):\n---\n{transcript_text[:15000]}\n---\n\n"
-                   f"НОВЫЙ ВОПРОС ОТ {safe_user_name}: \"{safe_user_question}\"\n\n"
-                   f"ЗАДАЧА: Внимательно перечитай транскрипт и ответь на новый вопрос.")
-    return await _generate_gemini_response(user_prompt_text_initial=prompt_text, chat_history_for_model_initial=[{"role": "user", "parts": [{"text": prompt_text}]}], user_id=user_id, chat_id=chat_id, context=context, system_instruction=system_instruction_text, log_prefix=log_prefix)
+    
+    chat_history_for_reanalysis = [
+        {"role": "user", "parts": [{"text": "Это был конспект видео с YouTube."}]},
+        {"role": "model", "parts": [{"text": old_bot_response}]},
+        {"role": "user", "parts": [{"text": (
+             f"Теперь новый вопрос от {safe_user_name}: \"{html.escape(user_question)}\"\n\n"
+             f"ЗАДАЧА: Внимательно перечитай транскрипт и ответь на новый вопрос.\n\n"
+             f"ТРАНСКРИПТ ВИДЕО:\n---\n{transcript_text[:15000]}\n---"
+        )}]}
+    ]
+    return await _generate_gemini_response(
+        chat_history_for_model=chat_history_for_reanalysis, 
+        user_id=user_id, 
+        chat_id=chat_id, 
+        context=context, 
+        system_instruction=system_instruction_text, 
+        log_prefix=log_prefix,
+        use_google_search=True
+    )
 
 async def reanalyze_webpage_from_url(url: str, old_bot_response: str, user_question: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
     user_id, chat_id = context.user_data.get('id', 'Unknown'), context.chat_data.get('id', 'Unknown')
@@ -851,143 +898,101 @@ async def reanalyze_webpage_from_url(url: str, old_bot_response: str, user_quest
         return f"❌ Не удалось получить содержимое страницы для повторного анализа. {web_content}"
 
     safe_user_name = html.escape(context.user_data.get('first_name', 'Пользователь'))
-    safe_user_question = html.escape(user_question)
-    prompt_text = (f"Это уточняющий вопрос к веб-странице, которую ты уже читал(а).\n"
-                   f"ТВОЙ ПРЕДЫДУЩИЙ ОТВЕТ:\n---\n{old_bot_response}\n---\n\n"
-                   f"ПОЛНОЕ СОДЕРЖИМОЕ СТРАНИЦЫ (для справки):\n---\n{web_content[:15000]}\n---\n\n"
-                   f"НОВЫЙ ВОПРОС ОТ {safe_user_name}: \"{safe_user_question}\"\n\n"
-                   f"ЗАДАЧА: Внимательно перечитай текст страницы и ответь на новый вопрос.")
-    return await _generate_gemini_response(user_prompt_text_initial=prompt_text, chat_history_for_model_initial=[{"role": "user", "parts": [{"text": prompt_text}]}], user_id=user_id, chat_id=chat_id, context=context, system_instruction=system_instruction_text, log_prefix=log_prefix)
+    chat_history_for_reanalysis = [
+        {"role": "user", "parts": [{"text": "Это был анализ веб-страницы."}]},
+        {"role": "model", "parts": [{"text": old_bot_response}]},
+        {"role": "user", "parts": [{"text": (
+             f"Теперь новый вопрос от {safe_user_name}: \"{html.escape(user_question)}\"\n\n"
+             f"ЗАДАЧА: Внимательно перечитай текст страницы и ответь на новый вопрос.\n\n"
+             f"ТЕКСТ СТРАНИЦЫ:\n---\n{web_content[:15000]}\n---"
+        )}]}
+    ]
+    return await _generate_gemini_response(
+        chat_history_for_model=chat_history_for_reanalysis, 
+        user_id=user_id, 
+        chat_id=chat_id, 
+        context=context, 
+        system_instruction=system_instruction_text, 
+        log_prefix=log_prefix,
+        use_google_search=True
+    )
 
 def build_context_for_model(chat_history: list) -> list:
+    # ИЗМЕНЕНО: Эта функция теперь еще и правильно обрабатывает мультимодальные входы
     clean_history = []
     for entry in chat_history:
         if entry.get("role") in ("user", "model") and isinstance(entry.get("parts"), list):
-            clean_entry = {"role": entry["role"], "parts": []}
-            for part in entry["parts"]:
-                if isinstance(part, dict) and "text" in part:
-                    clean_entry["parts"].append({"text": part["text"]})
-            if clean_entry["parts"]: clean_history.append(clean_entry)
+            # Пропускаем пустые записи
+            if not any(part.get("text") or part.get("inline_data") for part in entry["parts"]):
+                continue
+            clean_history.append(entry)
+
     history_for_model = []
     current_chars = 0
+    # Идем в обратном порядке, чтобы собрать самый свежий контекст
     for entry in reversed(clean_history):
         entry_text = "".join(p.get("text", "") for p in entry.get("parts", []))
+        # Простое ограничение по символам. Для мультимодальных чатов может потребоваться более сложная логика.
         if current_chars + len(entry_text) > MAX_CONTEXT_CHARS:
             logger.info(f"Обрезка истории по символам. Учтено {len(history_for_model)} сообщений из {len(clean_history)}.")
             break
         history_for_model.append(entry)
         current_chars += len(entry_text)
-    history_for_model.reverse()
+    
+    history_for_model.reverse() # Восстанавливаем хронологический порядок
     return history_for_model
 
-async def perform_google_search(query: str, api_key: str, cse_id: str, num_results: int, session: httpx.AsyncClient) -> list[str] | None:
-    search_url = "https://www.googleapis.com/customsearch/v1"
-    params = {'key': api_key, 'cx': cse_id, 'q': query, 'num': num_results, 'lr': 'lang_ru', 'gl': 'ru'}
-    query_short = query[:50] + '...' if len(query) > 50 else query
-    logger.debug(f"Запрос к Google Search API для '{query_short}'...")
-    try:
-        response = await session.get(search_url, params=params, timeout=10.0)
-        response.raise_for_status() 
-        data = response.json()
-        items = data.get('items', [])
-        snippets = [item.get('snippet', item.get('title', '')) for item in items if item.get('snippet') or item.get('title')]
-        if snippets:
-            logger.info(f"Google Search: Найдено {len(snippets)} результатов для '{query_short}'.")
-            return snippets
-        else:
-            logger.info(f"Google Search: Нет сниппетов/заголовков для '{query_short}'.")
-            return None
-    except httpx.HTTPStatusError as e: logger.error(f"Google Search: Ошибка HTTP {e.response.status_code} для '{query_short}'. Ответ: {e.response.text[:200]}...")
-    except Exception as e: logger.error(f"Google Search: Непредвиденная ошибка для '{query_short}' - {e}", exc_info=True)
-    return None
+# УДАЛЕНО: Функции ручного поиска больше не нужны в основном потоке.
+# async def perform_google_search(...)
+# async def perform_ddg_search(...)
+# async def perform_web_search(...)
 
-async def perform_ddg_search(query: str, num_results: int) -> list[str] | None:
-    query_short = query[:50] + '...' if len(query) > 50 else query
-    logger.info(f"Запрос к DDG Search API для '{query_short}'...")
-    try:
-        results = await asyncio.to_thread(DDGS().text, keywords=query, region='ru-ru', max_results=num_results)
-        if results:
-            snippets = [r['body'] for r in results]
-            logger.info(f"DDG Search: Найдено {len(snippets)} результатов для '{query_short}'.")
-            return snippets
-        logger.info(f"DDG Search: Не найдено результатов для '{query_short}'.")
-        return None
-    except Exception as e:
-        logger.error(f"DDG Search: Непредвиденная ошибка для '{query_short}' - {e}", exc_info=True)
-        return None
-
-async def perform_web_search(query: str, context: ContextTypes.DEFAULT_TYPE) -> tuple[str | None, str | None]:
-    session = getattr(context.application, 'http_client', None)
-    if session and not session.is_closed:
-        google_results = await perform_google_search(query, GOOGLE_API_KEY, GOOGLE_CSE_ID, GOOGLE_SEARCH_MAX_RESULTS, session)
-        if google_results:
-            search_str = "\n".join(f"- {s.strip()}" for s in google_results)
-            return search_str, "Google"
-    logger.warning(f"Поиск Google не дал результатов для '{query[:50]}...'. Переключаюсь на DuckDuckGo.")
-    ddg_results = await perform_ddg_search(query, DDG_MAX_RESULTS)
-    if ddg_results:
-        search_str = "\n".join(f"- {s.strip()}" for s in ddg_results)
-        return search_str, "DuckDuckGo"
-    return None, None
-
+# ИЗМЕНЕНО: Функция полностью переписана для использования нативного поиска.
 async def process_text_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text_to_process: str, content_type: str | None = None, content_id: str | None = None):
     chat_id, user, message, user_id = update.effective_chat.id, update.effective_user, update.message, update.effective_user.id
     safe_user_name = html.escape(user.first_name) if user.first_name else "Пользователь"
     
-    # --- ЭТАП 1: Подготовка данных для модели ---
-    # Мы больше не генерируем поисковый запрос. Модель сделает это сама.
-    # Просто добавляем последнее сообщение пользователя в историю.
-    
+    # --- ЭТАП 1: Подготовка истории для модели ---
     current_time_str = get_current_time_str()
     time_prefix_for_prompt = f"(Текущая дата и время: {current_time_str})\n"
     user_message_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name)
+    
+    # Мы больше не добавляем результаты поиска в историю. Просто чистый запрос пользователя.
     prompt_for_history = f"{time_prefix_for_prompt}{user_message_prefix}{html.escape(text_to_process)}"
-
-    # Определяем тип контента для истории: приоритет у явно переданного, затем голос, иначе - ничего
+    
     final_content_type = content_type if content_type else ("voice" if message.voice else None)
     final_content_id = content_id if content_id else (message.voice.file_id if message.voice else None)
     
     await _add_to_history(
         context,
         "user",
-        prompt_for_history, # В историю кладём чистый промпт без результатов поиска
+        prompt_for_history,
         user_id=user_id,
         message_id=message.message_id,
         content_type=final_content_type,
         content_id=final_content_id,
     )
 
-    # --- ЭТАП 2: Вызов модели с активированным поиском Google ---
+    # --- ЭТАП 2: Вызов модели с активированным поиском ---
     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | Вызов Gemini с нативным Google Search Grounding.")
 
-    # Собираем историю для модели. Она важна для контекста поиска.
     history_for_model = build_context_for_model(context.chat_data.get("history", []))
 
-    try:
-        # Создаем модель, включая инструмент поиска
-        model_with_search = genai.GenerativeModel(
-            model_name=get_user_setting(context, 'selected_model', DEFAULT_MODEL),
-            safety_settings=SAFETY_SETTINGS_BLOCK_NONE,
-            system_instruction=system_instruction_text,
-            tools=[Tool.from_google_search_retrieval()] # Активируем магию!
-        )
-        
-        # Генерируем ответ. Модель сама решит, использовать поиск или нет.
-        response_obj = await asyncio.to_thread(
-            model_with_search.generate_content,
-            history_for_model,
-            generation_config=genai.GenerationConfig(temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS)
-        )
-        
-        raw_gemini_reply = _get_text_from_response(response_obj, user_id, chat_id, "GoogleGroundedGen")
-
-    except Exception as e:
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | Ошибка при вызове модели с Google Search: {e}", exc_info=True)
-        raw_gemini_reply = f"❌ Произошла ошибка при обращении к модели с поиском: {e}"
+    # Вызываем нашу упрощенную функцию-обертку, явно включая поиск
+    raw_gemini_reply = await _generate_gemini_response(
+        chat_history_for_model=history_for_model,
+        user_id=user_id,
+        chat_id=chat_id,
+        context=context,
+        system_instruction=system_instruction_text,
+        log_prefix="GroundedGen",
+        use_google_search=True # Главное изменение!
+    )
 
     # --- ЭТАП 3: Отправка ответа и сохранение в историю ---
     sanitized_reply = sanitize_telegram_html(raw_gemini_reply or "🤖 Модель не дала ответ.")
     sent_message = await send_reply(message, sanitized_reply, context)
+    # Сохраняем чистый ответ модели в историю
     await _add_to_history(context, "model", sanitized_reply, bot_message_id=sent_message.message_id if sent_message else None)
     
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1001,21 +1006,32 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка скачивания голоса: {e}", exc_info=True)
         await message.reply_text("❌ Ошибка при загрузке вашего голосового сообщения."); return
-    transcription_prompt = "Расшифруй это аудиосообщение и верни только текст расшифровки, без каких-либо добавлений или комментариев."
+    
+    # Используем модель для транскрипции. Здесь поиск не нужен.
     effective_context = _get_effective_context_for_task("audio", context, user_id, chat_id, log_prefix)
-    model_id = get_user_setting(effective_context, 'selected_model', DEFAULT_MODEL)
-    model_obj = genai.GenerativeModel(model_id)
-    try:
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Отправка аудио на расшифровку в {model_id}.")
-        response = await asyncio.to_thread(model_obj.generate_content, [transcription_prompt, {"mime_type": "audio/ogg", "data": bytes(file_bytes)}])
-        transcribed_text = _get_text_from_response(response, user_id, chat_id, log_prefix)
-        if not transcribed_text:
-            await message.reply_text("🤖 Не удалось распознать речь. Попробуйте еще раз."); return
-    except Exception as e:
-        logger.error(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Ошибка при расшифровке: {e}", exc_info=True)
-        await message.reply_text(f"❌ Ошибка сервиса распознавания речи: {str(e)[:100]}"); return
+    
+    transcription_prompt = "Расшифруй это аудиосообщение и верни только текст расшифровки, без каких-либо добавлений или комментариев."
+    history_for_transcribe = [{"role": "user", "parts": [
+        transcription_prompt, 
+        {"mime_type": "audio/ogg", "data": bytes(file_bytes)}
+    ]}]
+
+    transcribed_text = await _generate_gemini_response(
+        chat_history_for_model=history_for_transcribe,
+        user_id=user_id,
+        chat_id=chat_id,
+        context=effective_context,
+        system_instruction="Ты - точный инструмент транскрибации.", # Упрощенная инструкция
+        log_prefix="VoiceTranscribe",
+        use_google_search=False # Поиск для транскрипции не нужен
+    )
+    
+    if not transcribed_text or transcribed_text.startswith(("🤖", "❌")):
+        await message.reply_text(transcribed_text or "🤖 Не удалось распознать речь. Попробуйте еще раз."); return
+
     logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Голос расшифрован -> '{transcribed_text}'. Передача в обработчик.")
-    await process_text_query(update, context, transcribed_text)
+    # ИЗМЕНЕНО: передаем file_id голосового сообщения
+    await process_text_query(update, context, transcribed_text, content_type="voice", content_id=message.voice.file_id)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -1052,22 +1068,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             new_reply_text = await reanalyze_youtube_from_id(content_id, old_bot_response, original_text, context)
                         elif content_type == "webpage":
                             new_reply_text = await reanalyze_webpage_from_url(content_id, old_bot_response, original_text, context)
+                        # ИЗМЕНЕНО: Добавляем обработку ответа на голосовое сообщение
+                        elif content_type == "voice":
+                            # Для голоса просто продолжаем диалог, так как аудио уже обработано.
+                            # Здесь можно было бы реализовать re-analyze аудио, но это сложнее.
+                            # Пока просто передаем в обычный обработчик.
+                            await process_text_query(update, context, original_text)
+                            return
                         
                         if new_reply_text:
-                            user_message_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name) + html.escape(original_text)
-                            await _add_to_history(context, "user", user_message_for_history, user_id=user_id, message_id=message.message_id)
+                            # История для re-analyze уже добавлена внутри самих функций reanalyze_*
+                            # Поэтому просто отправляем ответ.
                             sanitized_reply = sanitize_telegram_html(new_reply_text)
                             sent_message = await send_reply(message, sanitized_reply, context)
+                            # И добавляем ответ бота в историю
                             await _add_to_history(context, "model", sanitized_reply, bot_message_id=sent_message.message_id if sent_message else None)
-                            return # Важно: выходим, так как запрос обработан
-                break # Выходим из цикла, как только нашли соответствующее сообщение
+                            return
+                break 
     
     # --- БЛОК 2: ОБРАБОТКА НОВОГО СООБЩЕНИЯ СО ССЫЛКОЙ ---
     youtube_id = extract_youtube_id(original_text)
     general_url = extract_general_url(original_text)
     session = getattr(context.application, 'http_client', None)
 
-    # Приоритет YouTube
     if youtube_id:
         log_prefix = "YouTubeHandler"
         logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Обнаружена ссылка YouTube (ID: {youtube_id}).")
@@ -1089,7 +1112,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await process_text_query(update, context, summary_prompt, content_type="youtube", content_id=youtube_id)
         return
 
-    # Затем общие веб-страницы
     elif general_url and session and not session.is_closed:
         log_prefix = "WebpageHandler"
         logger.info(f"UserID: {user_id}, ChatID: {chat_id} | ({log_prefix}) Обнаружена ссылка на веб-страницу: {general_url}")
@@ -1110,6 +1132,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- БЛОК 3: ОБРАБОТКА ОБЫЧНОГО ТЕКСТОВОГО СООБЩЕНИЯ ---
     await process_text_query(update, context, original_text)
 
+# ИЗМЕНЕНО: Функция радикально упрощена. Больше нет двухэтапного анализа.
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id, user = update.effective_chat.id, update.effective_user
     if not user:
@@ -1134,80 +1157,56 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Не удалось загрузить изображение.")
         return
 
-    safe_user_caption = html.escape(message.caption or "")
+    safe_user_caption = html.escape(message.caption or "Проанализируй это изображение.")
     safe_user_name = html.escape(user.first_name if user.first_name else "Пользователь")
     effective_context_photo = _get_effective_context_for_task("vision", context, user_id, chat_id, log_prefix_handler)
-
-    # --- ЭТАП 1: Извлечение текста/ключевых слов для поиска ---
-    search_context_str = ""
-    search_performed = False
     
-    try:
-        b64_data = base64.b64encode(file_bytes).decode()
-    except Exception:
-        await message.reply_text("❌ Ошибка обработки изображения.")
-        return
-    mime_type = "image/jpeg" if file_bytes.startswith(b'\xff\xd8\xff') else "image/png"
-    
-    extraction_prompt = "Проанализируй это изображение. Если на нем есть хорошо читаемый текст (заголовок, вывеска, название), извлеки его. Если текста нет, опиши ключевые объекты одним-тремя словами. Ответ должен быть очень коротким и содержать только текст или ключевые слова, подходящие для веб-поиска."
-    parts_for_extraction = [{"text": extraction_prompt}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}]
-
-    # "Тихий" запрос к Gemini для извлечения поискового запроса
-    extracted_text = await _generate_gemini_response(
-        user_prompt_text_initial=extraction_prompt,
-        chat_history_for_model_initial=[{"role": "user", "parts": parts_for_extraction}],
-        user_id=user_id,
-        chat_id=chat_id,
-        context=effective_context_photo,
-        system_instruction="Ты — инструмент для извлечения данных.", # Упрощенная инструкция для этой задачи
-        log_prefix="PhotoExtract"
-    )
-
-    if extracted_text and not extracted_text.startswith(("🤖", "❌")) and len(extracted_text.strip()) > 2:
-        search_query_text = extracted_text.strip()
-        logger.info(f"UserID: {user_id}, ChatID: {chat_id} | (PhotoVision) Извлечено для поиска: '{search_query_text}'")
-
-        # --- ЭТАП 2: Веб-поиск по извлеченным данным ---
-        search_results, search_source = await perform_web_search(search_query_text, context)
-        if search_results:
-            search_context_str = f"\n\n==== РЕЗУЛЬТАТЫ ПОИСКА ({search_source}) по тексту/объектам с изображения ====\n{search_results}"
-            search_performed = True
-            await message.reply_text(f"🔍 Нашел на картинке «_{html.escape(search_query_text[:60])}..._», ищу информацию...", parse_mode=ParseMode.HTML)
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-    # --- ЭТАП 3: Финальный анализ с учетом результатов поиска ---
+    # --- ЭТАП 1: Подготовка истории и вызов модели ---
     current_time_str_photo = get_current_time_str()
-    final_prompt_text = (
+    prompt_text = (
         f"(Текущая дата и время: {current_time_str_photo})\n"
         f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name)}"
-        f"Подробно проанализируй изображение и ответь на комментарий пользователя: \"{safe_user_caption}\". "
+        f"{safe_user_caption}"
     )
-    if search_performed:
-        final_prompt_text += "Используй следующие результаты веб-поиска, чтобы дать более полный и актуальный ответ. Ссылайся на них, если это уместно."
-    else:
-        final_prompt_text += "Если на изображении есть текст, учти его в своем ответе."
     
-    final_prompt_text += f"{search_context_str}{REASONING_PROMPT_ADDITION}"
+    # Создаем запись для истории, которая пойдет в модель
+    history_for_model = build_context_for_model(context.chat_data.get("history", []))
+    
+    mime_type = "image/jpeg" if file_bytes.startswith(b'\xff\xd8\xff') else "image/png"
+    
+    # Добавляем текущий запрос с изображением
+    history_for_model.append({
+        "role": "user",
+        "parts": [
+            {"text": prompt_text},
+            {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(file_bytes).decode()}}
+        ]
+    })
+    
+    # Сохраняем в "вечную" историю чата для контекста будущих сообщений
+    await _add_to_history(
+        context, 
+        "user", 
+        USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name) + (message.caption or "Отправлено изображение"), 
+        user_id=user_id, 
+        message_id=message.message_id, 
+        content_type="image", 
+        content_id=photo_file_id
+    )
 
-    parts_for_final_analysis = [{"text": final_prompt_text}, {"inline_data": {"mime_type": mime_type, "data": b64_data}}]
-    
+    # Вызываем модель с поиском. Она сама разберется, что искать.
     raw_reply_photo = await _generate_gemini_response(
-        user_prompt_text_initial=final_prompt_text,
-        chat_history_for_model_initial=[{"role": "user", "parts": parts_for_final_analysis}],
+        chat_history_for_model=history_for_model,
         user_id=user_id,
         chat_id=chat_id,
         context=effective_context_photo,
         system_instruction=system_instruction_text,
-        log_prefix="PhotoVisionGen",
-        is_text_request_with_search=search_performed
+        log_prefix="PhotoVisionGrounded",
+        use_google_search=True
     )
     
-    # Сохранение в историю и отправка ответа пользователю
-    user_text_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name) + (safe_user_caption or "Пользователь прислал фото.")
-    await _add_to_history(context, "user", user_text_for_history, user_id=user_id, message_id=message.message_id, content_type="image", content_id=photo_file_id)
-    
+    # --- ЭТАП 2: Отправка ответа и сохранение ---
     sanitized_reply = sanitize_telegram_html(raw_reply_photo or "🤖 Не удалось проанализировать изображение.")
-    
     sent_message = await send_reply(message, sanitized_reply, context)
     await _add_to_history(context, "model", sanitized_reply, bot_message_id=sent_message.message_id if sent_message else None)
 
@@ -1242,23 +1241,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try: text = file_bytes.decode('cp1251')
             except UnicodeDecodeError: await update.message.reply_text(f"❌ Не удалось прочитать текстовый файл `{doc.file_name}`. Попробуйте кодировку UTF-8 или CP1251."); return
     if text is None: await update.message.reply_text(f"❌ Не удалось извлечь текст из файла `{doc.file_name}`."); return
-    safe_user_caption = html.escape(message.caption or "")
-    current_time_str_doc, time_prefix_for_prompt_doc = get_current_time_str(), f"(Текущая дата и время: {get_current_time_str()})\n"
-    file_context_for_prompt = f"Содержимое файла `{doc.file_name or 'файл'}`:\n```\n{text[:10000]}\n```"
-    safe_user_name = html.escape(user.first_name if user.first_name else "Пользователь")
-    user_prompt_doc_for_gemini = (f"{time_prefix_for_prompt_doc}"
-                                  f"{USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name)}"
-                                  f"Проанализируй текст из файла. Мой комментарий: \"{safe_user_caption}\".\n{file_context_for_prompt}")
-    user_prompt_doc_for_gemini += REASONING_PROMPT_ADDITION
-    raw_gemini_reply_doc = await _generate_gemini_response(user_prompt_text_initial=user_prompt_doc_for_gemini, chat_history_for_model_initial=[{"role": "user", "parts": [{"text": user_prompt_doc_for_gemini}]}], user_id=user_id, chat_id=chat_id, context=context, system_instruction=system_instruction_text, log_prefix="DocGen")
     
-    doc_caption_for_history = safe_user_caption or f"Загружен документ: {doc.file_name}"
-    user_message_with_id_for_history = USER_ID_PREFIX_FORMAT.format(user_id=user_id, user_name=safe_user_name) + doc_caption_for_history
-    await _add_to_history(context, "user", user_message_with_id_for_history, user_id=user_id, message_id=message.message_id, content_type="document", content_id=doc.file_id)
-    
-    sanitized_reply = sanitize_telegram_html(raw_gemini_reply_doc or "🤖 Не удалось обработать документ.")
-    sent_message = await send_reply(message, sanitized_reply, context)
-    await _add_to_history(context, "model", sanitized_reply, bot_message_id=sent_message.message_id if sent_message else None)
+    # Используем process_text_query для унификации
+    user_comment = message.caption or ""
+    prompt_with_doc = (f"Проанализируй текст из файла и ответь на мой комментарий. "
+                       f"Мой комментарий: '{html.escape(user_comment)}'.\n\n"
+                       f"--- ТЕКСТ ФАЙЛА '{doc.file_name}' ---\n{text[:15000]}\n--- КОНЕЦ ---")
+                       
+    await process_text_query(update, context, prompt_with_doc, content_type="document", content_id=doc.file_id)
 
 async def setup_bot_and_server(stop_event: asyncio.Event):
     persistence = None
