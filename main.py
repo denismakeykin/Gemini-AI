@@ -189,10 +189,16 @@ async def _add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: 
         history.pop(0)
 
 def build_context_for_model(chat_history: list) -> list:
-    """Собирает контекст для модели, обрезая старые сообщения по лимиту символов."""
+    """
+    Собирает и ОЧИЩАЕТ контекст для модели, 
+    обрезая старые сообщения и удаляя служебные поля.
+    """
     context_for_model = []
     current_chars = 0
     for entry in reversed(chat_history):
+        if not all(k in entry for k in ('role', 'parts')):
+            continue
+
         entry_text = "".join(p.get("text", "") for p in entry.get("parts", []) if isinstance(p, dict))
         entry_chars = len(entry_text)
         
@@ -200,7 +206,12 @@ def build_context_for_model(chat_history: list) -> list:
             logger.info(f"Контекст обрезан. Учтено {len(context_for_model)} из {len(chat_history)} сообщений.")
             break
             
-        context_for_model.insert(0, entry)
+        clean_entry = {
+            "role": entry["role"],
+            "parts": entry["parts"]
+        }
+        
+        context_for_model.insert(0, clean_entry)
         current_chars += entry_chars
         
     return context_for_model
@@ -232,7 +243,7 @@ async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> 
         return final_text
     except Exception as e:
         logger.error(f"Ошибка стриминга: {e}", exc_info=True)
-        await message_to_edit.edit_text(f"❌ Ошибка стриминга: {e}")
+        await message_to_edit.edit_text(f"❌ Ошибка стриминга: {str(e)[:500]}") # Обрезаем текст ошибки
         return ""
 
 async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list, content_type: str = None, content_id: str = None):
@@ -266,7 +277,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 
     except Exception as e:
         logger.error(f"Критическая ошибка в process_query: {e}", exc_info=True)
-        await placeholder_message.edit_text(f"❌ Произошла серьезная ошибка: {e}")
+        await placeholder_message.edit_text(f"❌ Произошла серьезная ошибка: {str(e)[:500]}") # Обрезаем текст ошибки
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
