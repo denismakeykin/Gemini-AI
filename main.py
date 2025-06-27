@@ -152,44 +152,30 @@ async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> 
 # --- ГЛАВНЫЙ ОБРАБОТЧИК ЗАПРОСОВ К GEMINI (ИСПОЛЬЗУЕТ НАТИВНЫЙ ЧАТ) ---
 async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text_to_process: str, **kwargs):
     client = context.application.gemini_client
-    chat_id = update.effective_chat.id
     
-    # Получаем или создаем нативную сессию чата
     if 'chat_session' not in context.chat_data:
         model_name = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
-        
-        # <<< НОВОЕ: Сборка инструментов
         tools = [get_current_time, types.Tool(code_execution=types.ToolCodeExecution())]
         if get_user_setting(context, 'search_enabled', True):
             tools.append(types.Tool(google_search=types.GoogleSearch()))
-
-        # Создаем чат с системной инструкцией и инструментами
         context.chat_data['chat_session'] = client.chats.create(
             model=f'models/{model_name}',
             history=[],
-            config=types.CreateChatConfig(
-                system_instruction=system_instruction_text,
-                tools=tools,
-                temperature=1.0,
-                max_output_tokens=MAX_OUTPUT_TOKENS,
-            )
+            config=types.CreateChatConfig(system_instruction=system_instruction_text, tools=tools, temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS)
         )
     chat_session = context.chat_data['chat_session']
 
     placeholder_message = await update.message.reply_text("...")
     
-    # Формируем `contents` для отправки
     prompt_text = f"(Текущая дата: {datetime.datetime.now(pytz.timezone(TARGET_TIMEZONE)).strftime('%Y-%m-%d')})\n{USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))}{html.escape(text_to_process)}"
     message_parts = [prompt_text] + kwargs.get('content_parts', [])
 
     try:
-        # <<< ИЗМЕНЕНО: Используем send_message_stream из объекта чата
         stream = chat_session.send_message_stream(message=message_parts)
-        final_text = await stream_and_send_reply(placeholder_message, stream)
+        await stream_and_send_reply(placeholder_message, stream)
     except Exception as e:
         logger.error(f"Критическая ошибка в process_query: {e}", exc_info=True)
-        final_text = f"❌ Произошла серьезная ошибка: {e}"
-        await placeholder_message.edit_text(final_text)
+        await placeholder_message.edit_text(f"❌ Произошла серьезная ошибка: {e}")
 
 # --- ОБРАБОТЧИКИ СООБЩЕНИЙ TELEGRAM ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -198,7 +184,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(start_message, disable_web_page_preview=True)
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'chat_session' in context.chat_data:
-        del context.chat_data['chat_session'] # Удаляем нативную сессию, чтобы следующая началась с чистого листа
+        del context.chat_data['chat_session']
     await update.message.reply_text("🧹 История чата и сессия сброшены.")
 async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_model = get_user_setting(context, 'selected_model', DEFAULT_MODEL)
@@ -209,7 +195,7 @@ async def select_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
     selected = query.data.replace("set_model_", "")
     if selected in AVAILABLE_MODELS:
         set_user_setting(context, 'selected_model', selected)
-        if 'chat_session' in context.chat_data: del context.chat_data['chat_session'] # Сбрасываем сессию при смене модели
+        if 'chat_session' in context.chat_data: del context.chat_data['chat_session']
         await query.edit_message_text(f"Модель установлена: <b>{AVAILABLE_MODELS[selected]}</b>. Сессия сброшена.", parse_mode=ParseMode.HTML)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
