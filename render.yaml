@@ -3,7 +3,7 @@ services:
     name: gemini_ai_new_bot # Можете дать любое имя
     env: python
     plan: free # Важно для бесплатных лимитов
-    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
+    buildCommand: "python -m pip install --upgrade pip && python -m pip install --index-url https://pypi.org/simple/ -r requirements.txt"
     startCommand: "python ./main.py"
     envVars:
       - key: PYTHON_VERSION
