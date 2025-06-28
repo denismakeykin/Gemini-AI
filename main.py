@@ -138,7 +138,7 @@ DEFAULT_MODEL = 'gemini-2.5-flash'
 MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
 MAX_CONTEXT_CHARS = 100000
-THINKING_BUDGET = 24576
+THINKING_BUDGET = 24576 # Эта константа пока не используется напрямую, но оставлена для будущего
 USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow"
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -204,9 +204,9 @@ async def send_reply(target_message: Message, text: str, context: ContextTypes.D
         if "Can't parse entities" in str(e) or "can't parse" in str(e).lower():
             plain_text = re.sub(r'<[^>]*>', '', text)
             plain_chunks = [plain_text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(plain_text), MAX_MESSAGE_LENGTH)]
-            for i, chunk in enumerate(plain_chunks):
-                if i == 0: sent_message = await target_message.reply_text(chunk)
-                else: sent_message = await context.bot.send_message(chat_id=target_message.chat_id, text=chunk)
+            for i_plain, chunk_plain in enumerate(plain_chunks):
+                if i_plain == 0: sent_message = await target_message.reply_text(chunk_plain)
+                else: sent_message = await context.bot.send_message(chat_id=target_message.chat_id, text=chunk_plain)
             return sent_message
     except Exception as e:
         logger.error(f"Непредвиденная ошибка при отправке ответа: {e}", exc_info=True)
@@ -222,20 +222,21 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         
         thinking_mode = context.user_data.get('thinking_mode', 'auto')
         tool_config = None
+        # Примечание: прямое управление бюджетом через SDK ограничено.
+        # Режим 'max' здесь означает, что мы просто подтверждаем использование инструментов,
+        # что само по себе активирует наиболее сложный режим работы модели.
         if thinking_mode == 'max':
-            tool_config = {"function_calling_config": {"mode": "ANY", "allowed_function_names": None}} # This is a placeholder for future detailed control. For now, we enable thinking via tools.
-            logger.info(f"Используется режим мышления, активированный наличием инструментов.")
+            tool_config = types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="ANY"))
+            logger.info("Режим мышления: Максимум (активировано принудительное использование инструментов).")
         else:
-            logger.info("Используется стандартный режим.")
+            logger.info("Режим мышления: Авто.")
 
         request_config = types.GenerateContentConfig(
             temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS,
             system_instruction=system_instruction_text,
-            tools=[types.Tool(google_search=types.GoogleSearch())]
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            tool_config=tool_config
         )
-        if tool_config:
-            request_config.tool_config = tool_config
-
         response = await client.aio.models.generate_content(
             model=f'models/{DEFAULT_MODEL}', contents=context_for_model, config=request_config
         )
@@ -272,10 +273,10 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_mode = context.user_data.get('thinking_mode', 'auto')
     keyboard = [
-        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'auto' else ''}Авто", callback_data="set_thinking_auto")],
-        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'max' else ''}Максимум", callback_data="set_thinking_max")]
+        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'auto' else ''}Авто (Рекомендуется)", callback_data="set_thinking_auto")],
+        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'max' else ''}Максимум (Медленнее)", callback_data="set_thinking_max")]
     ]
-    await update.message.reply_text("Выберите режим размышлений модели (влияет на использование инструментов, таких как поиск):", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Выберите режим размышлений модели:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def select_thinking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -284,8 +285,8 @@ async def select_thinking_callback(update: Update, context: ContextTypes.DEFAULT
     new_mode = 'auto' if choice == 'set_thinking_auto' else 'max'
     context.user_data['thinking_mode'] = new_mode
     keyboard = [
-        [InlineKeyboardButton(f"{'✅ ' if new_mode == 'auto' else ''}Авто", callback_data="set_thinking_auto")],
-        [InlineKeyboardButton(f"{'✅ ' if new_mode == 'max' else ''}Максимум", callback_data="set_thinking_max")]
+        [InlineKeyboardButton(f"{'✅ ' if new_mode == 'auto' else ''}Авто (Рекомендуется)", callback_data="set_thinking_auto")],
+        [InlineKeyboardButton(f"{'✅ ' if new_mode == 'max' else ''}Максимум (Медленнее)", callback_data="set_thinking_max")]
     ]
     text = f"Режим размышлений установлен на: <b>{'Авто' if new_mode == 'auto' else 'Максимум'}</b>."
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
