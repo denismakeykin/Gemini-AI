@@ -220,21 +220,22 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     try:
         context_for_model = build_context_for_model(context.chat_data.get("history", []))
         
-        # Настройка бюджета мышления
         thinking_mode = context.user_data.get('thinking_mode', 'auto')
         tool_config = None
         if thinking_mode == 'max':
-            tool_config = {"thinking_config": {"max_decoding_steps": THINKING_BUDGET, "temperature": 1.0}}
-            logger.info(f"Используется максимальный бюджет мышления: {THINKING_BUDGET} шагов.")
+            tool_config = {"function_calling_config": {"mode": "ANY", "allowed_function_names": None}} # This is a placeholder for future detailed control. For now, we enable thinking via tools.
+            logger.info(f"Используется режим мышления, активированный наличием инструментов.")
         else:
-            logger.info("Используется автоматический бюджет мышления.")
+            logger.info("Используется стандартный режим.")
 
         request_config = types.GenerateContentConfig(
             temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS,
             system_instruction=system_instruction_text,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            tool_config=tool_config
+            tools=[types.Tool(google_search=types.GoogleSearch())]
         )
+        if tool_config:
+            request_config.tool_config = tool_config
+
         response = await client.aio.models.generate_content(
             model=f'models/{DEFAULT_MODEL}', contents=context_for_model, config=request_config
         )
@@ -271,10 +272,10 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_mode = context.user_data.get('thinking_mode', 'auto')
     keyboard = [
-        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'auto' else ''}Авто (Рекомендуется)", callback_data="set_thinking_auto")],
-        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'max' else ''}Максимум (Медленнее)", callback_data="set_thinking_max")]
+        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'auto' else ''}Авто", callback_data="set_thinking_auto")],
+        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'max' else ''}Максимум", callback_data="set_thinking_max")]
     ]
-    await update.message.reply_text("Выберите режим размышлений модели:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Выберите режим размышлений модели (влияет на использование инструментов, таких как поиск):", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def select_thinking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -282,14 +283,13 @@ async def select_thinking_callback(update: Update, context: ContextTypes.DEFAULT
     choice = query.data
     new_mode = 'auto' if choice == 'set_thinking_auto' else 'max'
     context.user_data['thinking_mode'] = new_mode
-    
     keyboard = [
-        [InlineKeyboardButton(f"{'✅ ' if new_mode == 'auto' else ''}Авто (Рекомендуется)", callback_data="set_thinking_auto")],
-        [InlineKeyboardButton(f"{'✅ ' if new_mode == 'max' else ''}Максимум (Медленнее)", callback_data="set_thinking_max")]
+        [InlineKeyboardButton(f"{'✅ ' if new_mode == 'auto' else ''}Авто", callback_data="set_thinking_auto")],
+        [InlineKeyboardButton(f"{'✅ ' if new_mode == 'max' else ''}Максимум", callback_data="set_thinking_max")]
     ]
-    
     text = f"Режим размышлений установлен на: <b>{'Авто' if new_mode == 'auto' else 'Максимум'}</b>."
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+
 
 async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     replied_message = update.message.reply_to_message
@@ -331,11 +331,8 @@ async def summarize_yt_command(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, user = update.message, update.effective_user
     if not message: return
-    
-    parts, text_parts_for_history = [], []
+    parts = []
     content_type, content_id = None, None
-    caption_for_history = ""
-    
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user.id, user_name=html.escape(user.first_name or ''))
     base_text_prompt = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}"
 
@@ -365,7 +362,6 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         except Exception as e:
                             await message.reply_text(f"❌ Не удалось получить исходный контент для повторного анализа: {e}")
                             return
-
     if message.photo:
         content_type, content_id = "image", message.photo[-1].file_id
         file_bytes = await (await context.bot.get_file(content_id)).download_as_bytearray()
@@ -400,7 +396,6 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parts.append({"text": f"{base_text_prompt}{html.escape(f'Анализ файла {doc.file_name}. Комментарий: {caption}')}\n\nТЕКСТ ФАЙЛА:\n{text}"})
     elif message.text:
         parts.append({"text": f"{base_text_prompt}{html.escape(message.text)}"})
-    
     if parts:
         await process_query(update, context, parts, content_type, content_id)
 
