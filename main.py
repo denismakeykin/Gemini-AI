@@ -111,7 +111,6 @@ class PostgresPersistence(BasePersistence):
     async def get_user_data(self) -> defaultdict[int, dict]: return defaultdict(dict)
     async def update_user_data(self, user_id: int, data: dict) -> None: pass
     
-    # --- ИЗМЕНЕНО: Восстановлены обязательные абстрактные методы ---
     async def drop_chat_data(self, chat_id: int) -> None:
         await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"chat_data_{chat_id}",))
     async def drop_user_data(self, user_id: int) -> None:
@@ -182,7 +181,6 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         history.append({"role": "model", "parts": [{"text": reply_text}]})
         context.chat_data['history'] = history[-MAX_HISTORY_MESSAGES:]
         
-        # Используем reply_html для большей надежности с HTML
         await update.message.reply_html(reply_text, disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Ошибка при генерации ответа: {e}", exc_info=True)
@@ -191,6 +189,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я Женя, ваш ассистент. Просто напишите мне, отправьте фото или файл.")
+
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     context.chat_data.clear()
@@ -314,7 +313,6 @@ async def handle_telegram_webhook(request: aiohttp.web.Request):
     except Exception as e:
         logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
         return aiohttp.web.Response(status=500)
-
 async def run_web_server(application: Application, stop_event: asyncio.Event):
     app = aiohttp.web.Application()
     app['bot_app'] = application
@@ -325,7 +323,6 @@ async def run_web_server(application: Application, stop_event: asyncio.Event):
     await site.start()
     await stop_event.wait()
     await runner.cleanup()
-
 async def main():
     persistence = PostgresPersistence(database_url=DATABASE_URL) if DATABASE_URL else None
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
@@ -341,6 +338,9 @@ async def main():
     application.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_and_links))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+
+    # --- ИЗМЕНЕНО: Добавлена инициализация приложения ---
+    await application.initialize()
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
