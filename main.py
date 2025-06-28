@@ -143,7 +143,7 @@ MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
 MAX_CONTEXT_CHARS = 100000
 USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow"
-MEDIA_CONTEXT_TURNS_TTL = 8 # Сколько ходов назад бот будет помнить медиаконтекст
+MEDIA_CONTEXT_TURNS_TTL = 8
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_current_time_str() -> str: return datetime.datetime.now(pytz.timezone(TARGET_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -326,12 +326,15 @@ async def find_and_re_analyze_context(update: Update, context: ContextTypes.DEFA
     if len(history) < 1: return False
 
     last_media_turn = None
-    for i in range(len(history) - 1, -1, -1):
+    # Итерируем с предпоследнего сообщения, т.к. последнее - это текущий запрос
+    for i in range(len(history) - 2, -1, -1):
+        # Ограничиваем глубину поиска, чтобы не уйти слишком далеко
+        if (len(history) - 2 - i) >= MEDIA_CONTEXT_TURNS_TTL: break
+        
         turn = history[i]
         if turn.get("role") == "user" and turn.get("content_type") in ["image", "video", "document", "webpage", "youtube"]:
-            if (len(history) - 1 - i) <= MEDIA_CONTEXT_TURNS_TTL:
-                last_media_turn = turn
-            break
+            last_media_turn = turn
+            break # Нашли - выходим
 
     if not last_media_turn: return False
 
