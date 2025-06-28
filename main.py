@@ -31,9 +31,17 @@ from telegram.error import BadRequest
 
 from google import genai
 from google.genai import types
+from google.generativeai.types import (
+    BlockedPromptException as RealBlockedPromptException, 
+    StopCandidateException as RealStopCandidateException,
+)
 
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from pdfminer.high_level import extract_text
+
+# --- ЗАГЛУШКИ ДЛЯ ОБРАТНОЙ СОВМЕСТИМОСТИ (ЕСЛИ НУЖНО) ---
+BlockedPromptException = RealBlockedPromptException
+StopCandidateException = RealStopCandidateException
 
 try:
     with open('system_prompt.md', 'r', encoding='utf-8') as f:
@@ -43,7 +51,7 @@ except FileNotFoundError:
     logger.critical("Критическая ошибка: файл system_prompt.md не найден!")
     exit(1)
 
-# --- БАЗА ДАННЫХ (НАДЕЖНАЯ ВЕРСИЯ) ---
+# --- БАЗА ДАННЫХ (ИЗ СТАРОГО КОДА, УЛУЧШЕННАЯ) ---
 class PostgresPersistence(BasePersistence):
     def __init__(self, database_url: str):
         super().__init__()
@@ -67,28 +75,33 @@ class PostgresPersistence(BasePersistence):
         else:
              dsn = f"{dsn}?{keepalive_options}"
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=dsn)
-        logger.info(f"Пул соединений с БД (пере)создан. DSN: ...{dsn[-70:]}")
+        logger.info(f"Пул соединений с БД (пере)создан.")
 
 
-    def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=1):
+    def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=3):
         if not self.db_pool: raise ConnectionError("Пул соединений не инициализирован.")
-        try:
-            conn = self.db_pool.getconn()
+        last_exception = None
+        for attempt in range(retries):
+            conn = None
             try:
+                conn = self.db_pool.getconn()
                 with conn.cursor() as cur:
                     cur.execute(query, params)
                     if fetch == "one": return cur.fetchone()
                     if fetch == "all": return cur.fetchall()
                     conn.commit()
-            finally: self.db_pool.putconn(conn)
-        except psycopg2.OperationalError as e:
-            logger.warning(f"Ошибка соединения с БД: {e}. Попытка переподключения...")
-            if retries > 0:
-                self._connect()
-                return self._execute(query, params, fetch, retries - 1)
-            else:
-                logger.error("Не удалось выполнить запрос после переподключения.")
-                raise e
+                return True
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                logger.warning(f"Postgres: Ошибка соединения (попытка {attempt + 1}/{retries}): {e}. Попытка переподключения...")
+                last_exception = e
+                if conn: self.db_pool.putconn(conn, close=True) # Закрываем "сломанный" коннект
+                if attempt < retries - 1: self._connect(); time.sleep(1 + attempt)
+                continue
+            finally:
+                if conn: self.db_pool.putconn(conn)
+        
+        logger.error(f"Postgres: Не удалось выполнить запрос после {retries} попыток. Последняя ошибка: {last_exception}")
+        return None
 
     def _initialize_db(self): self._execute("CREATE TABLE IF NOT EXISTS persistence_data (key TEXT PRIMARY KEY, data BYTEA NOT NULL);")
     def _get_pickled(self, key: str) -> object | None:
@@ -102,18 +115,20 @@ class PostgresPersistence(BasePersistence):
     async def get_chat_data(self) -> defaultdict[int, dict]:
         all_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'chat_data_%';", fetch="all")
         chat_data = defaultdict(dict)
-        for k, d in all_data or []:
-            try: chat_data[int(k.split('_')[-1])] = pickle.loads(d)
-            except (ValueError, IndexError): logger.warning(f"Обнаружен некорректный ключ чата в БД: '{k}'. Запись пропущена.")
+        if all_data:
+            for k, d in all_data:
+                try: chat_data[int(k.split('_')[-1])] = pickle.loads(d)
+                except (ValueError, IndexError): logger.warning(f"Обнаружен некорректный ключ чата в БД: '{k}'. Запись пропущена.")
         return chat_data
     async def update_chat_data(self, chat_id: int, data: dict) -> None: await asyncio.to_thread(self._set_pickled, f"chat_data_{chat_id}", data)
     
     async def get_user_data(self) -> defaultdict[int, dict]:
         all_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'user_data_%';", fetch="all")
         user_data = defaultdict(dict)
-        for k, d in all_data or []:
-            try: user_data[int(k.split('_')[-1])] = pickle.loads(d)
-            except (ValueError, IndexError): logger.warning(f"Обнаружен некорректный ключ пользователя в БД: '{k}'. Запись пропущена.")
+        if all_data:
+            for k, d in all_data:
+                try: user_data[int(k.split('_')[-1])] = pickle.loads(d)
+                except (ValueError, IndexError): logger.warning(f"Обнаружен некорректный ключ пользователя в БД: '{k}'. Запись пропущена.")
         return user_data
     async def update_user_data(self, user_id: int, data: dict) -> None: await asyncio.to_thread(self._set_pickled, f"user_data_{user_id}", data)
     
@@ -169,11 +184,12 @@ def sanitize_telegram_html(raw_html: str) -> str:
     if not raw_html: return ""
     s = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
     s = re.sub(r'<li>', '• ', s, flags=re.IGNORECASE)
-    s = re.sub(r'</?(?!b>|i>|u>|s>|code>|pre>|a>|tg-spoiler>)\w+\s*[^>]*>', '', s)
+    s = re.sub(r'</?(?!b>|i>|u>|s>|code|pre>|a>|tg-spoiler>)\w+\s*[^>]*>', '', s)
     return s.strip()
 
 def html_safe_chunker(text: str, chunk_size: int = 4096) -> list[str]:
     chunks = []
+    if not text: return ['']
     tag_stack = []
     remaining_text = text
     tag_regex = re.compile(r'</?(b|i|u|s|code|pre|a|tg-spoiler)>', re.IGNORECASE)
@@ -262,11 +278,9 @@ async def send_final_reply(placeholder_message: Message, full_text: str, context
     
     sent_message = None
     try:
-        # Редактируем первое сообщение
         await placeholder_message.edit_text(chunks[0])
         sent_message = placeholder_message
         
-        # Отправляем последующие части новыми сообщениями
         if len(chunks) > 1:
             for chunk in chunks[1:]:
                 sent_message = await context.bot.send_message(chat_id=placeholder_message.chat_id, text=chunk, parse_mode=ParseMode.HTML)
