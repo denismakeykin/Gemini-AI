@@ -223,7 +223,6 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         thinking_mode = context.user_data.get('thinking_mode', 'auto')
         tool_config = None
         if thinking_mode == 'max':
-            # Примечание: Это заставляет модель всегда рассматривать вызов функции, что может симулировать более "глубокое" размышление.
             tool_config = types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="ANY"))
             logger.info("Режим мышления: Максимум (активировано принудительное использование инструментов).")
         else:
@@ -288,7 +287,6 @@ async def select_thinking_callback(update: Update, context: ContextTypes.DEFAULT
     ]
     text = f"Режим размышлений установлен на: <b>{'Авто' if new_mode == 'auto' else 'Максимум'}</b>."
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
-
 
 async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     replied_message = update.message.reply_to_message
@@ -454,18 +452,23 @@ async def main():
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, stop_event.set)
-    application, web_task = None, None
+    application, web_server_task = None, None
     try:
-        application, web_task = await setup_bot_and_server(stop_event)
-        await stop_event.wait()
+        application, web_server_task = await setup_bot_and_server(stop_event)
+        stop_wait_task = asyncio.create_task(stop_event.wait())
+        await asyncio.gather(web_server_task, stop_wait_task)
+    except Exception as e:
+        logger.critical(f"Критическая ошибка в main: {e}", exc_info=True)
     finally:
         logger.info("--- Остановка приложения ---")
-        if web_task and not web_task.done(): web_task.cancel()
+        if web_server_task and not web_server_task.done(): 
+            web_server_task.cancel()
         if application:
             if http_client := application.bot_data.get('http_client'):
                 if not http_client.is_closed: await http_client.aclose()
             await application.shutdown()
-            if hasattr(application, 'persistence') and application.persistence: application.persistence.close()
+            if hasattr(application, 'persistence') and application.persistence: 
+                application.persistence.close()
         logger.info("--- Приложение полностью остановлено ---")
 
 if __name__ == '__main__':
