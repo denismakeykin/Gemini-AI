@@ -146,6 +146,7 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     logger.critical("Отсутствуют обязательные переменные окружения!")
     exit(1)
 
+# --- ИЗМЕНЕНО: Строго используем модель gemini-2.5-flash ---
 DEFAULT_MODEL = 'gemini-2.5-flash'
 MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
@@ -224,9 +225,6 @@ def build_context_for_model(chat_history: list) -> list:
         if not repaired_parts:
             continue
         
-        # --- ИЗМЕНЕНО: КРИТИЧЕСКИЙ ФИКС БАГА С TypeError ---
-        # Конструкция `p.text or ''` элегантно заменяет None (у медиа-файлов) на пустую строку,
-        # предотвращая падение `"".join()`.
         entry_text = "".join(p.text or '' for p in repaired_parts)
         entry_chars = len(entry_text)
         
@@ -319,11 +317,11 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         )
         
         logger.info(f"Отправка запроса к модели {DEFAULT_MODEL}...")
-        stream = await client.generative_models.generate_content(
-            model_name=f"models/{DEFAULT_MODEL}",
+        # --- ИЗМЕНЕНО: Унифицированный и корректный вызов стриминга ---
+        stream = await client.aio.models.generate_content_stream(
+            model=DEFAULT_MODEL,
             contents=context_for_model,
-            generation_config=request_config,
-            stream=True
+            config=request_config
         )
         
         logger.info("Начало стриминга ответа...")
@@ -340,7 +338,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Команда /start от пользователя {update.effective_user.id} в чате {update.effective_chat.id}")
     start_message = (
-        "Я - Женя, лучший ИИ-ассистент на базе Google GEMINI 2.5 Flash:\n"
+        f"Я - Женя, лучший ИИ-ассистент на базе Google <b>{DEFAULT_MODEL}</b>:\n"
         "• 💬 Веду диалог, понимаю контекст, анализирую данные\n"
         "• 🎤 Понимаю голосовые сообщения, могу переводить в текст\n"
         "• 🖼 Анализирую изображения и видео (до 20 мб)\n"
@@ -390,8 +388,9 @@ async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     file_bytes = await (await replied_message.voice.get_file()).download_as_bytearray()
     client = context.bot_data['gemini_client']
     try:
-        model = client.generative_models(DEFAULT_MODEL)
-        response = await model.generate_content_async(
+        # --- ИЗМЕНЕНО: Унифицированный и корректный вызов ---
+        response = await client.aio.models.generate_content(
+            model=DEFAULT_MODEL,
             contents=[types.Part(text="Расшифруй это аудио и верни только текст."), types.Part(inline_data=types.Blob(mime_type=replied_message.voice.mime_type, data=file_bytes))]
         )
         await update.message.reply_text(f"<b>Транскрипт:</b>\n{html.escape(response.text)}", parse_mode=ParseMode.HTML)
@@ -508,8 +507,8 @@ async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT
     extraction_prompt = "Проанализируй это изображение. Если на нем есть хорошо читаемый текст, извлеки его. Если текста нет, опиши ключевые объекты 1-3 словами. Ответ должен быть ОЧЕНЬ коротким и содержать только текст или слова, подходящие для веб-поиска."
     search_query = None
     try:
-        model = client.generative_models(DEFAULT_MODEL)
-        response_extract = await model.generate_content_async(contents=[types.Part(text=extraction_prompt), media_part])
+        # --- ИЗМЕНЕНО: Унифицированный и корректный вызов ---
+        response_extract = await client.aio.models.generate_content(model=DEFAULT_MODEL, contents=[types.Part(text=extraction_prompt), media_part])
         search_query = response_extract.text.strip()
     except Exception as e:
         logger.warning(f"Ошибка при извлечении ключевых слов с фото: {e}")
@@ -549,7 +548,7 @@ async def worker(application: Application, update_queue: asyncio.Queue):
         try:
             update_json = await update_queue.get()
             logger.info("Воркер получил новое обновление из очереди.")
-            update = Update.de_json(json.loads(update_json) if isinstance(update_json, str) else update_json, application.bot)
+            update = Update.de_json(update_json, application.bot)
             await application.process_update(update)
             update_queue.task_done()
         except asyncio.CancelledError:
@@ -618,8 +617,11 @@ async def main():
         await application.initialize()
         logger.info("Приложение инициализировано.")
 
-        genai.configure(api_key=GOOGLE_API_KEY)
-        application.bot_data['gemini_client'] = genai
+        # --- ИЗМЕНЕНО: КРИТИЧЕСКИЙ ФИКС ОШИБКИ ИНИЦИАЛИЗАЦИИ ---
+        # Убран неверный вызов genai.configure().
+        # Создаем клиент напрямую, передавая ему ключ API.
+        client = genai.Client(api_key=GOOGLE_API_KEY)
+        application.bot_data['gemini_client'] = client
         
         application.bot_data['http_client'] = httpx.AsyncClient()
         logger.info("API клиенты (Gemini, HTTPX) успешно созданы и добавлены в bot_data.")
