@@ -224,12 +224,11 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         sent_message = await message.reply_text(full_reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         
         # Обновляем историю
-        context.chat_data["history"] = response.prompt.history.to_pydantic()[-MAX_HISTORY_MESSAGES:]
+        context.chat_data["history"] = [h.to_dict() for h in response.prompt.history]
         
     except Exception as e:
         logger.error(f"Критическая ошибка в process_query: {e}", exc_info=True)
         await message.reply_text(f"❌ Произошла серьезная ошибка: {str(e)[:500]}")
-
 
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -277,7 +276,8 @@ async def handle_text_or_voice(update: Update, context: ContextTypes.DEFAULT_TYP
     await process_query(update, context, user_text, content_parts=None, content_id=None)
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, user = update.message, update.effective_user
+    message = update.message
+    user = update.effective_user
     caption = message.caption or "Подробно опиши этот медиафайл."
     
     if message.photo:
@@ -309,11 +309,90 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- НАСТРОЙКА И ЗАПУСК БОТА ---
 async def setup_bot_and_server(stop_event: asyncio.Event):
-    # ... (код без изменений)
+    persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
+    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
+    if persistence: builder.persistence(persistence)
+    application = builder.build()
+    await application.initialize()
+    
+    client = genai.Client()
+    application.bot_data['gemini_client'] = client
+    application.bot_data['http_client'] = httpx.AsyncClient()
+
+    commands = [
+        BotCommand("start", "Инфо и помощь"),
+        BotCommand("clear", "Очистить историю"),
+        BotCommand("thinking", "Настроить режим размышлений"),
+        # Команда transcribe убрана, т.к. ее логика теперь в основном хендлере
+        BotCommand("summarize_yt", "Конспект видео YouTube"),
+        BotCommand("summarize_url", "Выжимка из статьи по ссылке")
+    ]
+    handlers = [
+        CommandHandler("start", start),
+        CommandHandler("clear", clear_history),
+        CommandHandler("thinking", thinking_command),
+        CommandHandler("summarize_url", summarize_url_command),
+        CommandHandler("summarize_yt", summarize_yt_command),
+        CallbackQueryHandler(select_thinking_callback, pattern="^set_thinking_"),
+        MessageHandler(filters.PHOTO | filters.VIDEO, handle_media),
+        MessageHandler(filters.Document, handle_document),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_or_voice),
+        MessageHandler(filters.VOICE, handle_text_or_voice)
+    ]
+    application.add_handlers(handlers)
+    await application.bot.set_my_commands(commands)
+    webhook_url = f"{WEBHOOK_HOST.rstrip('/')}/{GEMINI_WEBHOOK_PATH.strip('/')}"
+    await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES, secret_token=os.getenv('WEBHOOK_SECRET_TOKEN'))
+    logger.info(f"Вебхук установлен: {webhook_url}")
+    return application, asyncio.create_task(run_web_server(application, stop_event))
+
 async def run_web_server(application: Application, stop_event: asyncio.Event):
-    # ... (код без изменений)
+    app = aiohttp.web.Application()
+    async def webhook_handler(request: aiohttp.web.Request):
+        secret = os.getenv('WEBHOOK_SECRET_TOKEN')
+        if secret and request.headers.get('X-Telegram-Bot-Api-Secret-Token') != secret: return aiohttp.web.Response(status=403)
+        try:
+            await application.process_update(Update.de_json(await request.json(), application.bot))
+            return aiohttp.web.Response(status=200)
+        except Exception as e:
+            logger.error(f"Ошибка вебхука: {e}", exc_info=True)
+            return aiohttp.web.Response(status=500)
+    app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), webhook_handler)
+    app.router.add_get('/', lambda r: aiohttp.web.Response(text="Bot is running"))
+    
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, os.getenv("HOST", "0.0.0.0"), int(os.getenv("PORT", "10000")))
+    
+    try:
+        await site.start()
+        logger.info(f"Веб-сервер запущен на порту {os.getenv('PORT', '10000')}")
+        await stop_event.wait()
+    finally:
+        await runner.cleanup()
+        logger.info("Веб-сервер остановлен.")
+
 async def main():
-    # ... (код без изменений)
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, stop_event.set)
+    application, web_task = None, None
+    try:
+        application, web_task = await setup_bot_and_server(stop_event)
+        await stop_event.wait()
+    finally:
+        logger.info("--- Остановка приложения ---")
+        if web_task and not web_task.done(): web_task.cancel()
+        if application:
+            if http_client := application.bot_data.pop('http_client', None):
+                if not http_client.is_closed:
+                    await http_client.aclose()
+            application.bot_data.pop('gemini_client', None)
+            
+            await application.shutdown()
+            if hasattr(application, 'persistence') and application.persistence:
+                application.persistence.close()
+        logger.info("--- Приложение полностью остановлено ---")
 
 if __name__ == '__main__':
     try:
