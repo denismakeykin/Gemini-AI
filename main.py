@@ -23,9 +23,9 @@ logger = logging.getLogger(__name__)
 
 import aiohttp
 import aiohttp.web
-from telegram import Update, Message, BotCommand
+from telegram import Update, Message, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, BasePersistence
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, BasePersistence, CallbackQueryHandler
 from telegram.error import BadRequest
 
 from google import genai
@@ -42,7 +42,7 @@ except FileNotFoundError:
     logger.critical("Критическая ошибка: файл system_prompt.md не найден!")
     exit(1)
 
-# --- БАЗА ДАННЫХ (НАДЕЖНАЯ ВЕРСИЯ) ---
+# --- БАЗА ДАННЫХ (НАДЕЖНАЯ ВЕРСИЯ С ПОЛНЫМ КОНТРАКТОМ) ---
 class PostgresPersistence(BasePersistence):
     def __init__(self, database_url: str):
         super().__init__()
@@ -67,7 +67,6 @@ class PostgresPersistence(BasePersistence):
              dsn = f"{dsn}?{keepalive_options}"
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=dsn)
         logger.info(f"Пул соединений с БД (пере)создан. DSN: ...{dsn[-70:]}")
-
 
     def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=1):
         if not self.db_pool: raise ConnectionError("Пул соединений не инициализирован.")
@@ -120,6 +119,15 @@ class PostgresPersistence(BasePersistence):
     def close(self):
         if self.db_pool: self.db_pool.closeall()
 
+    # --- НОВЫЕ ОБЯЗАТЕЛЬНЫЕ МЕТОДЫ-ЗАГЛУШКИ ---
+    async def drop_user_data(self, user_id: int) -> None:
+        await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"user_data_{user_id}",))
+    async def get_callback_data(self) -> dict | None: return None
+    async def update_callback_data(self, data: dict) -> None: pass
+    async def get_conversations(self, name: str) -> dict: return {}
+    async def update_conversation(self, name: str, key: tuple, new_state: object | None) -> None: pass
+
+
 # --- КОНФИГУРАЦИЯ БОТА ---
 TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PATH, DATABASE_URL = map(os.getenv, ['TELEGRAM_BOT_TOKEN', 'GOOGLE_API_KEY', 'WEBHOOK_HOST', 'GEMINI_WEBHOOK_PATH', 'DATABASE_URL'])
 if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PATH]):
@@ -130,6 +138,7 @@ DEFAULT_MODEL = 'gemini-2.5-flash'
 MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
 MAX_CONTEXT_CHARS = 100000
+THINKING_BUDGET = 24576
 USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow"
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -210,10 +219,21 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     client = context.bot_data['gemini_client']
     try:
         context_for_model = build_context_for_model(context.chat_data.get("history", []))
+        
+        # Настройка бюджета мышления
+        thinking_mode = context.user_data.get('thinking_mode', 'auto')
+        tool_config = None
+        if thinking_mode == 'max':
+            tool_config = {"thinking_config": {"max_decoding_steps": THINKING_BUDGET, "temperature": 1.0}}
+            logger.info(f"Используется максимальный бюджет мышления: {THINKING_BUDGET} шагов.")
+        else:
+            logger.info("Используется автоматический бюджет мышления.")
+
         request_config = types.GenerateContentConfig(
             temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS,
             system_instruction=system_instruction_text,
-            tools=[types.Tool(google_search=types.GoogleSearch())]
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            tool_config=tool_config
         )
         response = await client.aio.models.generate_content(
             model=f'models/{DEFAULT_MODEL}', contents=context_for_model, config=request_config
@@ -228,24 +248,48 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_message = (
-        "Я - Женя, лучший ИИ-ассистент на базе Google GEMINI 2.5 Flash.\n\n"
-        "• 💬 Веду диалог, понимаю контекст, анализирую данные\n\n"
+        "Я - Женя, лучший ИИ-ассистент на базе Google GEMINI 2.5 Flash:\n\n"
+        "• 💬 Веду диалог, понимаю контекст, анализирую данные\n"
         "• 🎤 Понимаю голосовые сообщения, могу переводить в текст\n"
-        "• 🖼️ Анализирую изображения и видео (до 20 мб)\n"
+        "• 🖼 Анализирую изображения и видео (до 20 мб)\n"
         "• 📄 Читаю репосты, txt, pdf и веб-страницы\n"
         "• 🌐 Использую умный Google-поиск и огромный объем собственных знаний\n\n"
         "<b>Команды:</b>\n"
         "/transcribe - <i>(в ответе на голосовое)</i> Расшифровать аудио\n"
         "/summarize_yt <i><ссылка></i> - Конспект видео с YouTube\n"
         "/summarize_url <i><ссылка></i> - Выжимка из статьи\n"
+        "/thinking - Настроить режим размышлений\n"
         "/clear - Очистить историю чата\n\n"
-        "(!) Пользуясь данным ботом, вы автоматически соглашаетесь на отправку ваших сообщений через Google Gemini API для получения ответов."
+        "(!) Пользуясь ботом, вы автоматически соглашаетесь на отправку сообщений для получения ответов через Google Gemini API."
     )
     await update.message.reply_text(start_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.clear()
     await update.message.reply_text("🧹 История этого чата очищена.")
+
+async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current_mode = context.user_data.get('thinking_mode', 'auto')
+    keyboard = [
+        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'auto' else ''}Авто (Рекомендуется)", callback_data="set_thinking_auto")],
+        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'max' else ''}Максимум (Медленнее)", callback_data="set_thinking_max")]
+    ]
+    await update.message.reply_text("Выберите режим размышлений модели:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def select_thinking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+    new_mode = 'auto' if choice == 'set_thinking_auto' else 'max'
+    context.user_data['thinking_mode'] = new_mode
+    
+    keyboard = [
+        [InlineKeyboardButton(f"{'✅ ' if new_mode == 'auto' else ''}Авто (Рекомендуется)", callback_data="set_thinking_auto")],
+        [InlineKeyboardButton(f"{'✅ ' if new_mode == 'max' else ''}Максимум (Медленнее)", callback_data="set_thinking_max")]
+    ]
+    
+    text = f"Режим размышлений установлен на: <b>{'Авто' if new_mode == 'auto' else 'Максимум'}</b>."
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
 
 async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     replied_message = update.message.reply_to_message
@@ -288,8 +332,7 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     message, user = update.message, update.effective_user
     if not message: return
     
-    parts = []
-    text_parts_for_history = []
+    parts, text_parts_for_history = [], []
     content_type, content_id = None, None
     caption_for_history = ""
     
@@ -297,19 +340,16 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     base_text_prompt = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}"
 
     if message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id:
-        # Логика ответов на сообщения бота
         history = context.chat_data.get("history", [])
         for i in range(len(history) - 1, -1, -1):
             if history[i].get("bot_message_id") == message.reply_to_message.message_id:
                 prev_user_turn = history[i-1] if i > 0 else None
                 if prev_user_turn and prev_user_turn.get("role") == "user":
-                    content_type = prev_user_turn.get("content_type")
-                    content_id = prev_user_turn.get("content_id")
+                    content_type, content_id = prev_user_turn.get("content_type"), prev_user_turn.get("content_id")
                     if content_type and content_id:
                         await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
                         prompt_text = f"Это уточняющий вопрос к предыдущему контенту. Пользователь спрашивает: '{message.text}'. Проанализируй исходный материал еще раз и ответь."
                         parts.append({"text": prompt_text})
-                        caption_for_history = prompt_text
                         try:
                             if content_type in ["image", "video", "voice"]:
                                 file_bytes = await(await context.bot.get_file(content_id)).download_as_bytearray()
@@ -320,8 +360,6 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                                 file_bytes = await(await context.bot.get_file(content_id)).download_as_bytearray()
                                 doc_text = file_bytes.decode('utf-8', 'ignore')
                                 parts[0]["text"] += f"\n\nТЕКСТ ИСХОДНОГО ДОКУМЕНТА:\n{doc_text}"
-                                caption_for_history = parts[0]["text"]
-
                             await process_query(update, context, parts, content_type, content_id)
                             return
                         except Exception as e:
@@ -333,21 +371,18 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         file_bytes = await (await context.bot.get_file(content_id)).download_as_bytearray()
         parts.append(types.Part(inline_data=types.Blob(mime_type='image/jpeg', data=file_bytes)))
         caption = message.caption or "Опиши это изображение."
-        caption_for_history = caption
         parts.insert(0, {"text": f"{base_text_prompt}{html.escape(caption)}"})
     elif message.video:
         content_type, content_id = "video", message.video.file_id
         file_bytes = await (await context.bot.get_file(content_id)).download_as_bytearray()
         parts.append(types.Part(inline_data=types.Blob(mime_type=message.video.mime_type, data=file_bytes)))
         caption = message.caption or "Опиши это видео."
-        caption_for_history = caption
         parts.insert(0, {"text": f"{base_text_prompt}{html.escape(caption)}"})
     elif message.voice:
         content_type, content_id = "voice", message.voice.file_id
         file_bytes = await (await context.bot.get_file(content_id)).download_as_bytearray()
         parts.append(types.Part(inline_data=types.Blob(mime_type=message.voice.mime_type, data=file_bytes)))
         caption = "Расшифруй это голосовое сообщение и ответь на него."
-        caption_for_history = caption
         parts.insert(0, {"text": f"{base_text_prompt}{html.escape(caption)}"})
     elif message.document:
         doc = message.document
@@ -362,10 +397,8 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             try: text = file_bytes.decode('utf-8')
             except UnicodeDecodeError: text = file_bytes.decode('cp1251', errors='ignore')
         caption = message.caption or "Проанализируй содержимое этого файла."
-        caption_for_history = f"Анализ файла {doc.file_name}. Комментарий: {caption}"
-        parts.append({"text": f"{base_text_prompt}{html.escape(caption_for_history)}\n\nТЕКСТ ФАЙЛА:\n{text}"})
+        parts.append({"text": f"{base_text_prompt}{html.escape(f'Анализ файла {doc.file_name}. Комментарий: {caption}')}\n\nТЕКСТ ФАЙЛА:\n{text}"})
     elif message.text:
-        caption_for_history = message.text
         parts.append({"text": f"{base_text_prompt}{html.escape(message.text)}"})
     
     if parts:
@@ -383,15 +416,18 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
     commands = [
         BotCommand("start", "Инфо и помощь"),
         BotCommand("clear", "Очистить историю"),
+        BotCommand("thinking", "Настроить режим размышлений"),
         BotCommand("transcribe", "Расшифровать аудио (ответом)"),
         BotCommand("summarize_yt", "Конспект видео YouTube"),
         BotCommand("summarize_url", "Выжимка из статьи по ссылке")
     ]
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("clear", clear_history))
+    application.add_handler(CommandHandler("thinking", thinking_command))
     application.add_handler(CommandHandler("transcribe", transcribe_command))
     application.add_handler(CommandHandler("summarize_url", summarize_url_command))
     application.add_handler(CommandHandler("summarize_yt", summarize_yt_command))
+    application.add_handler(CallbackQueryHandler(select_thinking_callback, pattern="^set_thinking_"))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_any_message))
     await application.bot.set_my_commands(commands)
     webhook_url = f"{WEBHOOK_HOST.rstrip('/')}/{GEMINI_WEBHOOK_PATH.strip('/')}"
