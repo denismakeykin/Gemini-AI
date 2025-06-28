@@ -296,17 +296,20 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     try:
         context_for_model = build_context_for_model(context.chat_data.get("history", []))
 
+        # ИЗМЕНЕНО: Создание thinking_config через специальный класс types.ThinkingConfig
         thinking_budget_mode = context.user_data.get('thinking_budget', 'auto')
-        thinking_config = {'mode': 'auto'}
+        thinking_kwargs = {'mode': 'auto'}
         if thinking_budget_mode == 'max':
-            thinking_config = {'budget': 24576, 'mode': 'auto'}
+            thinking_kwargs['budget'] = 24576
             logger.info("Используется максимальный бюджет мышления (24576).")
+        thinking_config_obj = types.ThinkingConfig(**thinking_kwargs)
 
         request_config = types.GenerateContentConfig(
-            temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS,
+            temperature=1.0, 
+            max_output_tokens=MAX_OUTPUT_TOKENS,
             system_instruction=system_instruction_text,
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            thinking_config=thinking_config
+            thinking_config=thinking_config_obj  # ИЗМЕНЕНО: Передаем объект правильного типа
         )
         
         logger.info(f"Отправка запроса к модели {DEFAULT_MODEL}...")
@@ -583,11 +586,9 @@ async def main():
     try:
         web_task = asyncio.create_task(run_web_server(update_queue, stop_event))
 
-        # ИЗМЕНЕНО: Порядок действий исправлен
         await application.initialize()
         logger.info("Приложение инициализировано.")
 
-        # Добавляем "живые" клиенты ПОСЛЕ инициализации
         application.bot_data['gemini_client'] = genai.Client()
         application.bot_data['http_client'] = httpx.AsyncClient()
         logger.info("API клиенты (Gemini, HTTPX) успешно созданы и добавлены в bot_data.")
