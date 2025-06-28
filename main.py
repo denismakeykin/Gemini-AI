@@ -163,6 +163,8 @@ async def fetch_webpage_content(url: str, session: httpx.AsyncClient) -> str | N
     except Exception as e:
         logger.error(f"Ошибка скрапинга {url}: {e}")
         return None
+
+# --- ФУНКЦИИ-ВЕРСТАЛЬЩИКИ ДЛЯ TELEGRAM ---
 def sanitize_telegram_html(raw_html: str) -> str:
     if not raw_html: return ""
     s = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
@@ -170,6 +172,40 @@ def sanitize_telegram_html(raw_html: str) -> str:
     s = re.sub(r'</?(?!b>|i>|u>|s>|code>|pre>|a>|tg-spoiler>)\w+\s*[^>]*>', '', s)
     return s.strip()
 
+def html_safe_chunker(text: str, chunk_size: int = 4096) -> list[str]:
+    chunks = []
+    tag_stack = []
+    remaining_text = text
+    tag_regex = re.compile(r'</?(b|i|u|s|code|pre|a|tg-spoiler)>', re.IGNORECASE)
+
+    while remaining_text:
+        if len(remaining_text) <= chunk_size:
+            chunks.append(remaining_text)
+            break
+        
+        split_pos = remaining_text.rfind('\n', 0, chunk_size)
+        if split_pos == -1: split_pos = chunk_size
+
+        current_chunk = remaining_text[:split_pos]
+        
+        temp_stack = list(tag_stack)
+        for match in tag_regex.finditer(current_chunk):
+            tag_name = match.group(1).lower()
+            if f'</{tag_name}>' == match.group(0).lower():
+                if temp_stack and temp_stack[-1] == tag_name: temp_stack.pop()
+            else:
+                temp_stack.append(tag_name)
+        
+        closing_tags = ''.join(f'</{tag}>' for tag in reversed(temp_stack))
+        chunks.append(current_chunk + closing_tags)
+        
+        tag_stack = temp_stack
+        opening_tags = ''.join(f'<{tag}>' for tag in tag_stack)
+        remaining_text = opening_tags + remaining_text[split_pos:].lstrip()
+
+    return chunks
+
+# --- ЛОГИКА ИСТОРИИ И КОНТЕКСТА ---
 async def _add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list, **kwargs):
     history = context.chat_data.setdefault("history", [])
     entry = {"role": role, "parts": parts, **kwargs}
@@ -192,7 +228,7 @@ def build_context_for_model(chat_history: list) -> list:
         current_chars += entry_chars
     return context_for_model
 
-# --- НОВЫЙ МЕХАНИЗМ СТРИМИНГА И ОБРАБОТКИ ---
+# --- ФУНКЦИИ ОТВЕТА ---
 async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> str:
     full_text, buffer, last_edit_time = "", "", time.time()
     try:
@@ -215,12 +251,31 @@ async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> 
     except Exception as e:
         logger.error(f"Ошибка стриминга: {e}", exc_info=True)
         final_text = full_text + buffer + f"\n\n[❌ Ошибка стриминга: {str(e)[:100]}]"
-    
-    sanitized_final = sanitize_telegram_html(final_text)
-    if sanitized_final != message_to_edit.text.removesuffix(" ▌"):
-         await message_to_edit.edit_text(sanitized_final)
     return final_text
 
+async def send_final_reply(placeholder_message: Message, full_text: str, context: ContextTypes.DEFAULT_TYPE) -> Message:
+    sanitized_text = sanitize_telegram_html(full_text)
+    if not sanitized_text.strip(): sanitized_text = "🤖 Модель не дала ответа."
+    
+    chunks = html_safe_chunker(sanitized_text)
+    
+    sent_message = None
+    try:
+        # Редактируем первое сообщение
+        await placeholder_message.edit_text(chunks[0])
+        sent_message = placeholder_message
+        
+        # Отправляем последующие части новыми сообщениями
+        if len(chunks) > 1:
+            for chunk in chunks[1:]:
+                sent_message = await context.bot.send_message(chat_id=placeholder_message.chat_id, text=chunk, parse_mode=ParseMode.HTML)
+                await asyncio.sleep(0.1) # Небольшая задержка, чтобы не спамить
+    except Exception as e:
+        logger.error(f"Критическая ошибка при финальной отправке ответа: {e}", exc_info=True)
+    
+    return sent_message or placeholder_message # Возвращаем последнее отправленное сообщение
+
+# --- ГЛАВНЫЙ ПРОЦЕССОР ЗАПРОСОВ ---
 async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list, content_type: str = None, content_id: str = None):
     message, user = update.message, update.effective_user
     await _add_to_history(context, "user", prompt_parts, user_id=user.id, message_id=message.message_id, content_type=content_type, content_id=content_id)
@@ -231,13 +286,10 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         context_for_model = build_context_for_model(context.chat_data.get("history", []))
         
         thinking_budget_mode = context.user_data.get('thinking_budget', 'auto')
-        thinking_config = {}
+        thinking_config = {'mode': 'auto'}
         if thinking_budget_mode == 'max':
-            thinking_config['budget'] = 24576
+            thinking_config = {'budget': 24576, 'mode': 'auto'} # Режим авто нужен даже с бюджетом
             logger.info("Используется максимальный бюджет мышления (24576).")
-        else:
-            thinking_config['mode'] = 'auto'
-            logger.info("Используется автоматический бюджет мышления.")
 
         request_config = types.GenerateContentConfig(
             temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS,
@@ -249,7 +301,12 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
             model=f'models/{DEFAULT_MODEL}', contents=context_for_model, config=request_config
         )
         full_reply_text = await stream_and_send_reply(placeholder_message, stream)
-        await _add_to_history(context, "model", [{"text": full_reply_text}], bot_message_id=placeholder_message.message_id)
+        
+        # Финальная отправка с нарезкой
+        final_message = await send_final_reply(placeholder_message, full_reply_text, context)
+
+        await _add_to_history(context, "model", [{"text": full_reply_text}], bot_message_id=final_message.message_id)
+
     except Exception as e:
         logger.error(f"Критическая ошибка в process_query: {e}", exc_info=True)
         await placeholder_message.edit_text(f"❌ Произошла серьезная ошибка: {str(e)[:500]}")
