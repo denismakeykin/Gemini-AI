@@ -43,7 +43,7 @@ except FileNotFoundError:
     logger.critical("Критическая ошибка: файл system_prompt.md не найден!")
     exit(1)
 
-# --- БАЗА ДАННЫХ (ИЗ СТАРОГО КОДА, УЛУЧШЕННАЯ) ---
+# --- БАЗА ДАННЫХ (НАДЕЖНАЯ ВЕРСИЯ) ---
 class PostgresPersistence(BasePersistence):
     def __init__(self, database_url: str):
         super().__init__()
