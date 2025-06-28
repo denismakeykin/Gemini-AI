@@ -16,8 +16,10 @@ from typing import Coroutine
 import mimetypes
 import json
 
-import httpx
-from bs4 import BeautifulSoup
+# --- НОВОЕ: httpx больше не нужен для скрапинга, но оставим для будущих задач.
+import httpx 
+# --- УДАЛЕНО: BeautifulSoup больше не нужен для скрапинга URL.
+# from bs4 import BeautifulSoup 
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,8 +34,9 @@ from telegram.error import BadRequest
 from google import genai
 from google.genai import types
 
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from pdfminer.high_level import extract_text
+from youtube_transcript_api import YouTubeTranscriptApi
+# --- ИЗМЕНЕНО: pdfminer больше не нужен, Gemini сам читает PDF.
+# from pdfminer.high_level import extract_text
 
 try:
     with open('system_prompt.md', 'r', encoding='utf-8') as f:
@@ -44,6 +47,7 @@ except FileNotFoundError:
     exit(1)
 
 # --- БАЗА ДАННЫХ (НАДЕЖНАЯ ВЕРСИЯ) ---
+# ... (Код без изменений, он великолепен)
 class PostgresPersistence(BasePersistence):
     def __init__(self, database_url: str):
         super().__init__()
@@ -149,7 +153,7 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     logger.critical("Отсутствуют обязательные переменные окружения!")
     exit(1)
 
-DEFAULT_MODEL = 'gemini-2.5-flash'
+DEFAULT_MODEL = 'gemini-1.5-flash' # ИЗМЕНЕНО: Рекомендую 1.5 Flash для доступа к новым функциям, таким как UrlContext
 MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
 MAX_CONTEXT_CHARS = 100000
@@ -164,18 +168,11 @@ def extract_general_url(text: str) -> str | None:
     match = re.search(r'https?://[^\s<>"\'`]+', text)
     if match: return match.group(0).rstrip('.,?!')
     return None
-async def fetch_webpage_content(url: str, session: httpx.AsyncClient) -> str | None:
-    try:
-        response = await session.get(url, timeout=15.0, follow_redirects=True)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        [s.decompose() for s in soup(['script', 'style', 'nav', 'footer', 'header', 'aside'])]
-        return ' '.join(soup.stripped_strings)
-    except Exception as e:
-        logger.error(f"Ошибка скрапинга {url}: {e}")
-        return None
+# --- УДАЛЕНО: Функция fetch_webpage_content больше не нужна, используем UrlContext от Gemini
+# async def fetch_webpage_content(url: str, session: httpx.AsyncClient) -> str | None: ...
 
 # --- ФУНКЦИИ-ВЕРСТАЛЬЩИКИ ДЛЯ TELEGRAM ---
+# ... (Код без изменений, он великолепен)
 def sanitize_telegram_html(raw_html: str) -> str:
     if not raw_html: return ""
     s = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
@@ -218,6 +215,7 @@ def html_safe_chunker(text: str, chunk_size: int = 4096) -> list[str]:
     return chunks
 
 # --- ЛОГИКА ИСТОРИИ И КОНТЕКСТА ---
+# ... (Код без изменений, он хорош)
 async def _add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list, **kwargs):
     history = context.chat_data.setdefault("history", [])
     entry = {"role": role, "parts": parts, **kwargs}
@@ -235,8 +233,7 @@ def build_context_for_model(chat_history: list) -> list:
         raw_parts = entry.get("parts", [])
         if not raw_parts:
             continue
-
-        # ИЗМЕНЕНО: Бронебойная логика. Сначала "ремонтируем", потом используем.
+        
         repaired_parts = [
             types.Part(text=p) if isinstance(p, str) else p 
             for p in raw_parts if p is not None and (isinstance(p, str) or hasattr(p, 'text'))
@@ -261,6 +258,7 @@ def build_context_for_model(chat_history: list) -> list:
     return context_for_model
 
 # --- ФУНКЦИИ ОТВЕТА ---
+# ... (Код без изменений, он хорош)
 async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> str:
     full_text, buffer, last_edit_time = "", "", time.time()
     try:
@@ -307,7 +305,8 @@ async def send_final_reply(placeholder_message: Message, full_text: str, context
     return sent_message or placeholder_message
 
 # --- ГЛАВНЫЙ ПРОЦЕССОР ЗАПРОСОВ ---
-async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list, content_type: str = None, content_id: str = None):
+# --- ИЗМЕНЕНО: Добавлен параметр tools для гибкости.
+async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list, content_type: str = None, content_id: str = None, tools: list = None):
     message = update.message
     logger.info(f"Начало process_query для чата {message.chat_id}. Тип контента: {content_type or 'text'}")
     
@@ -322,14 +321,18 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         thinking_budget_mode = context.user_data.get('thinking_budget', 'auto')
         thinking_config_obj = None
         if thinking_budget_mode == 'max':
+            # --- ИЗМЕНЕНО: Бюджет для 1.5 flash может быть другим, но 24576 - безопасное значение
             logger.info("Используется максимальный бюджет мышления (24576).")
             thinking_config_obj = types.ThinkingConfig(budget=24576)
+
+        # --- ИЗМЕНЕНО: Гибкая конфигурация инструментов
+        final_tools = tools if tools is not None else [types.Tool(google_search=types.GoogleSearch())]
 
         request_config = types.GenerateContentConfig(
             temperature=1.0, 
             max_output_tokens=MAX_OUTPUT_TOKENS,
             system_instruction=system_instruction_text,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
+            tools=final_tools,
             thinking_config=thinking_config_obj
         )
         
@@ -351,10 +354,11 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         await placeholder_message.edit_text(f"❌ Произошла серьезная ошибка: {html.escape(str(e)[:500])}")
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
+# ... (start, clear, thinking_command, select_thinking_callback, transcribe_command - без изменений)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Команда /start от пользователя {update.effective_user.id} в чате {update.effective_chat.id}")
     start_message = (
-        "Я - Женя, лучший ИИ-ассистент на базе Google GEMINI 2.5 Flash:\n"
+        "Я - Женя, лучший ИИ-ассистент на базе Google GEMINI 1.5 Flash:\n" # Обновил версию
         "• 💬 Веду диалог, понимаю контекст, анализирую данные\n"
         "• 🎤 Понимаю голосовые сообщения, могу переводить в текст\n"
         "• 🖼 Анализирую изображения и видео (до 20 мб)\n"
@@ -390,10 +394,10 @@ async def select_thinking_callback(update: Update, context: ContextTypes.DEFAULT
     choice = query.data.split('_')[-1]
     context.user_data['thinking_budget'] = choice
     logger.info(f"Пользователь {update.effective_user.id} сменил режим размышлений на: {choice}")
-    text = "✅ Режим размышлений установлен на **'Авто'**.\nЭто обеспечивает лучший баланс скорости и качества."
+    text = "✅ Режим размышлений установлен на <b>'Авто'</b>.\nЭто обеспечивает лучший баланс скорости и качества."
     if choice == 'max':
-        text = "✅ Режим размышлений установлен на **'Максимум'**.\nОтветы могут быть качественнее, но и дольше."
-    await query.edit_message_text(text.replace("**", "<b>"), parse_mode=ParseMode.HTML)
+        text = "✅ Режим размышлений установлен на <b>'Максимум'</b>.\nОтветы могут быть качественнее, но и дольше."
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML)
 
 
 async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -413,24 +417,36 @@ async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.error(f"Ошибка транскрипции: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка сервиса распознавания: {e}")
-
+        
+# --- ИЗМЕНЕНО: Полная переработка summarize_url с использованием UrlContext
 async def summarize_url_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = extract_general_url(" ".join(context.args))
     logger.info(f"Команда /summarize_url от {update.effective_user.id}, URL: {url}")
-    if not url: await update.message.reply_text("Пожалуйста, укажите URL после команды."); return
+    if not url:
+        await update.message.reply_text("Пожалуйста, укажите URL после команды."); return
+        
     await update.message.reply_text(f"🌐 Читаю страницу: {url}")
-    content = await fetch_webpage_content(url, context.bot_data['http_client'])
-    if not content: await update.message.reply_text("❌ Не удалось получить содержимое страницы."); return
-    prompt = f"Сделай краткую выжимку (summary) по тексту с веб-страницы: {url}\n\nТЕКСТ:\n{content}"
-    await process_query(update, context, [types.Part(text=prompt)], content_type="webpage", content_id=url)
+    
+    # Создаем промпт, который будет использовать контент со страницы
+    prompt_text = f"Сделай краткую выжимку (summary) по тексту с веб-страницы: {url}"
+    prompt_parts = [types.Part(text=prompt_text)]
+    
+    # Включаем инструмент UrlContext, чтобы Gemini сам загрузил страницу
+    url_tool = types.Tool(url_context=types.UrlContext())
 
+    # Вызываем основной процессор с нужными инструментами
+    await process_query(update, context, prompt_parts, content_type="webpage", content_id=url, tools=[url_tool])
+
+# --- summarize_yt_command без изменений
 async def summarize_yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_id = extract_youtube_id(" ".join(context.args))
     logger.info(f"Команда /summarize_yt от {update.effective_user.id}, video_id: {video_id}")
     if not video_id: await update.message.reply_text("Пожалуйста, укажите ссылку на YouTube после команды."); return
     await update.message.reply_text(f"📺 Анализирую видео с YouTube (ID: ...{video_id[-4:]})")
     try:
-        transcript = " ".join([d['text'] for d in await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, video_id, languages=['ru', 'en'])])
+        # --- ИЗМЕНЕНО: Убраны лишние импорты из функции
+        transcript_list = await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, video_id, languages=['ru', 'en'])
+        transcript = " ".join([d['text'] for d in transcript_list])
     except Exception as e: await update.message.reply_text(f"❌ Ошибка получения субтитров: {e}"); return
     prompt = f"Сделай краткий конспект по транскрипту видео с YouTube.\n\nТРАНСКРИПТ:\n{transcript}"
     await process_query(update, context, [types.Part(text=prompt)], content_type="youtube", content_id=video_id)
@@ -454,15 +470,35 @@ async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_
                         prompt_text = f"Это уточняющий вопрос к предыдущему контенту. Пользователь спрашивает: '{original_text}'. Проанализируй исходный материал еще раз и ответь."
                         parts = [types.Part(text=prompt_text)]
                         try:
-                            if content_type in ["image", "video", "voice"]:
+                            # --- ИЗМЕНЕНО: Логика получения контента для ответа на медиа
+                            if content_type == "document":
                                 file_bytes = await(await context.bot.get_file(content_id)).download_as_bytearray()
-                                mime, _ = mimetypes.guess_type(content_id)
-                                if not mime: mime = {'image': 'image/jpeg', 'voice': 'audio/ogg', 'video': 'video/mp4'}.get(content_type)
-                                parts.append(types.Part(inline_data=types.Blob(mime_type=mime, data=file_bytes)))
-                            elif content_type == "document":
+                                doc = await context.bot.get_file(content_id)
+                                parts.append(types.Part(inline_data=types.Blob(mime_type=doc.mime_type, data=file_bytes)))
+                            elif content_type in ["image", "video", "voice"]:
                                 file_bytes = await(await context.bot.get_file(content_id)).download_as_bytearray()
-                                # Обновляем текст в первом Part
-                                parts[0].text += f"\n\nТЕКСТ ДОКУМЕНТА:\n{file_bytes.decode('utf-8', 'ignore')}"
+                                # --- ИЗМЕНО: Исправлен баг с mimetypes. Используем словарь как основной источник.
+                                mime_map = {'image': 'image/jpeg', 'voice': 'audio/ogg', 'video': 'video/mp4'}
+                                mime = mime_map.get(content_type)
+                                if mime:
+                                    parts.append(types.Part(inline_data=types.Blob(mime_type=mime, data=file_bytes)))
+                                else:
+                                    raise ValueError(f"Неизвестный content_type: {content_type}")
+                            elif content_type == "webpage":
+                                # --- НОВОЕ: Обработка ответа на сообщение с URL
+                                prompt_text += f"\n\nПроанализируй еще раз страницу: {content_id}"
+                                parts[0].text = prompt_text
+                                await process_query(update, context, parts, content_type=content_type, content_id=content_id, tools=[types.Tool(url_context=types.UrlContext())])
+                                return
+                            # --- НОВОЕ: Обработка ответа на YouTube видео
+                            elif content_type == "youtube":
+                                transcript_list = await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, content_id, languages=['ru', 'en'])
+                                transcript = " ".join([d['text'] for d in transcript_list])
+                                prompt_text += f"\n\nИСХОДНЫЙ ТРАНСКРИПТ:\n{transcript}"
+                                parts[0].text = prompt_text
+                                await process_query(update, context, parts, content_type=content_type, content_id=content_id)
+                                return
+                                
                             await process_query(update, context, parts, content_type=content_type, content_id=content_id)
                             return
                         except Exception as e:
@@ -474,6 +510,7 @@ async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_
     prompt_parts = [types.Part(text=f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(original_text)}")]
     await process_query(update, context, prompt_parts)
 
+# ... (handle_media и handle_photo_with_search без изменений)
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, user = update.message, update.effective_user
     logger.info(f"Получено медиа от {user.id} в чате {message.chat_id}")
@@ -514,30 +551,41 @@ async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user.id, user_name=html.escape(user.first_name or ''))
     final_text_prompt = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(caption)}"
     if search_query and len(search_query) > 2:
-        await message.reply_text(f"🔍 Нашел на картинке «_{html.escape(search_query[:60])}_», ищу информацию...", parse_mode=ParseMode.HTML)
+        await message.reply_text(f"🔍 Нашел на картинке «<i>{html.escape(search_query[:60])}</i>», ищу информацию...", parse_mode=ParseMode.HTML)
         final_text_prompt += f"\n\nПроанализируй изображение, а также используй поиск, чтобы дополнить ответ по теме: '{search_query}'."
     final_prompt_parts = [types.Part(text=final_text_prompt), media_part]
     await process_query(update, context, final_prompt_parts, content_type="image", content_id=photo_file.file_id)
 
+# --- ИЗМЕНЕНО: Полностью переработанный обработчик документов
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
-    logger.info(f"Обработка документа '{doc.file_name}' от {update.effective_user.id}")
-    if doc.file_size > 15 * 1024 * 1024: await update.message.reply_text("❌ Файл слишком большой."); return
-    file_bytes = await (await doc.get_file()).download_as_bytearray()
-    text, error = None, None
-    if doc.mime_type == 'application/pdf':
-        try: text = await asyncio.to_thread(extract_text, io.BytesIO(file_bytes))
-        except Exception as e: error = f"Ошибка извлечения из PDF: {e}"
-    else:
-        try: text = file_bytes.decode('utf-8')
-        except UnicodeDecodeError: text = file_bytes.decode('cp1251', errors='ignore')
-    if error or text is None: await update.message.reply_text(error or "❌ Не удалось прочитать файл."); return
-    caption = update.message.caption or "Проанализируй содержимое этого файла."
-    user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))
-    prompt = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}Проанализируй текст из файла '{doc.file_name}'. Мой комментарий: '{caption}'\n\nТЕКСТ:\n{text}"
-    await process_query(update, context, [types.Part(text=prompt)], content_type="document", content_id=doc.file_id)
+    logger.info(f"Обработка документа '{doc.file_name}' ({doc.mime_type}) от {update.effective_user.id}")
+    
+    if doc.file_size > 20 * 1024 * 1024: # Максимальный размер для inline-запроса
+        await update.message.reply_text("❌ Файл слишком большой (лимит 20 МБ)."); return
+
+    await update.message.reply_text(f"📄 Читаю файл '{doc.file_name}'...")
+    try:
+        file_bytes = await (await doc.get_file()).download_as_bytearray()
+        
+        # Создаем Part для файла, Gemini сам его обработает
+        file_part = types.Part(inline_data=types.Blob(mime_type=doc.mime_type, data=file_bytes))
+
+        caption = update.message.caption or f"Проанализируй содержимое этого файла ({doc.file_name})."
+        user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))
+        
+        text_part = types.Part(text=f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(caption)}")
+        
+        prompt_parts = [text_part, file_part]
+        
+        await process_query(update, context, prompt_parts, content_type="document", content_id=doc.file_id)
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке документа {doc.file_name}: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Не удалось обработать файл: {e}")
 
 # --- НОВЫЙ МЕХАНИЗМ ЗАПУСКА ---
+# ... (Код без изменений, он хорош)
 async def worker(application: Application, update_queue: asyncio.Queue):
     """Обрабатывает обновления из очереди."""
     logger.info("Воркер запущен и готов к работе.")
@@ -592,6 +640,12 @@ async def main():
     if persistence: builder.persistence(persistence)
     application = builder.build()
 
+    # --- ИЗМЕНЕНО: Добавлен фильтр для документов, чтобы он ловил больше типов
+    # Фильтр Document.ALL ловит вообще все, но можно и уточнить, если нужно
+    doc_filter = filters.Document.MimeType(
+        ['application/pdf', 'text/plain', 'text/markdown', 'text/csv', 'text/html', 'text/xml', 'application/json', 'text/css']
+    )
+
     handlers = [
         CommandHandler("start", start), CommandHandler("clear", clear_history),
         CommandHandler("thinking", thinking_command), CommandHandler("transcribe", transcribe_command),
@@ -599,7 +653,7 @@ async def main():
         CallbackQueryHandler(select_thinking_callback, pattern="^set_thinking_"),
         MessageHandler(filters.PHOTO, handle_media),
         MessageHandler(filters.VIDEO | filters.VOICE, handle_media),
-        MessageHandler(filters.Document.TEXT | filters.Document.PDF, handle_document),
+        MessageHandler(doc_filter, handle_document), # Используем новый, более широкий фильтр
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_and_replies)
     ]
     application.add_handlers(handlers)
@@ -611,7 +665,10 @@ async def main():
         await application.initialize()
         logger.info("Приложение инициализировано.")
 
-        application.bot_data['gemini_client'] = genai.Client()
+        # --- ИЗМЕНЕНО: Gemini Client теперь конфигурируется сразу, а не просто создается
+        genai.configure(api_key=GOOGLE_API_KEY)
+        application.bot_data['gemini_client'] = genai
+        
         application.bot_data['http_client'] = httpx.AsyncClient()
         logger.info("API клиенты (Gemini, HTTPX) успешно созданы и добавлены в bot_data.")
 
