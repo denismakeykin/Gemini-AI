@@ -17,15 +17,14 @@ import httpx
 from bs4 import BeautifulSoup
 import aiohttp
 import aiohttp.web
-from telegram import Update, Message, BotCommand, File
+from telegram import Update, Message, BotCommand
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, BasePersistence
 from telegram.error import BadRequest
 
-# --- ИЗМЕНЕНО: Корректный импорт SDK и его типов ---
+# --- ИЗМЕНЕНО: Исправлен импорт. Убраны несуществующие исключения ---
 from google import genai
 from google.genai import types
-from google.genai.errors import BlockedPromptError, StopCandidateError
 
 from duckduckgo_search import DDGS
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, RequestBlocked
@@ -49,13 +48,8 @@ class PostgresPersistence(BasePersistence):
         super().__init__()
         self.db_pool = None
         self.dsn = database_url
-        try:
-            self._connect()
-            self._initialize_db()
-        except psycopg2.Error as e:
-            logger.critical(f"PostgresPersistence: Не удалось подключиться к БД: {e}")
-            raise
-
+        try: self._connect(); self._initialize_db()
+        except psycopg2.Error as e: logger.critical(f"PostgresPersistence: Не удалось подключиться к БД: {e}"); raise
     def _connect(self):
         if self.db_pool:
             try: self.db_pool.closeall()
@@ -68,7 +62,6 @@ class PostgresPersistence(BasePersistence):
              dsn = f"{dsn}?{keepalive_options}"
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=dsn)
         logger.info(f"Пул соединений с БД (пере)создан.")
-
     def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=3):
         if not self.db_pool: raise ConnectionError("Пул соединений не инициализирован.")
         last_exception = None
@@ -91,7 +84,6 @@ class PostgresPersistence(BasePersistence):
                 if conn: self.db_pool.putconn(conn)
         logger.error(f"Postgres: Не удалось выполнить запрос после {retries} попыток. Последняя ошибка: {last_exception}")
         return None
-    
     def _initialize_db(self): self._execute("CREATE TABLE IF NOT EXISTS persistence_data (key TEXT PRIMARY KEY, data BYTEA NOT NULL);")
     def _get_pickled(self, key: str) -> object | None:
         res = self._execute("SELECT data FROM persistence_data WHERE key = %s;", (key,), fetch="one")
@@ -132,7 +124,6 @@ GEMINI_WEBHOOK_PATH = os.getenv('GEMINI_WEBHOOK_PATH')
 DATABASE_URL = os.getenv('DATABASE_URL')
 DEFAULT_MODEL = 'gemini-2.5-flash'
 MAX_HISTORY_MESSAGES = 50
-MAX_OUTPUT_TOKENS = 8192
 SAFETY_SETTINGS = [
     {"category": c, "threshold": types.HarmBlockThreshold.BLOCK_NONE} for c in 
     (types.HarmCategory.HARM_CATEGORY_HARASSMENT, types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, 
@@ -140,11 +131,6 @@ SAFETY_SETTINGS = [
 ]
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def build_context_for_model(chat_history: list) -> list:
-    history_for_model, current_chars = [], 0
-    # Простая сборка истории для API
-    return chat_history[-MAX_HISTORY_MESSAGES:]
-
 async def perform_web_search(query: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
     session = context.bot_data.get('http_client')
     search_results = None
@@ -155,14 +141,12 @@ async def perform_web_search(query: str, context: ContextTypes.DEFAULT_TYPE) -> 
             if response.status_code == 200:
                 items = response.json().get('items', [])
                 search_results = "\n".join([item.get('snippet', item.get('title', '')) for item in items])
-        except Exception as e:
-            logger.error(f"Google Search Error: {e}")
+        except Exception as e: logger.error(f"Google Search Error: {e}")
     if not search_results:
         try:
             results = await asyncio.to_thread(DDGS().text, keywords=query, region='ru-ru', max_results=5)
             if results: search_results = "\n".join([r['body'] for r in results])
-        except Exception as e:
-            logger.error(f"DDG Search Error: {e}")
+        except Exception as e: logger.error(f"DDG Search Error: {e}")
     return search_results
 
 # --- ГЛАВНАЯ ФУНКЦИЯ ОБРАЩЕНИЯ К GEMINI ---
@@ -177,7 +161,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     model = client.generative_model(DEFAULT_MODEL, safety_settings=SAFETY_SETTINGS, system_instruction=system_instruction_text)
     
     try:
-        response = await model.generate_content_async(history)
+        response = await model.generate_content_async(history[-MAX_HISTORY_MESSAGES:])
         reply_text = response.text
         
         history.append({"role": "model", "parts": [{"text": reply_text}]})
@@ -200,7 +184,6 @@ async def handle_text_and_links(update: Update, context: ContextTypes.DEFAULT_TY
     message, text = update.message, (update.message.text or "").strip()
     if not text: return
     
-    # Логика обработки ссылок
     youtube_id = extract_youtube_id(text)
     if youtube_id:
         await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
@@ -223,7 +206,7 @@ async def handle_text_and_links(update: Update, context: ContextTypes.DEFAULT_TY
         http_client = context.bot_data['http_client']
         try:
             response = await http_client.get(general_url, timeout=15.0, follow_redirects=True)
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(response.text, 'lxml')
             for element in soup(["script", "style", "nav", "footer", "header", "aside"]): element.decompose()
             web_content = ' '.join(soup.stripped_strings)
             prompt_text = f"Проанализируй текст со страницы: {text}\n\nТЕКСТ:\n{web_content[:20000]}"
@@ -233,7 +216,6 @@ async def handle_text_and_links(update: Update, context: ContextTypes.DEFAULT_TY
         await process_query(update, context, [types.Part(text=prompt_text)])
         return
         
-    # Обычный текстовый запрос
     search_results = await perform_web_search(text, context)
     prompt_text = f"{text}\n\nРезультаты поиска:\n{search_results}" if search_results else text
     await process_query(update, context, [types.Part(text=prompt_text)])
@@ -248,18 +230,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = context.bot_data['gemini_client']
     model = client.generative_model(DEFAULT_MODEL)
     
-    # Этап 1: Извлечение
     response_extract = await model.generate_content_async(["Опиши изображение 1-3 словами для поиска.", image_part])
     search_query = response_extract.text.strip()
     
-    # Этап 2: Поиск
     search_context_str = ""
     if search_query:
         search_results = await perform_web_search(search_query, context)
         if search_results:
             search_context_str = f"\n\nРезультаты поиска по '{html.escape(search_query)}':\n{search_results}"
     
-    # Этап 3: Финальный анализ
     final_prompt_text = f"Подробно опиши изображение и ответь на комментарий: '{message.caption or ''}'. {search_context_str}"
     await process_query(update, context, [types.Part(text=final_prompt_text), image_part])
 
@@ -269,7 +248,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     mime_type = doc.mime_type or "application/octet-stream"
     if not (mime_type.startswith('text/') or mime_type == 'application/pdf'):
-        await message.reply_text(f"⚠️ Пока могу читать только текстовые файлы и PDF. Ваш тип: `{mime_type}`"); return
+        await message.reply_text(f"⚠️ Пока могу читать только текстовые файлы и PDF."); return
     
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     doc_file = await doc.get_file()
@@ -286,6 +265,19 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt_text = f"Проанализируй текст из файла '{doc.file_name}'. Мой комментарий: '{message.caption or ''}'\n\nТЕКСТ:\n{text[:20000]}"
     await process_query(update, context, [types.Part(text=prompt_text)])
 
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    voice_file = await message.voice.get_file()
+    file_bytes = await voice_file.download_as_bytearray()
+
+    client = context.bot_data['gemini_client']
+    model = client.generative_model(DEFAULT_MODEL)
+    response = await model.generate_content_async(["Расшифруй аудио и ответь на него.", types.Part(data=file_bytes, mime_type="audio/ogg")])
+    
+    await process_query(update, context, [types.Part(text=response.text)])
+
+
 # --- ФУНКЦИИ ЗАПУСКА И ОСТАНОВКИ ---
 async def handle_telegram_webhook(request: aiohttp.web.Request):
     application = request.app['bot_app']
@@ -300,9 +292,7 @@ async def run_web_server(application: Application, stop_event: asyncio.Event):
     app = aiohttp.web.Application()
     app['bot_app'] = application
     app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), handle_telegram_webhook)
-    runner = aiohttp.web.AppRunner(app)
-    await runner.setup()
-    site = aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
+    runner, site = aiohttp.web.AppRunner(app), aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
     await site.start()
     await stop_event.wait()
     await runner.cleanup()
@@ -320,7 +310,7 @@ async def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_and_links))
-    application.add_handler(MessageHandler(filters.VOICE, handle_text_and_links))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
