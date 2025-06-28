@@ -138,7 +138,6 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     logger.critical("Отсутствуют обязательные переменные окружения!")
     exit(1)
 
-# --- ИСПРАВЛЕННАЯ СТРОКА ---
 DEFAULT_MODEL = 'gemini-2.5-flash'
 MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
@@ -212,24 +211,19 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         else:
             logger.info("Используется автоматический бюджет мышления.")
         
-        request_config = types.GenerateContentConfig(
-            temperature=1.0, 
+        # --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ ---
+        response = await client.aio.models.generate_content(
+            model=f'models/{DEFAULT_MODEL}',
+            contents=context_for_model,
+            temperature=1.0,
             max_output_tokens=MAX_OUTPUT_TOKENS,
             thinking_config=thinking_config,
             tools=[types.Tool(google_search=types.GoogleSearch())],
             system_instruction=system_instruction_text
         )
-        
-        response = await client.aio.models.generate_content(
-            model=f'models/{DEFAULT_MODEL}',
-            contents=context_for_model,
-            generation_config=request_config
-        )
 
         full_reply_text = sanitize_telegram_html(response.text)
-        # Отправляем ответ новым сообщением, а не редактируем старое
         sent_message = await message.reply_text(full_reply_text, parse_mode=ParseMode.HTML)
-        # Сохраняем ID нового сообщения в историю
         await _add_to_history(context, "model", [{"text": full_reply_text}], bot_message_id=sent_message.message_id)
 
     except Exception as e:
