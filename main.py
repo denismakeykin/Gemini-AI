@@ -212,14 +212,20 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
             logger.info("Используется автоматический бюджет мышления.")
         
         # --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ ---
-        response = await client.aio.models.generate_content(
-            model=f'models/{DEFAULT_MODEL}',
-            contents=context_for_model,
-            temperature=1.0,
+        # Создаем объект config
+        config = types.GenerateContentConfig(
+            temperature=1.0, 
             max_output_tokens=MAX_OUTPUT_TOKENS,
             thinking_config=thinking_config,
             tools=[types.Tool(google_search=types.GoogleSearch())],
             system_instruction=system_instruction_text
+        )
+        
+        # Передаем его в generate_content под правильным именем 'config'
+        response = await client.aio.models.generate_content(
+            model=f'models/{DEFAULT_MODEL}',
+            contents=context_for_model,
+            config=config
         )
 
         full_reply_text = sanitize_telegram_html(response.text)
