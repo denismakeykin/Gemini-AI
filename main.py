@@ -138,7 +138,7 @@ DEFAULT_MODEL = 'gemini-2.5-flash'
 MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
 MAX_CONTEXT_CHARS = 100000
-THINKING_BUDGET = 24576 # Эта константа пока не используется напрямую, но оставлена для будущего
+THINKING_BUDGET = 24576
 USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow"
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -222,10 +222,8 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         
         thinking_mode = context.user_data.get('thinking_mode', 'auto')
         tool_config = None
-        # Примечание: прямое управление бюджетом через SDK ограничено.
-        # Режим 'max' здесь означает, что мы просто подтверждаем использование инструментов,
-        # что само по себе активирует наиболее сложный режим работы модели.
         if thinking_mode == 'max':
+            # Примечание: Это заставляет модель всегда рассматривать вызов функции, что может симулировать более "глубокое" размышление.
             tool_config = types.ToolConfig(function_calling_config=types.FunctionCallingConfig(mode="ANY"))
             logger.info("Режим мышления: Максимум (активировано принудительное использование инструментов).")
         else:
