@@ -251,6 +251,7 @@ async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> 
     except Exception as e:
         logger.error(f"Ошибка стриминга: {e}", exc_info=True)
         final_text = full_text + buffer + f"\n\n[❌ Ошибка стриминга: {str(e)[:100]}]"
+    
     return final_text
 
 async def send_final_reply(placeholder_message: Message, full_text: str, context: ContextTypes.DEFAULT_TYPE) -> Message:
@@ -269,11 +270,11 @@ async def send_final_reply(placeholder_message: Message, full_text: str, context
         if len(chunks) > 1:
             for chunk in chunks[1:]:
                 sent_message = await context.bot.send_message(chat_id=placeholder_message.chat_id, text=chunk, parse_mode=ParseMode.HTML)
-                await asyncio.sleep(0.1) # Небольшая задержка, чтобы не спамить
+                await asyncio.sleep(0.1)
     except Exception as e:
         logger.error(f"Критическая ошибка при финальной отправке ответа: {e}", exc_info=True)
     
-    return sent_message or placeholder_message # Возвращаем последнее отправленное сообщение
+    return sent_message or placeholder_message
 
 # --- ГЛАВНЫЙ ПРОЦЕССОР ЗАПРОСОВ ---
 async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list, content_type: str = None, content_id: str = None):
@@ -288,7 +289,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         thinking_budget_mode = context.user_data.get('thinking_budget', 'auto')
         thinking_config = {'mode': 'auto'}
         if thinking_budget_mode == 'max':
-            thinking_config = {'budget': 24576, 'mode': 'auto'} # Режим авто нужен даже с бюджетом
+            thinking_config = {'budget': 24576, 'mode': 'auto'}
             logger.info("Используется максимальный бюджет мышления (24576).")
 
         request_config = types.GenerateContentConfig(
@@ -301,12 +302,9 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
             model=f'models/{DEFAULT_MODEL}', contents=context_for_model, config=request_config
         )
         full_reply_text = await stream_and_send_reply(placeholder_message, stream)
-        
-        # Финальная отправка с нарезкой
         final_message = await send_final_reply(placeholder_message, full_reply_text, context)
 
         await _add_to_history(context, "model", [{"text": full_reply_text}], bot_message_id=final_message.message_id)
-
     except Exception as e:
         logger.error(f"Критическая ошибка в process_query: {e}", exc_info=True)
         await placeholder_message.edit_text(f"❌ Произошла серьезная ошибка: {str(e)[:500]}")
