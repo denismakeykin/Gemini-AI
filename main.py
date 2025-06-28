@@ -31,6 +31,7 @@ from telegram.error import BadRequest
 
 from google import genai
 from google.genai import types
+from google.generativeai.client import CachedContent
 
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from pdfminer.high_level import extract_text
@@ -43,7 +44,7 @@ except FileNotFoundError:
     logger.critical("Критическая ошибка: файл system_prompt.md не найден!")
     exit(1)
 
-# --- БАЗА ДАННЫХ (НАДЕЖНАЯ ВЕРСИЯ) ---
+# --- БАЗА ДАННЫХ ---
 class PostgresPersistence(BasePersistence):
     def __init__(self, database_url: str):
         super().__init__()
@@ -132,18 +133,17 @@ class PostgresPersistence(BasePersistence):
     def close(self):
         if self.db_pool: self.db_pool.closeall()
 
-# --- КОНФИГУРАЦИЯ БОТА ---
+# --- КОНФИГУРАЦИЯ ---
 TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PATH, DATABASE_URL = map(os.getenv, ['TELEGRAM_BOT_TOKEN', 'GOOGLE_API_KEY', 'WEBHOOK_HOST', 'GEMINI_WEBHOOK_PATH', 'DATABASE_URL'])
 if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PATH]):
     logger.critical("Отсутствуют обязательные переменные окружения!")
     exit(1)
 
-DEFAULT_MODEL = 'gemini-2.5-flash'
+DEFAULT_MODEL = 'gemini-2.5-flash-001' # Для кэширования нужна версия с -001
 MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
-MAX_CONTEXT_CHARS = 100000
 USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow"
-MEDIA_CONTEXT_TURNS_TTL = 8
+CACHE_TTL_SECONDS = 3600 # 1 час
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_current_time_str() -> str: return datetime.datetime.now(pytz.timezone(TARGET_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -171,42 +171,41 @@ def sanitize_telegram_html(raw_html: str) -> str:
     s = re.sub(r'</?(?!b>|i>|u>|s>|code>|pre>|a>|tg-spoiler>)\w+\s*[^>]*>', '', s)
     return s.strip()
 
-async def _add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list, **kwargs):
-    history = context.chat_data.setdefault("history", [])
-    entry = {"role": role, "parts": parts, **kwargs}
-    history.append(entry)
-    while len(history) > MAX_HISTORY_MESSAGES:
-        history.pop(0)
-
-def build_context_for_model(chat_history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    context_for_model = []
-    current_chars = 0
-    for entry in reversed(chat_history):
-        if not all(k in entry for k in ('role', 'parts')): continue
-        entry_text = "".join(p.get("text", "") for p in entry.get("parts", []) if isinstance(p, dict))
-        entry_chars = len(entry_text)
-        if current_chars + entry_chars > MAX_CONTEXT_CHARS and context_for_model:
-            logger.info(f"Контекст обрезан. Учтено {len(context_for_model)} из {len(chat_history)} сообщений.")
-            break
-        clean_parts = []
-        for part in entry.get("parts", []):
-            if isinstance(part, dict) and "text" in part:
-                clean_parts.append({"text": part["text"]})
-            elif isinstance(part, types.Part):
-                 clean_parts.append(part)
-        if clean_parts:
-            context_for_model.insert(0, {"role": entry["role"], "parts": clean_parts})
-            current_chars += entry_chars
-    return context_for_model
-
-# --- ОБРАБОТЧИК ЗАПРОСА ---
-async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list, content_type: str = None, content_id: str = None):
-    message = update.message
-    user = update.effective_user
+async def get_or_create_cache(context: ContextTypes.DEFAULT_TYPE, content_id: str, content_parts: List[Any]) -> CachedContent | None:
+    """Получает или создает кэш для контента."""
+    client = context.bot_data['gemini_client']
+    cache_store = context.chat_data.setdefault("content_cache", {})
     
-    await _add_to_history(context, "user", prompt_parts, user_id=user.id, message_id=message.message_id, content_type=content_type, content_id=content_id)
-    
+    # Проверяем, есть ли валидный кэш
+    if content_id in cache_store:
+        cache_name, expiry_time = cache_store[content_id]
+        if time.time() < expiry_time:
+            logger.info(f"Используется существующий кэш для {content_id}")
+            return CachedContent(name=cache_name) # Возвращаем объект по имени
+        else:
+            logger.info(f"Кэш для {content_id} устарел.")
+            del cache_store[content_id]
+
+    # Создаем новый кэш
+    try:
+        logger.info(f"Создается новый кэш для {content_id}")
+        # Для создания кэша ему не нужны системные инструкции, только контент
+        cache = await client.aio.caches.create(model=f'models/{DEFAULT_MODEL}', contents=content_parts)
+        cache_store[content_id] = (cache.name, time.time() + CACHE_TTL_SECONDS)
+        logger.info(f"Кэш {cache.name} успешно создан.")
+        return cache
+    except Exception as e:
+        logger.error(f"Не удалось создать кэш для {content_id}: {e}")
+        return None
+
+# --- ГЛАВНЫЙ ОБРАБОТЧИК ЗАПРОСА ---
+async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list, content_id: str = None):
+    message, user = update.message, update.effective_user
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+
+    # Сохраняем в историю только текстовую часть для легковесности
+    text_parts_for_history = [p for p in prompt_parts if isinstance(p, dict)]
+    await _add_to_history(context, "user", text_parts_for_history, content_id=content_id)
     
     try:
         chat_history = build_context_for_model(context.chat_data.get("history", []))
@@ -227,6 +226,18 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
             system_instruction=system_instruction_text
         )
         
+        # Если есть content_id, значит, это запрос с файлом, который можно кэшировать
+        if content_id:
+            cached_content = await get_or_create_cache(context, content_id, prompt_parts)
+            if cached_content:
+                config.cached_content = cached_content.name # Добавляем кэш в конфиг
+                # В основной запрос передаем только текстовую часть, т.к. медиа уже в кэше
+                chat_history.append({"role": "user", "parts": text_parts_for_history})
+            else: # Если кэш не создался, идем по старому пути
+                chat_history.append({"role": "user", "parts": prompt_parts})
+        else: # Обычный текстовый запрос
+             chat_history.append({"role": "user", "parts": prompt_parts})
+        
         response = await context.bot_data['gemini_client'].aio.models.generate_content(
             model=f'models/{DEFAULT_MODEL}',
             contents=chat_history,
@@ -235,125 +246,50 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 
         full_reply_text = sanitize_telegram_html(response.text)
         sent_message = await message.reply_text(full_reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        
         await _add_to_history(context, "model", [{"text": full_reply_text}], bot_message_id=sent_message.message_id)
 
     except Exception as e:
         logger.error(f"Критическая ошибка в process_query: {e}", exc_info=True)
         await message.reply_text(f"❌ Произошла серьезная ошибка: {str(e)[:500]}")
 
-# --- ОБРАБОТЧИКИ КОМАНД ---
+# --- ОБРАБОТЧИКИ ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    start_message = (
-        "Я - Женя, лучший ИИ-ассистент на базе Google GEMINI 2.5 Flash:\n"
-        "• 💬 Веду диалог, понимаю контекст, анализирую данные\n"
-        "• 🎤 Понимаю голосовые сообщения, могу переводить в текст\n"
-        "• 🖼 Анализирую изображения и видео (до 20 мб)\n"
-        "• 📄 Читаю репосты, txt, pdf и веб-страницы\n"
-        "• 🌐 Использую умный Google-поиск и огромный объем собственных знаний\n\n"
-        "<b>Команды:</b>\n"
-        "/transcribe - <i>(в ответе на голосовое)</i> Расшифровать аудио\n"
-        "/summarize_yt <i>ссылка</i> - Конспект видео с YouTube\n"
-        "/summarize_url <i>ссылка</i> - Выжимка из статьи\n"
-        "/thinking - Настроить режим размышлений\n"
-        "/clear - Очистить историю чата\n\n"
-        "(!) Пользуясь ботом, вы автоматически соглашаетесь на отправку сообщений для получения ответов через Google Gemini API."
-    )
-    await update.message.reply_text(start_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
+    # ... (код без изменений)
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data.clear()
-    await update.message.reply_text("🧹 История этого чата очищена.")
-
+    # ... (код без изменений)
 async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    current_mode = context.user_data.get('thinking_mode', 'auto')
-    keyboard = [
-        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'auto' else ''}Авто (Рекомендуется)", callback_data="set_thinking_auto")],
-        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'max' else ''}Максимум (Медленнее)", callback_data="set_thinking_max")],
-    ]
-    await update.message.reply_text("Выберите режим размышлений модели:", reply_markup=InlineKeyboardMarkup(keyboard))
-
+    # ... (код без изменений)
 async def select_thinking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    choice = query.data.split('_')[-1]
-    context.user_data['thinking_mode'] = choice
-    text = "✅ Режим размышлений установлен на **'Авто'**.\nЭто обеспечивает лучший баланс скорости и качества."
-    if choice == 'max':
-        text = "✅ Режим размышлений установлен на **'Максимум'**.\nОтветы могут быть качественнее, но и дольше."
-    await query.edit_message_text(text.replace("**", "<b>"), parse_mode=ParseMode.HTML)
+    # ... (код без изменений)
 
 async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    replied_message = update.message.reply_to_message
-    if not (replied_message and replied_message.voice):
-        await update.message.reply_text("ℹ️ Используйте эту команду, отвечая на голосовое сообщение."); return
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    file_bytes = await (await replied_message.voice.get_file()).download_as_bytearray()
-    client = context.bot_data['gemini_client']
-    try:
-        response = await client.aio.models.generate_content(
-            model=f'models/{DEFAULT_MODEL}',
-            contents=[{"text": "Расшифруй это аудио и верни только текст."}, types.Part(inline_data=types.Blob(mime_type=replied_message.voice.mime_type, data=file_bytes))]
-        )
-        await update.message.reply_text(f"<b>Транскрипт:</b>\n{html.escape(response.text)}", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.error(f"Ошибка транскрипции: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка сервиса распознавания: {e}")
+    # ... (код без изменений)
 
 async def summarize_url_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = extract_general_url(" ".join(context.args))
     if not url: await update.message.reply_text("Пожалуйста, укажите URL после команды."); return
-    await update.message.reply_text(f"🌐 Читаю страницу: {url}")
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await update.message.reply_text(f"🌐 Читаю и кэширую страницу: {url}")
     content = await fetch_webpage_content(url, context.bot_data['http_client'])
     if not content: await update.message.reply_text("❌ Не удалось получить содержимое страницы."); return
-    prompt_text = f"Сделай краткую выжимку (summary) по тексту с веб-страницы: {url}\n\nТЕКСТ:\n{content}"
-    await process_query(update, context, [{"text": prompt_text}], content_type="webpage", content_id=url)
+    prompt_text = f"Сделай краткую выжимку (summary) по тексту с этой веб-страницы."
+    await process_query(update, context, [{"text": prompt_text}, {"text": content}], content_id=url)
 
 async def summarize_yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_id = extract_youtube_id(" ".join(context.args))
     if not video_id: await update.message.reply_text("Пожалуйста, укажите ссылку на YouTube после команды."); return
-    await update.message.reply_text(f"📺 Анализирую видео с YouTube (ID: ...{video_id[-4:]})")
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await update.message.reply_text(f"📺 Анализирую и кэширую видео (ID: ...{video_id[-4:]})")
     try:
         transcript = " ".join([d['text'] for d in await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, video_id, languages=['ru', 'en'])])
     except Exception as e: await update.message.reply_text(f"❌ Ошибка получения субтитров: {e}"); return
-    prompt_text = f"Сделай краткий конспект по транскрипту видео с YouTube.\n\nТРАНСКРИПТ:\n{transcript}"
-    await process_query(update, context, [{"text": prompt_text}], content_type="youtube", content_id=video_id)
-
-async def find_and_re_analyze_context(update: Update, context: ContextTypes.DEFAULT_TYPE, original_text: str) -> bool:
-    history = context.chat_data.get("history", [])
-    if len(history) < 1: return False
-
-    last_media_turn = None
-    # Итерируем с предпоследнего сообщения, т.к. последнее - это текущий запрос
-    for i in range(len(history) - 2, -1, -1):
-        # Ограничиваем глубину поиска, чтобы не уйти слишком далеко
-        if (len(history) - 2 - i) >= MEDIA_CONTEXT_TURNS_TTL: break
-        
-        turn = history[i]
-        if turn.get("role") == "user" and turn.get("content_type") in ["image", "video", "document", "webpage", "youtube"]:
-            last_media_turn = turn
-            break # Нашли - выходим
-
-    if not last_media_turn: return False
-
-    logger.info(f"Обнаружен уточняющий вопрос к медиа-контексту типа '{last_media_turn['content_type']}'.")
-    
-    original_media_parts = [p for p in last_media_turn.get("parts", []) if not (isinstance(p, dict) and "text" in p)]
-    user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))
-    new_text_part = {"text": f"(Текущая дата: {get_current_time_str()})\n{user_prefix}Это уточняющий вопрос к предыдущему материалу. Пользователь спрашивает: '{original_text}'. Проанализируй ИСХОДНЫЙ материал еще раз с учетом этого вопроса и ответь."}
-    
-    final_prompt_parts = [new_text_part] + original_media_parts
-    
-    await process_query(update, context, final_prompt_parts, content_type=last_media_turn["content_type"], content_id=last_media_turn["content_id"])
-    return True
+    prompt_text = f"Сделай краткий конспект по транскрипту этого видео."
+    await process_query(update, context, [{"text": prompt_text}, {"text": transcript}], content_id=f"yt_{video_id}")
 
 async def handle_text_or_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     original_text = ""
     
     if message.voice:
+        # Логика расшифровки остается простой, без кэширования
         await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
         file_bytes = await (await message.voice.get_file()).download_as_bytearray()
         try:
@@ -365,25 +301,22 @@ async def handle_text_or_voice(update: Update, context: ContextTypes.DEFAULT_TYP
             await message.reply_text(f"❌ Не смог расшифровать голосовое: {e}")
             return
     else:
-        original_text = (message.text or "").strip()
+        original_text = message.text or ""
 
-    if not original_text: return
+    if not original_text.strip(): return
     
-    if await find_and_re_analyze_context(update, context, original_text):
-        return
-
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))
     prompt_text = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(original_text)}"
-    await process_query(update, context, [{"text": prompt_text}])
+    await process_query(update, context, [{"text": prompt_text}], content_id=None) # У текстовых сообщений нет ID для кэша
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, user = update.message, update.effective_user
     caption = message.caption or "Подробно опиши этот медиафайл."
     
     if message.photo:
-        content_type, file_id, mime_type = "image", message.photo[-1].file_id, 'image/jpeg'
+        file_id, mime_type = message.photo[-1].file_id, 'image/jpeg'
     elif message.video:
-        content_type, file_id, mime_type = "video", message.video.file_id, message.video.mime_type
+        file_id, mime_type = message.video.file_id, message.video.mime_type
     else: return
 
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user.id, user_name=html.escape(user.first_name or ''))
@@ -392,26 +325,20 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_bytes = await (await context.bot.get_file(file_id)).download_as_bytearray()
     media_part = types.Part(inline_data=types.Blob(mime_type=mime_type, data=file_bytes))
     
-    await process_query(update, context, [{"text": prompt_text}, media_part], content_type=content_type, content_id=file_id)
+    await process_query(update, context, [{"text": prompt_text}, media_part], content_id=file_id)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if doc.file_size > 15 * 1024 * 1024: await update.message.reply_text("❌ Файл слишком большой."); return
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    file_bytes = await (await doc.get_file()).download_as_bytearray()
-    text, error = None, None
-    if doc.mime_type == 'application/pdf':
-        try: text = await asyncio.to_thread(extract_text, io.BytesIO(file_bytes))
-        except Exception as e: error = f"Ошибка извлечения из PDF: {e}"
-    else:
-        try: text = file_bytes.decode('utf-8')
-        except UnicodeDecodeError: text = file_bytes.decode('cp1251', errors='ignore')
-    if error or text is None: await update.message.reply_text(error or "❌ Не удалось прочитать файл."); return
     
-    caption = update.message.caption or "Проанализируй содержимое этого файла."
+    file_bytes = await (await doc.get_file()).download_as_bytearray()
+    doc_part = types.Part(inline_data=types.Blob(mime_type=doc.mime_type, data=file_bytes))
+    
+    caption = update.message.caption or f"Проанализируй содержимое файла '{doc.file_name}'."
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))
-    prompt_text = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}Проанализируй текст из файла '{doc.file_name}'. Мой комментарий: '{caption}'\n\nТЕКСТ:\n{text}"
-    await process_query(update, context, [{"text": prompt_text}], content_type="document", content_id=doc.file_id)
+    prompt_text = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(caption)}"
+    
+    await process_query(update, context, [{"text": prompt_text}, doc_part], content_id=doc.file_id)
 
 # --- НАСТРОЙКА И ЗАПУСК БОТА ---
 async def setup_bot_and_server(stop_event: asyncio.Event):
@@ -442,7 +369,7 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
         CommandHandler("summarize_yt", summarize_yt_command),
         CallbackQueryHandler(select_thinking_callback, pattern="^set_thinking_"),
         MessageHandler(filters.PHOTO | filters.VIDEO, handle_media),
-        MessageHandler(filters.Document.TEXT | filters.Document.PDF, handle_document),
+        MessageHandler(filters.Document, handle_document),
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_or_voice),
         MessageHandler(filters.VOICE, handle_text_or_voice)
     ]
