@@ -210,7 +210,7 @@ async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> 
                         if "Message is not modified" not in str(e): logger.warning(f"Ошибка редактирования: {e}")
         final_text = full_text + buffer
     except json.JSONDecodeError as e:
-        logger.error(f"Ошибка декодирования JSON в стриме: {e}", exc_info=False) # Не засоряем лог трейсбеком
+        logger.error(f"Ошибка декодирования JSON в стриме: {e}", exc_info=False)
         final_text = full_text + buffer + "\n\n[❗️Ответ был прерван из-за сетевой ошибки.]"
     except Exception as e:
         logger.error(f"Ошибка стриминга: {e}", exc_info=True)
@@ -425,91 +425,32 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_query(update, context, [{"text": prompt}], content_type="document", content_id=doc.file_id)
 
 # --- НОВЫЙ МЕХАНИЗМ ЗАПУСКА ---
-async def post_startup_tasks(application: Application):
-    """Выполняет "длинные" задачи после того, как веб-сервер запущен."""
-    await application.initialize()
-    logger.info("Приложение инициализировано, персистентность загружена.")
-    
-    commands = [
-        BotCommand("start", "Инфо и помощь"),
-        BotCommand("clear", "Очистить историю"),
-        BotCommand("thinking", "Настроить режим размышлений"),
-        BotCommand("transcribe", "Расшифровать аудио (ответом)"),
-        BotCommand("summarize_yt", "Конспект видео YouTube"),
-        BotCommand("summarize_url", "Выжимка из статьи по ссылке")
-    ]
-    await application.bot.set_my_commands(commands)
-    logger.info("Команды бота установлены.")
-    
-    webhook_url = f"{WEBHOOK_HOST.rstrip('/')}/{GEMINI_WEBHOOK_PATH.strip('/')}"
-    await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES, secret_token=os.getenv('WEBHOOK_SECRET_TOKEN'))
-    logger.info(f"Вебхук установлен: {webhook_url}")
+async def worker(application: Application, update_queue: asyncio.Queue):
+    """Обрабатывает обновления из очереди."""
+    logger.info("Воркер запущен и готов к работе.")
+    while True:
+        try:
+            update_json = await update_queue.get()
+            update = Update.de_json(update_json, application.bot)
+            await application.process_update(update)
+            update_queue.task_done()
+        except asyncio.CancelledError:
+            logger.info("Воркер остановлен.")
+            break
+        except Exception:
+            logger.error("Критическая ошибка в воркере:", exc_info=True)
 
-async def main():
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, stop_event.set)
-
-    # --- Быстрая настройка приложения ---
-    persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
-    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
-    if persistence: builder.persistence(persistence)
-    application = builder.build()
-    
-    application.bot_data['gemini_client'] = genai.Client()
-    application.bot_data['http_client'] = httpx.AsyncClient()
-    
-    handlers = [
-        CommandHandler("start", start),
-        CommandHandler("clear", clear_history),
-        CommandHandler("thinking", thinking_command),
-        CommandHandler("transcribe", transcribe_command),
-        CommandHandler("summarize_url", summarize_url_command),
-        CommandHandler("summarize_yt", summarize_yt_command),
-        CallbackQueryHandler(select_thinking_callback, pattern="^set_thinking_"),
-        MessageHandler(filters.PHOTO, handle_media),
-        MessageHandler(filters.VIDEO | filters.VOICE, handle_media),
-        MessageHandler(filters.Document.TEXT | filters.Document.PDF, handle_document),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_and_replies)
-    ]
-    application.add_handlers(handlers)
-    
-    # --- Запуск приложения ---
-    web_task, startup_task = None, None
-    try:
-        # 1. Сначала запускаем веб-сервер, чтобы открыть порт для Render
-        web_task = asyncio.create_task(run_web_server(application, stop_event))
-        logger.info("Веб-сервер запущен и слушает порт.")
-        
-        # 2. Затем выполняем "длинные" задачи
-        startup_task = asyncio.create_task(post_startup_tasks(application))
-        
-        # 3. Ждем сигнала об остановке
-        await stop_event.wait()
-
-    finally:
-        logger.info("--- Остановка приложения ---")
-        if startup_task and not startup_task.done(): startup_task.cancel()
-        if web_task and not web_task.done(): web_task.cancel()
-        if application:
-            if http_client := application.bot_data.get('http_client'):
-                if not http_client.is_closed: await http_client.aclose()
-            await application.shutdown()
-            if persistence: persistence.close()
-        logger.info("--- Приложение полностью остановлено ---")
-
-async def run_web_server(application: Application, stop_event: asyncio.Event):
+async def run_web_server(update_queue: asyncio.Queue, stop_event: asyncio.Event):
+    """Запускает только веб-сервер, который складывает обновления в очередь."""
     app = aiohttp.web.Application()
     async def webhook_handler(request: aiohttp.web.Request):
-        secret = os.getenv('WEBHOOK_SECRET_TOKEN')
-        if secret and request.headers.get('X-Telegram-Bot-Api-Secret-Token') != secret: return aiohttp.web.Response(status=403)
         try:
-            await application.process_update(Update.de_json(await request.json(), application.bot))
+            await update_queue.put(await request.json())
             return aiohttp.web.Response(status=200)
         except Exception as e:
-            logger.error(f"Ошибка вебхука: {e}", exc_info=True)
+            logger.error(f"Ошибка в обработчике вебхука (до очереди): {e}", exc_info=True)
             return aiohttp.web.Response(status=500)
-    app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), webhook_handler)
+    app.router.add_post(f"/{GEMINI_WEBHOOK_PATH.strip('/')}", webhook_handler)
     app.router.add_get('/', lambda r: aiohttp.web.Response(text="Bot is running"))
     
     runner = aiohttp.web.AppRunner(app)
@@ -518,9 +459,76 @@ async def run_web_server(application: Application, stop_event: asyncio.Event):
     
     try:
         await site.start()
+        logger.info(f"Веб-сервер запущен на порту {os.getenv('PORT', '10000')}.")
         await stop_event.wait()
     finally:
         await runner.cleanup()
+        logger.info("Веб-сервер остановлен.")
+
+async def main():
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, stop_event.set)
+    
+    update_queue = asyncio.Queue()
+
+    persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
+    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
+    if persistence: builder.persistence(persistence)
+    application = builder.build()
+
+    application.bot_data['gemini_client'] = genai.Client()
+    application.bot_data['http_client'] = httpx.AsyncClient()
+    
+    handlers = [
+        CommandHandler("start", start), CommandHandler("clear", clear_history),
+        CommandHandler("thinking", thinking_command), CommandHandler("transcribe", transcribe_command),
+        CommandHandler("summarize_url", summarize_url_command), CommandHandler("summarize_yt", summarize_yt_command),
+        CallbackQueryHandler(select_thinking_callback, pattern="^set_thinking_"),
+        MessageHandler(filters.PHOTO, handle_media),
+        MessageHandler(filters.VIDEO | filters.VOICE, handle_media),
+        MessageHandler(filters.Document.TEXT | filters.Document.PDF, handle_document),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_and_replies)
+    ]
+    application.add_handlers(handlers)
+    
+    web_task, worker_task = None, None
+    try:
+        web_task = asyncio.create_task(run_web_server(update_queue, stop_event))
+        
+        await application.initialize()
+        logger.info("Приложение инициализировано.")
+        
+        worker_task = asyncio.create_task(worker(application, update_queue))
+        
+        webhook_url = f"{WEBHOOK_HOST.rstrip('/')}/{GEMINI_WEBHOOK_PATH.strip('/')}"
+        await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES, secret_token=os.getenv('WEBHOOK_SECRET_TOKEN'))
+        logger.info(f"Вебхук установлен: {webhook_url}")
+
+        commands = [
+            BotCommand("start", "Инфо и помощь"), BotCommand("clear", "Очистить историю"),
+            BotCommand("thinking", "Настроить режим размышлений"), BotCommand("transcribe", "Расшифровать аудио (ответом)"),
+            BotCommand("summarize_yt", "Конспект видео YouTube"), BotCommand("summarize_url", "Выжимка из статьи")
+        ]
+        await application.bot.set_my_commands(commands)
+        logger.info("Команды бота установлены.")
+        
+        await stop_event.wait()
+
+    finally:
+        logger.info("--- Остановка приложения ---")
+        tasks_to_cancel = [t for t in [web_task, worker_task] if t and not t.done()]
+        if tasks_to_cancel:
+            for task in tasks_to_cancel:
+                task.cancel()
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+
+        if application:
+            if http_client := application.bot_data.get('http_client'):
+                if not http_client.is_closed: await http_client.aclose()
+            await application.shutdown()
+            if persistence: persistence.close()
+        logger.info("--- Приложение полностью остановлено ---")
 
 if __name__ == '__main__':
     try:
