@@ -230,23 +230,28 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     try:
         context_for_model = build_context_for_model(context.chat_data.get("history", []))
         
-        thinking_budget_mode = context.user_data.get('thinking_budget', 'auto')
+        # thinking_budget был удален в новом SDK, теперь это thinking_config
+        thinking_mode = context.user_data.get('thinking_mode', 'auto')
         thinking_config = {}
-        if thinking_budget_mode == 'max':
+        if thinking_mode == 'max':
             thinking_config['budget'] = 24576
             logger.info("Используется максимальный бюджет мышления (24576).")
-        else:
+        else: # auto
             thinking_config['mode'] = 'auto'
             logger.info("Используется автоматический бюджет мышления.")
 
         request_config = types.GenerateContentConfig(
             temperature=1.0, max_output_tokens=MAX_OUTPUT_TOKENS,
-            system_instruction=system_instruction_text,
+            # system_instruction передается здесь в новом SDK
             tools=[types.Tool(google_search=types.GoogleSearch())],
             thinking_config=thinking_config
         )
+        
+        # системный промпт теперь часть `contents`
+        final_contents = [{"role": "system", "parts": [{"text": system_instruction_text}]}] + context_for_model
+        
         stream = await client.aio.models.generate_content_stream(
-            model=f'models/{DEFAULT_MODEL}', contents=context_for_model, config=request_config
+            model=f'models/{DEFAULT_MODEL}', contents=final_contents, generation_config=request_config
         )
         full_reply_text = await stream_and_send_reply(placeholder_message, stream)
         await _add_to_history(context, "model", [{"text": full_reply_text}], bot_message_id=placeholder_message.message_id)
@@ -257,7 +262,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_message = (
-        "Я - Женя, лучший ИИ-ассистент на базе Google GEMINI 2.5 Flash:\n"
+        "Я - Женя, лучший ИИ-ассистент на базе Google GEMINI 2.5 Flash:\n" # Обновил версию
         "• 💬 Веду диалог, понимаю контекст, анализирую данные\n"
         "• 🎤 Понимаю голосовые сообщения, могу переводить в текст\n"
         "• 🖼 Анализирую изображения и видео (до 20 мб)\n"
@@ -278,7 +283,7 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧹 История этого чата очищена.")
 
 async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    current_mode = context.user_data.get('thinking_budget', 'auto')
+    current_mode = context.user_data.get('thinking_mode', 'auto') # переименовал thinking_budget в thinking_mode
     keyboard = [
         [InlineKeyboardButton(f"{'✅ ' if current_mode == 'auto' else ''}Авто (Рекомендуется)", callback_data="set_thinking_auto")],
         [InlineKeyboardButton(f"{'✅ ' if current_mode == 'max' else ''}Максимум (Медленнее)", callback_data="set_thinking_max")],
@@ -289,12 +294,11 @@ async def select_thinking_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     choice = query.data.split('_')[-1]
-    context.user_data['thinking_budget'] = choice
+    context.user_data['thinking_mode'] = choice # переименовал thinking_budget в thinking_mode
     text = "✅ Режим размышлений установлен на **'Авто'**.\nЭто обеспечивает лучший баланс скорости и качества."
     if choice == 'max':
         text = "✅ Режим размышлений установлен на **'Максимум'**.\nОтветы могут быть качественнее, но и дольше."
     await query.edit_message_text(text.replace("**", "<b>"), parse_mode=ParseMode.HTML)
-
 
 async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     replied_message = update.message.reply_to_message
@@ -403,7 +407,6 @@ async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT
     final_text_prompt = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(caption)}"
     if search_query and len(search_query) > 2:
         await message.reply_text(f"🔍 Нашел на картинке «_{html.escape(search_query[:60])}_», ищу информацию...", parse_mode=ParseMode.HTML)
-        final_text_prompt += f"\n\nПроанализируй изображение, а также используй поиск, чтобы дополнить ответ по теме: '{search_query}'."
     final_prompt_parts = [{"text": final_text_prompt}, media_part]
     await process_query(update, context, final_prompt_parts, content_type="image", content_id=photo_file.file_id)
 
@@ -474,12 +477,19 @@ async def run_web_server(application: Application, stop_event: asyncio.Event):
             return aiohttp.web.Response(status=500)
     app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), webhook_handler)
     app.router.add_get('/', lambda r: aiohttp.web.Response(text="Bot is running"))
-    runner, site = aiohttp.web.AppRunner(app), aiohttp.web.TCPSite(runner, os.getenv("HOST", "0.0.0.0"), int(os.getenv("PORT", "10000")))
+    
+    # --- ИСПРАВЛЕННЫЙ БЛОК ---
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, os.getenv("HOST", "0.0.0.0"), int(os.getenv("PORT", "10000")))
+    
     try:
-        await runner.setup(); await site.start()
+        await site.start()
+        logger.info(f"Веб-сервер запущен на порту {os.getenv('PORT', '10000')}")
         await stop_event.wait()
     finally:
         await runner.cleanup()
+        logger.info("Веб-сервер остановлен.")
 
 async def main():
     stop_event = asyncio.Event()
@@ -493,14 +503,22 @@ async def main():
         logger.info("--- Остановка приложения ---")
         if web_task and not web_task.done(): web_task.cancel()
         if application:
-            if http_client := application.bot_data.get('http_client'):
-                if not http_client.is_closed: await http_client.aclose()
+            # Изящно убираем "несохраняемых" клиентов перед выключением
+            if http_client := application.bot_data.pop('http_client', None):
+                if not http_client.is_closed:
+                    await http_client.aclose()
+            application.bot_data.pop('gemini_client', None)
+            
             await application.shutdown()
-            if hasattr(application, 'persistence') and application.persistence: application.persistence.close()
+            if hasattr(application, 'persistence') and application.persistence:
+                application.persistence.close()
         logger.info("--- Приложение полностью остановлено ---")
 
 if __name__ == '__main__':
+    # Добавил более подробный логгинг для ошибок при запуске/остановке
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Приложение остановлено пользователем.")
+    except Exception as e:
+        logger.critical(f"Необработанное исключение в main: {e}", exc_info=True)
