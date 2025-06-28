@@ -218,11 +218,8 @@ def html_safe_chunker(text: str, chunk_size: int = 4096) -> list[str]:
     return chunks
 
 # --- ЛОГИКА ИСТОРИИ И КОНТЕКСТА ---
-# ИЗМЕНЕНО: Убрана некорректная "очистка", которая портила данные.
 async def _add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list, **kwargs):
     history = context.chat_data.setdefault("history", [])
-    # Сохраняем "parts" как есть, без упрощения.
-    # Это могут быть строки, объекты types.Part и т.д.
     entry = {"role": role, "parts": parts, **kwargs}
     history.append(entry)
     while len(history) > MAX_HISTORY_MESSAGES:
@@ -235,9 +232,9 @@ def build_context_for_model(chat_history: list) -> list:
         if not all(k in entry for k in ('role', 'parts')): continue
         
         entry_text = ""
-        if entry.get("parts"):
+        if parts := entry.get("parts"):
             # Расчет длины только для текстовых частей
-            entry_text = "".join(p if isinstance(p, str) else getattr(p, 'text', '') for p in entry["parts"])
+            entry_text = "".join(p if isinstance(p, str) else getattr(p, 'text', '') for p in parts)
 
         entry_chars = len(entry_text)
         if current_chars + entry_chars > MAX_CONTEXT_CHARS and context_for_model:
@@ -245,8 +242,9 @@ def build_context_for_model(chat_history: list) -> list:
             break
         
         try:
-            # Превращаем сырой словарь из истории в объект нужного класса
-            content_object = types.Content(role=entry["role"], parts=entry["parts"])
+            # ИЗМЕНЕНО: "Ремонтируем" на лету старые записи, где parts могли быть строками
+            repaired_parts = [p if not isinstance(p, str) else types.Part(text=p) for p in entry.get("parts", [])]
+            content_object = types.Content(role=entry["role"], parts=repaired_parts)
             context_for_model.insert(0, content_object)
             current_chars += entry_chars
         except Exception as e:
@@ -338,7 +336,8 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         full_reply_text = await stream_and_send_reply(placeholder_message, stream)
         final_message = await send_final_reply(placeholder_message, full_reply_text, context)
         
-        await _add_to_history(context, "model", [full_reply_text], bot_message_id=final_message.message_id)
+        # ИЗМЕНЕНО: Сохраняем ответ модели тоже в формате types.Part
+        await _add_to_history(context, "model", [types.Part(text=full_reply_text)], bot_message_id=final_message.message_id)
         logger.info(f"Ответ успешно отправлен в чат {message.chat_id}.")
     except Exception as e:
         logger.error(f"Критическая ошибка в process_query для чата {message.chat_id}: {e}", exc_info=True)
