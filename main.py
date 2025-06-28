@@ -286,7 +286,6 @@ async def send_final_reply(placeholder_message: Message, full_text: str, context
 # --- ГЛАВНЫЙ ПРОЦЕССОР ЗАПРОСОВ ---
 async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list, content_type: str = None, content_id: str = None):
     message = update.message
-    # ИЗМЕНЕНО: Добавлено логгирование в самом начале
     logger.info(f"Начало process_query для чата {message.chat_id}. Тип контента: {content_type or 'text'}")
     
     user = update.effective_user
@@ -312,7 +311,6 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         
         logger.info(f"Отправка запроса к модели {DEFAULT_MODEL}...")
         stream = await client.aio.models.generate_content_stream(
-            # ИЗМЕНЕНО: Убран префикс 'models/'
             model=DEFAULT_MODEL,
             contents=context_for_model,
             config=request_config
@@ -384,7 +382,6 @@ async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     client = context.bot_data['gemini_client']
     try:
         response = await client.aio.models.generate_content(
-            # ИЗМЕНЕНО: Убран префикс 'models/'
             model=DEFAULT_MODEL,
             contents=["Расшифруй это аудио и верни только текст.", types.Part(inline_data=types.Blob(mime_type=replied_message.voice.mime_type, data=file_bytes))]
         )
@@ -419,7 +416,6 @@ async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_
     message, user = update.message, update.effective_user
     original_text = (message.text or "").strip()
     if not original_text: return
-    # ИЗМЕНЕНО: Добавлено логгирование
     logger.info(f"Получено текстовое сообщение от {user.id} в чате {message.chat_id}")
 
     if message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id:
@@ -485,7 +481,6 @@ async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT
     extraction_prompt = "Проанализируй это изображение. Если на нем есть хорошо читаемый текст, извлеки его. Если текста нет, опиши ключевые объекты 1-3 словами. Ответ должен быть ОЧЕНЬ коротким и содержать только текст или слова, подходящие для веб-поиска."
     search_query = None
     try:
-        # ИЗМЕНЕНО: Убран префикс 'models/'
         response_extract = await client.aio.models.generate_content(model=DEFAULT_MODEL, contents=[extraction_prompt, media_part])
         search_query = response_extract.text.strip()
     except Exception as e:
@@ -524,7 +519,6 @@ async def worker(application: Application, update_queue: asyncio.Queue):
     while True:
         try:
             update_json = await update_queue.get()
-            # ИЗМЕНЕНО: Добавлено логгирование получения из очереди
             logger.info("Воркер получил новое обновление из очереди.")
             update = Update.de_json(update_json, application.bot)
             await application.process_update(update)
@@ -540,7 +534,6 @@ async def run_web_server(update_queue: asyncio.Queue, stop_event: asyncio.Event)
     app = aiohttp.web.Application()
     async def webhook_handler(request: aiohttp.web.Request):
         try:
-            # ИЗМЕНЕНО: Добавлено логгирование получения вебхука
             logger.info(f"Получен входящий запрос на вебхук от {request.remote}")
             await update_queue.put(await request.json())
             return aiohttp.web.Response(status=200)
@@ -574,10 +567,6 @@ async def main():
     if persistence: builder.persistence(persistence)
     application = builder.build()
 
-    # Ключ API будет автоматически подхвачен из переменной окружения GOOGLE_API_KEY
-    application.bot_data['gemini_client'] = genai.Client()
-    application.bot_data['http_client'] = httpx.AsyncClient()
-
     handlers = [
         CommandHandler("start", start), CommandHandler("clear", clear_history),
         CommandHandler("thinking", thinking_command), CommandHandler("transcribe", transcribe_command),
@@ -594,8 +583,14 @@ async def main():
     try:
         web_task = asyncio.create_task(run_web_server(update_queue, stop_event))
 
+        # ИЗМЕНЕНО: Порядок действий исправлен
         await application.initialize()
         logger.info("Приложение инициализировано.")
+
+        # Добавляем "живые" клиенты ПОСЛЕ инициализации
+        application.bot_data['gemini_client'] = genai.Client()
+        application.bot_data['http_client'] = httpx.AsyncClient()
+        logger.info("API клиенты (Gemini, HTTPX) успешно созданы и добавлены в bot_data.")
 
         worker_task = asyncio.create_task(worker(application, update_queue))
 
