@@ -69,12 +69,13 @@ class PostgresPersistence(BasePersistence):
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=dsn)
         logger.info(f"Пул соединений с БД (пере)создан.")
 
-
+    # ИЗМЕНЕНО: Исправлена логика обработки ошибок для предотвращения PoolError
     def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=3):
         if not self.db_pool: raise ConnectionError("Пул соединений не инициализирован.")
         last_exception = None
         for attempt in range(retries):
             conn = None
+            connection_handled = False
             try:
                 conn = self.db_pool.getconn()
                 with conn.cursor() as cur:
@@ -86,12 +87,15 @@ class PostgresPersistence(BasePersistence):
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
                 logger.warning(f"Postgres: Ошибка соединения (попытка {attempt + 1}/{retries}): {e}. Попытка переподключения...")
                 last_exception = e
-                if conn: self.db_pool.putconn(conn, close=True) # Закрываем "сломанный" коннект
+                if conn:
+                    self.db_pool.putconn(conn, close=True)
+                    connection_handled = True
                 if attempt < retries - 1: self._connect(); time.sleep(1 + attempt)
                 continue
             finally:
-                if conn: self.db_pool.putconn(conn)
-
+                if conn and not connection_handled:
+                    self.db_pool.putconn(conn)
+        
         logger.error(f"Postgres: Не удалось выполнить запрос после {retries} попыток. Последняя ошибка: {last_exception}")
         return None
 
@@ -296,12 +300,10 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     try:
         context_for_model = build_context_for_model(context.chat_data.get("history", []))
 
-        # ИЗМЕНЕНО: Создаем thinking_config только при необходимости и без невалидных параметров
         thinking_budget_mode = context.user_data.get('thinking_budget', 'auto')
-        thinking_config_obj = None  # По умолчанию конфига нет
+        thinking_config_obj = None
         if thinking_budget_mode == 'max':
             logger.info("Используется максимальный бюджет мышления (24576).")
-            # Создаем объект только с валидным параметром 'budget'
             thinking_config_obj = types.ThinkingConfig(budget=24576)
 
         request_config = types.GenerateContentConfig(
