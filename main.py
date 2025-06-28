@@ -22,7 +22,6 @@ from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, BasePersistence
 from telegram.error import BadRequest
 
-# --- ИЗМЕНЕНО: Исправлен импорт. Убраны несуществующие исключения ---
 from google import genai
 from google.genai import types
 
@@ -43,13 +42,17 @@ except FileNotFoundError:
 
 # --- КЛАСС ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ ---
 class PostgresPersistence(BasePersistence):
-    # (Код без изменений, он работает отлично)
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
         self.dsn = database_url
-        try: self._connect(); self._initialize_db()
-        except psycopg2.Error as e: logger.critical(f"PostgresPersistence: Не удалось подключиться к БД: {e}"); raise
+        try:
+            self._connect()
+            self._initialize_db()
+        except psycopg2.Error as e:
+            logger.critical(f"PostgresPersistence: Не удалось подключиться к БД: {e}")
+            raise
+
     def _connect(self):
         if self.db_pool:
             try: self.db_pool.closeall()
@@ -62,6 +65,7 @@ class PostgresPersistence(BasePersistence):
              dsn = f"{dsn}?{keepalive_options}"
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=dsn)
         logger.info(f"Пул соединений с БД (пере)создан.")
+
     def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=3):
         if not self.db_pool: raise ConnectionError("Пул соединений не инициализирован.")
         last_exception = None
@@ -84,13 +88,16 @@ class PostgresPersistence(BasePersistence):
                 if conn: self.db_pool.putconn(conn)
         logger.error(f"Postgres: Не удалось выполнить запрос после {retries} попыток. Последняя ошибка: {last_exception}")
         return None
+    
     def _initialize_db(self): self._execute("CREATE TABLE IF NOT EXISTS persistence_data (key TEXT PRIMARY KEY, data BYTEA NOT NULL);")
     def _get_pickled(self, key: str) -> object | None:
         res = self._execute("SELECT data FROM persistence_data WHERE key = %s;", (key,), fetch="one")
         return pickle.loads(res[0]) if res and res[0] else None
     def _set_pickled(self, key: str, data: object) -> None: self._execute("INSERT INTO persistence_data (key, data) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET data = %s;", (key, pickle.dumps(data), pickle.dumps(data)))
+    
     async def get_bot_data(self) -> dict: return await asyncio.to_thread(self._get_pickled, "bot_data") or {}
     async def update_bot_data(self, data: dict) -> None: await asyncio.to_thread(self._set_pickled, "bot_data", data)
+    
     async def get_chat_data(self) -> defaultdict[int, dict]:
         all_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'chat_data_%';", fetch="all")
         chat_data = defaultdict(dict)
@@ -99,9 +106,17 @@ class PostgresPersistence(BasePersistence):
                 try: chat_data[int(k.split('_')[-1])] = pickle.loads(d)
                 except (ValueError, IndexError): logger.warning(f"Обнаружен некорректный ключ чата в БД: '{k}'. Запись пропущена.")
         return chat_data
+    
     async def update_chat_data(self, chat_id: int, data: dict) -> None: await asyncio.to_thread(self._set_pickled, f"chat_data_{chat_id}", data)
     async def get_user_data(self) -> defaultdict[int, dict]: return defaultdict(dict)
     async def update_user_data(self, user_id: int, data: dict) -> None: pass
+    
+    # --- ИЗМЕНЕНО: Восстановлены обязательные абстрактные методы ---
+    async def drop_chat_data(self, chat_id: int) -> None:
+        await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"chat_data_{chat_id}",))
+    async def drop_user_data(self, user_id: int) -> None:
+        await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"user_data_{user_id}",))
+    
     async def get_callback_data(self) -> dict | None: return None
     async def update_callback_data(self, data: dict) -> None: pass
     async def get_conversations(self, name: str) -> dict: return {}
@@ -167,7 +182,8 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         history.append({"role": "model", "parts": [{"text": reply_text}]})
         context.chat_data['history'] = history[-MAX_HISTORY_MESSAGES:]
         
-        await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        # Используем reply_html для большей надежности с HTML
+        await update.message.reply_html(reply_text, disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Ошибка при генерации ответа: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка: {str(e)[:200]}")
@@ -176,10 +192,21 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я Женя, ваш ассистент. Просто напишите мне, отправьте фото или файл.")
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     context.chat_data.clear()
+    if context.application.persistence:
+        await context.application.persistence.drop_chat_data(chat_id)
     await update.message.reply_text("История чата очищена.")
 
 # --- ОБРАБОТЧИКИ КОНТЕНТА ---
+def extract_general_url(text: str) -> str | None:
+    match = re.search(r'https?://[^\s<>"\'`]+', text)
+    return match.group(0).rstrip('.,?!') if match else None
+
+def extract_youtube_id(url_text: str) -> str | None:
+    match = re.search(r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})", url_text)
+    return match.group(1) if match else None
+
 async def handle_text_and_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, text = update.message, (update.message.text or "").strip()
     if not text: return
@@ -273,10 +300,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     client = context.bot_data['gemini_client']
     model = client.generative_model(DEFAULT_MODEL)
-    response = await model.generate_content_async(["Расшифруй аудио и ответь на него.", types.Part(data=file_bytes, mime_type="audio/ogg")])
+    response = await model.generate_content_async([types.Part(text="Расшифруй аудио и ответь на него."), types.Part(data=file_bytes, mime_type="audio/ogg")])
     
     await process_query(update, context, [types.Part(text=response.text)])
-
 
 # --- ФУНКЦИИ ЗАПУСКА И ОСТАНОВКИ ---
 async def handle_telegram_webhook(request: aiohttp.web.Request):
@@ -288,14 +314,18 @@ async def handle_telegram_webhook(request: aiohttp.web.Request):
     except Exception as e:
         logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
         return aiohttp.web.Response(status=500)
+
 async def run_web_server(application: Application, stop_event: asyncio.Event):
     app = aiohttp.web.Application()
     app['bot_app'] = application
     app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), handle_telegram_webhook)
-    runner, site = aiohttp.web.AppRunner(app), aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
     await site.start()
     await stop_event.wait()
     await runner.cleanup()
+
 async def main():
     persistence = PostgresPersistence(database_url=DATABASE_URL) if DATABASE_URL else None
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
