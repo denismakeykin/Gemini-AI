@@ -230,27 +230,23 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     try:
         context_for_model = build_context_for_model(context.chat_data.get("history", []))
         
-        # --- ИСПРАВЛЕННЫЙ БЛОК ---
         thinking_mode = context.user_data.get('thinking_mode', 'auto')
-        thinking_config = {}  # По умолчанию пустой конфиг
+        thinking_config = {}
         if thinking_mode == 'max':
             thinking_config['budget'] = 24576
             logger.info("Используется максимальный бюджет мышления (24576).")
-        else:  # auto
+        else:
             logger.info("Используется автоматический бюджет мышления.")
         
-        request_config = types.GenerateContentConfig(
-            temperature=1.0, 
+        # --- ИСПРАВЛЕННЫЙ БЛОК ---
+        stream = await client.aio.models.generate_content_stream(
+            model=f'models/{DEFAULT_MODEL}',
+            contents=context_for_model,
+            temperature=1.0,
             max_output_tokens=MAX_OUTPUT_TOKENS,
             thinking_config=thinking_config,
             tools=[types.Tool(google_search=types.GoogleSearch())],
             system_instruction=system_instruction_text
-        )
-        
-        stream = await client.aio.models.generate_content_stream(
-            model=f'models/{DEFAULT_MODEL}',
-            contents=context_for_model,
-            generation_config=request_config
         )
 
         full_reply_text = await stream_and_send_reply(placeholder_message, stream)
@@ -438,8 +434,6 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
     application = builder.build()
     await application.initialize()
     
-    # Правильная инициализация клиента в новом SDK
-    # Ключ GOOGLE_API_KEY подхватывается из переменных окружения автоматически
     client = genai.Client()
     application.bot_data['gemini_client'] = client
     application.bot_data['http_client'] = httpx.AsyncClient()
