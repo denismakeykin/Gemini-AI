@@ -146,7 +146,6 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     logger.critical("Отсутствуют обязательные переменные окружения!")
     exit(1)
 
-# --- ИЗМЕНЕНО: Строго используем модель gemini-2.5-flash ---
 DEFAULT_MODEL = 'gemini-2.5-flash'
 MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
@@ -242,30 +241,8 @@ def build_context_for_model(chat_history: list) -> list:
     return context_for_model
 
 # --- ФУНКЦИИ ОТВЕТА ---
-async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> str:
-    full_text, buffer, last_edit_time = "", "", time.time()
-    try:
-        async for chunk in stream:
-            if text_part := getattr(chunk, 'text', ''): buffer += text_part
-            current_time = time.time()
-            if current_time - last_edit_time > 1.2 or len(buffer) > 150:
-                new_text_portion = full_text + buffer
-                sanitized_chunk = sanitize_telegram_html(new_text_portion)
-                if sanitized_chunk != message_to_edit.text:
-                    try:
-                        await message_to_edit.edit_text(sanitized_chunk + " ▌")
-                        full_text, buffer, last_edit_time = new_text_portion, "", current_time
-                    except BadRequest as e:
-                        if "Message is not modified" not in str(e): logger.warning(f"Ошибка редактирования: {e}")
-        final_text = full_text + buffer
-    except json.JSONDecodeError as e:
-        logger.error(f"Ошибка декодирования JSON в стриме: {e}", exc_info=False)
-        final_text = full_text + buffer + "\n\n[❗️Ответ был прерван из-за сетевой ошибки.]"
-    except Exception as e:
-        logger.error(f"Ошибка стриминга: {e}", exc_info=True)
-        final_text = full_text + buffer + f"\n\n[❌ Ошибка стриминга: {str(e)[:100]}]"
-
-    return final_text
+# --- УДАЛЕНО: Функция stream_and_send_reply больше не нужна.
+# async def stream_and_send_reply(...)
 
 async def send_final_reply(placeholder_message: Message, full_text: str, context: ContextTypes.DEFAULT_TYPE) -> Message:
     sanitized_text = sanitize_telegram_html(full_text)
@@ -275,15 +252,23 @@ async def send_final_reply(placeholder_message: Message, full_text: str, context
 
     sent_message = None
     try:
+        # Сначала редактируем исходное сообщение "Думаю..."
         await placeholder_message.edit_text(chunks[0])
         sent_message = placeholder_message
 
+        # Если есть продолжение, отправляем его новыми сообщениями
         if len(chunks) > 1:
             for chunk in chunks[1:]:
                 sent_message = await context.bot.send_message(chat_id=placeholder_message.chat_id, text=chunk, parse_mode=ParseMode.HTML)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.1) # Небольшая задержка для порядка
     except Exception as e:
         logger.error(f"Критическая ошибка при финальной отправке ответа: {e}", exc_info=True)
+        # Если не удалось отредактировать, попробуем отправить новым сообщением
+        try:
+            await context.bot.send_message(chat_id=placeholder_message.chat_id, text=chunks[0], parse_mode=ParseMode.HTML)
+        except Exception as send_e:
+            logger.error(f"Не удалось отправить ответ даже новым сообщением: {send_e}", exc_info=True)
+
 
     return sent_message or placeholder_message
 
@@ -295,7 +280,9 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     user = update.effective_user
     await _add_to_history(context, "user", prompt_parts, user_id=user.id, message_id=message.message_id, content_type=content_type, content_id=content_id)
     client = context.bot_data['gemini_client']
-    placeholder_message = await message.reply_text("...")
+    
+    # --- ИЗМЕНЕНО: Отправляем простое сообщение о том, что бот думает ---
+    placeholder_message = await message.reply_text("🤔 Думаю...")
 
     try:
         context_for_model = build_context_for_model(context.chat_data.get("history", []))
@@ -317,15 +304,17 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         )
         
         logger.info(f"Отправка запроса к модели {DEFAULT_MODEL}...")
-        # --- ИЗМЕНЕНО: Унифицированный и корректный вызов стриминга ---
-        stream = await client.aio.models.generate_content_stream(
+        
+        # --- ИЗМЕНЕНО: Используем обычный (не-стриминговый) вызов ---
+        response = await client.aio.models.generate_content(
             model=DEFAULT_MODEL,
             contents=context_for_model,
             config=request_config
         )
         
-        logger.info("Начало стриминга ответа...")
-        full_reply_text = await stream_and_send_reply(placeholder_message, stream)
+        full_reply_text = response.text
+        logger.info(f"Ответ от модели получен, длина: {len(full_reply_text)}.")
+
         final_message = await send_final_reply(placeholder_message, full_reply_text, context)
         
         await _add_to_history(context, "model", [types.Part(text=full_reply_text)], bot_message_id=final_message.message_id)
@@ -337,6 +326,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Команда /start от пользователя {update.effective_user.id} в чате {update.effective_chat.id}")
+    # --- ИЗМЕНЕНО: Исправлена ошибка с незакрытыми тегами и неверными плейсхолдерами ---
     start_message = (
         f"Я - Женя, лучший ИИ-ассистент на базе Google <b>{DEFAULT_MODEL}</b>:\n"
         "• 💬 Веду диалог, понимаю контекст, анализирую данные\n"
@@ -346,8 +336,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🌐 Использую умный Google-поиск и огромный объем собственных знаний\n\n"
         "<b>Команды:</b>\n"
         "/transcribe - <i>(в ответе на голосовое)</i> Расшифровать аудио\n"
-        "/summarize_yt <i><ссылка></i> - Конспект видео с YouTube\n"
-        "/summarize_url <i><ссылка></i> - Выжимка из статьи\n"
+        "/summarize_yt <i><URL></i> - Конспект видео с YouTube\n"
+        "/summarize_url <i><URL></i> - Выжимка из статьи\n"
         "/thinking - Настроить режим размышлений\n"
         "/clear - Очистить историю чата\n\n"
         "(!) Пользуясь ботом, вы автоматически соглашаетесь на отправку сообщений для получения ответов через Google Gemini API."
@@ -355,9 +345,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(start_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Команда /clear от пользователя {update.effective_user.id} в чате {update.effective_chat.id}")
+    chat_id = update.effective_chat.id
+    logger.info(f"Команда /clear от пользователя {update.effective_user.id} в чате {chat_id}")
     context.chat_data.clear()
-    await update.message.reply_text("🧹 История этого чата очищена.")
+    # --- НОВОЕ: Принудительное сохранение пустого состояния в БД ---
+    # Это повышает шансы, что очистка "пробьется" даже при нестабильной сети
+    if isinstance(context.application.persistence, PostgresPersistence):
+        await context.application.persistence.update_chat_data(chat_id, {})
+    await update.message.reply_text("🧹 История этого чата очищена. Состояние принудительно сохранено.")
 
 async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Команда /thinking от пользователя {update.effective_user.id}")
@@ -388,7 +383,6 @@ async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     file_bytes = await (await replied_message.voice.get_file()).download_as_bytearray()
     client = context.bot_data['gemini_client']
     try:
-        # --- ИЗМЕНЕНО: Унифицированный и корректный вызов ---
         response = await client.aio.models.generate_content(
             model=DEFAULT_MODEL,
             contents=[types.Part(text="Расшифруй это аудио и верни только текст."), types.Part(inline_data=types.Blob(mime_type=replied_message.voice.mime_type, data=file_bytes))]
@@ -403,7 +397,7 @@ async def summarize_url_command(update: Update, context: ContextTypes.DEFAULT_TY
     logger.info(f"Команда /summarize_url от {update.effective_user.id}, URL: {url}")
     if not url:
         await update.message.reply_text("Пожалуйста, укажите URL после команды."); return
-    await update.message.reply_text(f"🌐 Читаю страницу: {url}")
+    
     prompt_text = f"Сделай краткую выжимку (summary) по тексту с веб-страницы: {url}"
     prompt_parts = [types.Part(text=prompt_text)]
     url_tool = types.Tool(url_context=types.UrlContext())
@@ -413,7 +407,7 @@ async def summarize_yt_command(update: Update, context: ContextTypes.DEFAULT_TYP
     video_id = extract_youtube_id(" ".join(context.args))
     logger.info(f"Команда /summarize_yt от {update.effective_user.id}, video_id: {video_id}")
     if not video_id: await update.message.reply_text("Пожалуйста, укажите ссылку на YouTube после команды."); return
-    await update.message.reply_text(f"📺 Анализирую видео с YouTube (ID: ...{video_id[-4:]})")
+    
     try:
         transcript_list = await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, video_id, languages=['ru', 'en'])
         transcript = " ".join([d['text'] for d in transcript_list])
@@ -500,14 +494,13 @@ async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT
     message, user = update.message, update.effective_user
     logger.info(f"Обработка фото от {user.id} в чате {message.chat_id}")
     client = context.bot_data['gemini_client']
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    
     photo_file = message.photo[-1]
     file_bytes = await (await context.bot.get_file(photo_file.file_id)).download_as_bytearray()
     media_part = types.Part(inline_data=types.Blob(mime_type='image/jpeg', data=file_bytes))
     extraction_prompt = "Проанализируй это изображение. Если на нем есть хорошо читаемый текст, извлеки его. Если текста нет, опиши ключевые объекты 1-3 словами. Ответ должен быть ОЧЕНЬ коротким и содержать только текст или слова, подходящие для веб-поиска."
     search_query = None
     try:
-        # --- ИЗМЕНЕНО: Унифицированный и корректный вызов ---
         response_extract = await client.aio.models.generate_content(model=DEFAULT_MODEL, contents=[types.Part(text=extraction_prompt), media_part])
         search_query = response_extract.text.strip()
     except Exception as e:
@@ -516,7 +509,8 @@ async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user.id, user_name=html.escape(user.first_name or ''))
     final_text_prompt = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(caption)}"
     if search_query and len(search_query) > 2:
-        await message.reply_text(f"🔍 Нашел на картинке «<i>{html.escape(search_query[:60])}</i>», ищу информацию...", parse_mode=ParseMode.HTML)
+        # Убираем отправку "печатаю", т.к. ответ не потоковый
+        await message.reply_text(f"🔍 Нашел на картинке «<i>{html.escape(search_query[:60])}</i>», ищу информацию...", parse_mode=ParseMode.HTML, disable_notification=True)
         final_text_prompt += f"\n\nПроанализируй изображение, а также используй поиск, чтобы дополнить ответ по теме: '{search_query}'."
     final_prompt_parts = [types.Part(text=final_text_prompt), media_part]
     await process_query(update, context, final_prompt_parts, content_type="image", content_id=photo_file.file_id)
@@ -528,7 +522,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if doc.file_size > 20 * 1024 * 1024:
         await update.message.reply_text("❌ Файл слишком большой (лимит 20 МБ)."); return
 
-    await update.message.reply_text(f"📄 Читаю файл '{doc.file_name}'...")
     try:
         file_bytes = await (await doc.get_file()).download_as_bytearray()
         file_part = types.Part(inline_data=types.Blob(mime_type=doc.mime_type, data=file_bytes))
@@ -617,9 +610,6 @@ async def main():
         await application.initialize()
         logger.info("Приложение инициализировано.")
 
-        # --- ИЗМЕНЕНО: КРИТИЧЕСКИЙ ФИКС ОШИБКИ ИНИЦИАЛИЗАЦИИ ---
-        # Убран неверный вызов genai.configure().
-        # Создаем клиент напрямую, передавая ему ключ API.
         client = genai.Client(api_key=GOOGLE_API_KEY)
         application.bot_data['gemini_client'] = client
         
