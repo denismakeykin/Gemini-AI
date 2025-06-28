@@ -233,8 +233,8 @@ def build_context_for_model(chat_history: list) -> list:
         
         entry_text = ""
         if parts := entry.get("parts"):
-            # Расчет длины только для текстовых частей
-            entry_text = "".join(p if isinstance(p, str) else getattr(p, 'text', '') for p in parts)
+            # ИЗМЕНЕНО: Добавлена проверка `if p` для защиты от None
+            entry_text = "".join(p if isinstance(p, str) else getattr(p, 'text', '') for p in parts if p)
 
         entry_chars = len(entry_text)
         if current_chars + entry_chars > MAX_CONTEXT_CHARS and context_for_model:
@@ -242,8 +242,13 @@ def build_context_for_model(chat_history: list) -> list:
             break
         
         try:
-            # ИЗМЕНЕНО: "Ремонтируем" на лету старые записи, где parts могли быть строками
-            repaired_parts = [p if not isinstance(p, str) else types.Part(text=p) for p in entry.get("parts", [])]
+            # ИЗМЕНЕНО: Добавлена проверка `if p is not None` для полной защиты от "проклятых" записей.
+            repaired_parts = [
+                types.Part(text=p) if isinstance(p, str) else p 
+                for p in entry.get("parts", []) if p is not None
+            ]
+            if not repaired_parts: continue # Пропускаем записи без валидных частей
+
             content_object = types.Content(role=entry["role"], parts=repaired_parts)
             context_for_model.insert(0, content_object)
             current_chars += entry_chars
@@ -336,7 +341,6 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         full_reply_text = await stream_and_send_reply(placeholder_message, stream)
         final_message = await send_final_reply(placeholder_message, full_reply_text, context)
         
-        # ИЗМЕНЕНО: Сохраняем ответ модели тоже в формате types.Part
         await _add_to_history(context, "model", [types.Part(text=full_reply_text)], bot_message_id=final_message.message_id)
         logger.info(f"Ответ успешно отправлен в чат {message.chat_id}.")
     except Exception as e:
