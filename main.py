@@ -31,17 +31,9 @@ from telegram.error import BadRequest
 
 from google import genai
 from google.genai import types
-from google.generativeai.types import (
-    BlockedPromptException as RealBlockedPromptException, 
-    StopCandidateException as RealStopCandidateException,
-)
 
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from pdfminer.high_level import extract_text
-
-# --- ЗАГЛУШКИ ДЛЯ ОБРАТНОЙ СОВМЕСТИМОСТИ (ЕСЛИ НУЖНО) ---
-BlockedPromptException = RealBlockedPromptException
-StopCandidateException = RealStopCandidateException
 
 try:
     with open('system_prompt.md', 'r', encoding='utf-8') as f:
@@ -51,7 +43,7 @@ except FileNotFoundError:
     logger.critical("Критическая ошибка: файл system_prompt.md не найден!")
     exit(1)
 
-# --- БАЗА ДАННЫХ (ИЗ СТАРОГО КОДА, УЛУЧШЕННАЯ) ---
+# --- БАЗА ДАННЫХ (НАДЕЖНАЯ ВЕРСИЯ) ---
 class PostgresPersistence(BasePersistence):
     def __init__(self, database_url: str):
         super().__init__()
@@ -184,7 +176,7 @@ def sanitize_telegram_html(raw_html: str) -> str:
     if not raw_html: return ""
     s = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
     s = re.sub(r'<li>', '• ', s, flags=re.IGNORECASE)
-    s = re.sub(r'</?(?!b>|i>|u>|s>|code|pre>|a>|tg-spoiler>)\w+\s*[^>]*>', '', s)
+    s = re.sub(r'</?(?!b>|i>|u>|s>|code>|pre>|a>|tg-spoiler>)\w+\s*[^>]*>', '', s)
     return s.strip()
 
 def html_safe_chunker(text: str, chunk_size: int = 4096) -> list[str]:
