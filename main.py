@@ -296,20 +296,20 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     try:
         context_for_model = build_context_for_model(context.chat_data.get("history", []))
 
-        # ИЗМЕНЕНО: Создание thinking_config через специальный класс types.ThinkingConfig
+        # ИЗМЕНЕНО: Создаем thinking_config только при необходимости и без невалидных параметров
         thinking_budget_mode = context.user_data.get('thinking_budget', 'auto')
-        thinking_kwargs = {'mode': 'auto'}
+        thinking_config_obj = None  # По умолчанию конфига нет
         if thinking_budget_mode == 'max':
-            thinking_kwargs['budget'] = 24576
             logger.info("Используется максимальный бюджет мышления (24576).")
-        thinking_config_obj = types.ThinkingConfig(**thinking_kwargs)
+            # Создаем объект только с валидным параметром 'budget'
+            thinking_config_obj = types.ThinkingConfig(budget=24576)
 
         request_config = types.GenerateContentConfig(
             temperature=1.0, 
             max_output_tokens=MAX_OUTPUT_TOKENS,
             system_instruction=system_instruction_text,
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            thinking_config=thinking_config_obj  # ИЗМЕНЕНО: Передаем объект правильного типа
+            thinking_config=thinking_config_obj
         )
         
         logger.info(f"Отправка запроса к модели {DEFAULT_MODEL}...")
