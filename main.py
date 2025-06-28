@@ -13,37 +13,27 @@ import io
 import html
 import time
 
-# --- ВСЕ НЕОБХОДИМЫЕ ИМПОРТЫ ИЗ ВАШЕГО КОДА ---
 import httpx
 from bs4 import BeautifulSoup
 import aiohttp
 import aiohttp.web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message, BotCommand, File
+from telegram import Update, Message, BotCommand, File
 from telegram.constants import ChatAction, ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-    BasePersistence
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, BasePersistence
 from telegram.error import BadRequest
 
-# --- КОРРЕКТНЫЙ ИМПОРТ SDK И ЕГО КОМПОНЕНТОВ ---
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold, Part
-from google.generativeai.errors import BlockedPromptError, StopCandidateError, ServerError
+# --- ИЗМЕНЕНО: Корректный импорт SDK и его типов ---
+from google import genai
+from google.genai import types
+from google.genai.errors import BlockedPromptError, StopCandidateError
 
 from duckduckgo_search import DDGS
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, RequestBlocked
 from pdfminer.high_level import extract_text
 
-# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- ЗАГРУЗКА СИСТЕМНОГО ПРОМПТА ---
 try:
     with open('system_prompt.md', 'r', encoding='utf-8') as f:
         system_instruction_text = f.read()
@@ -54,6 +44,7 @@ except FileNotFoundError:
 
 # --- КЛАСС ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ ---
 class PostgresPersistence(BasePersistence):
+    # (Код без изменений, он работает отлично)
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
@@ -117,8 +108,8 @@ class PostgresPersistence(BasePersistence):
                 except (ValueError, IndexError): logger.warning(f"Обнаружен некорректный ключ чата в БД: '{k}'. Запись пропущена.")
         return chat_data
     async def update_chat_data(self, chat_id: int, data: dict) -> None: await asyncio.to_thread(self._set_pickled, f"chat_data_{chat_id}", data)
-    async def get_user_data(self) -> defaultdict[int, dict]: return defaultdict(dict) # Упрощено, т.к. не используется
-    async def update_user_data(self, user_id: int, data: dict) -> None: pass # Упрощено
+    async def get_user_data(self) -> defaultdict[int, dict]: return defaultdict(dict)
+    async def update_user_data(self, user_id: int, data: dict) -> None: pass
     async def get_callback_data(self) -> dict | None: return None
     async def update_callback_data(self, data: dict) -> None: pass
     async def get_conversations(self, name: str) -> dict: return {}
@@ -142,66 +133,46 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 DEFAULT_MODEL = 'gemini-2.5-flash'
 MAX_HISTORY_MESSAGES = 50
 MAX_OUTPUT_TOKENS = 8192
-USER_ID_PREFIX_FORMAT = "[User {user_id}; Name: {user_name}]: "
-TARGET_TIMEZONE = "Europe/Moscow"
 SAFETY_SETTINGS = [
-    {"category": c, "threshold": HarmBlockThreshold.BLOCK_NONE} for c in 
-    (HarmCategory.HARM_CATEGORY_HARASSMENT, HarmCategory.HARM_CATEGORY_HATE_SPEECH, 
-     HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT)
+    {"category": c, "threshold": types.HarmBlockThreshold.BLOCK_NONE} for c in 
+    (types.HarmCategory.HARM_CATEGORY_HARASSMENT, types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, 
+     types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT)
 ]
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def get_current_time_str() -> str: return datetime.datetime.now(pytz.timezone(TARGET_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
-def extract_youtube_id(url_text: str) -> str | None:
-    match = re.search(r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})", url_text)
-    return match.group(1) if match else None
-def extract_general_url(text: str) -> str | None:
-    match = re.search(r'https?://[^\s<>"\'`]+', text)
-    return match.group(0).rstrip('.,?!') if match else None
-def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
-    chunks, tag_stack, remaining_text = [], [], text_to_chunk
-    tag_regex = re.compile(r'<(/?)(b|i|u|s|code|pre|a|tg-spoiler)>', re.IGNORECASE)
-    while len(remaining_text) > chunk_size:
-        split_pos = remaining_text.rfind('\n', 0, chunk_size)
-        if split_pos == -1: split_pos = chunk_size
-        current_chunk = remaining_text[:split_pos]
-        temp_stack = list(tag_stack)
-        for match in tag_regex.finditer(current_chunk):
-            tag_name, is_closing = match.group(2).lower(), bool(match.group(1))
-            if not is_closing: temp_stack.append(tag_name)
-            elif temp_stack and temp_stack[-1] == tag_name: temp_stack.pop()
-        closing_tags = ''.join(f'</{tag}>' for tag in reversed(temp_stack))
-        chunks.append(current_chunk + closing_tags)
-        tag_stack = temp_stack
-        opening_tags = ''.join(f'<{tag}>' for tag in tag_stack)
-        remaining_text = opening_tags + remaining_text[split_pos:].lstrip()
-    chunks.append(remaining_text)
-    return chunks
+def build_context_for_model(chat_history: list) -> list:
+    history_for_model, current_chars = [], 0
+    # Простая сборка истории для API
+    return chat_history[-MAX_HISTORY_MESSAGES:]
 
-# --- ФУНКЦИЯ ЗАГРУЗКИ ФАЙЛОВ ---
-async def upload_file_to_google(client: genai.GenerativeModel, file_bytes: bytes, mime_type: str | None = None) -> Part | None:
-    logger.info(f"Загрузка файла ({len(file_bytes) / 1024:.2f} KB) в Google...")
-    try:
-        # --- ИЗМЕНЕНО: Используем file_bytes напрямую. display_name убран. ---
-        uploaded_file = await client.upload_file_async(file=file_bytes, mime_type=mime_type)
-        logger.info(f"Файл успешно загружен. URI: {uploaded_file.uri}")
-        return Part.from_uri(uri=uploaded_file.uri, mime_type=uploaded_file.mime_type)
-    except Exception as e:
-        logger.error(f"Не удалось загрузить файл в Google: {e}", exc_info=True)
-        return None
+async def perform_web_search(query: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    session = context.bot_data.get('http_client')
+    search_results = None
+    if session and GOOGLE_API_KEY and GOOGLE_CSE_ID:
+        try:
+            params = {'key': GOOGLE_API_KEY, 'cx': GOOGLE_CSE_ID, 'q': query, 'num': 5, 'lr': 'lang_ru'}
+            response = await session.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=10.0)
+            if response.status_code == 200:
+                items = response.json().get('items', [])
+                search_results = "\n".join([item.get('snippet', item.get('title', '')) for item in items])
+        except Exception as e:
+            logger.error(f"Google Search Error: {e}")
+    if not search_results:
+        try:
+            results = await asyncio.to_thread(DDGS().text, keywords=query, region='ru-ru', max_results=5)
+            if results: search_results = "\n".join([r['body'] for r in results])
+        except Exception as e:
+            logger.error(f"DDG Search Error: {e}")
+    return search_results
 
 # --- ГЛАВНАЯ ФУНКЦИЯ ОБРАЩЕНИЯ К GEMINI ---
 async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list):
-    chat_id, user = update.effective_chat.id, update.effective_user
+    chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-    # Добавляем текстовую часть в историю
-    text_part = next((p.text for p in prompt_parts if hasattr(p, 'text')), "")
     history = context.chat_data.setdefault("history", [])
     history.append({"role": "user", "parts": [part.to_dict() for part in prompt_parts]})
-    if len(history) > MAX_HISTORY_MESSAGES: history.pop(0)
     
-    # Формируем контент для API
     client = context.bot_data['gemini_client']
     model = client.generative_model(DEFAULT_MODEL, safety_settings=SAFETY_SETTINGS, system_instruction=system_instruction_text)
     
@@ -209,18 +180,13 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         response = await model.generate_content_async(history)
         reply_text = response.text
         
-        # Обновляем историю ответом модели
         history.append({"role": "model", "parts": [{"text": reply_text}]})
+        context.chat_data['history'] = history[-MAX_HISTORY_MESSAGES:]
         
-        # Отправляем ответ
-        chunks = html_safe_chunker(reply_text, 4096)
-        sent_message = None
-        for i, chunk in enumerate(chunks):
-            if i == 0: sent_message = await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
-            else: sent_message = await context.bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML)
+        await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Ошибка при генерации ответа: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {str(e)[:200]}")
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,7 +200,7 @@ async def handle_text_and_links(update: Update, context: ContextTypes.DEFAULT_TY
     message, text = update.message, (update.message.text or "").strip()
     if not text: return
     
-    # --- Логика обработки ссылок (из вашего кода) ---
+    # Логика обработки ссылок
     youtube_id = extract_youtube_id(text)
     if youtube_id:
         await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
@@ -245,66 +211,80 @@ async def handle_text_and_links(update: Update, context: ContextTypes.DEFAULT_TY
         except (NoTranscriptFound, TranscriptsDisabled):
             prompt_text = f"Сделай краткое описание видео по ссылке (субтитры недоступны): {text}"
         except RequestBlocked:
-            await message.reply_text("❌ YouTube заблокировал мои запросы с этого сервера. Не могу получить субтитры."); return
+            await message.reply_text("❌ YouTube заблокировал мои запросы с этого сервера."); return
         except Exception as e:
             await message.reply_text(f"❌ Ошибка получения субтитров: {e}"); return
-        await process_query(update, context, [Part.from_text(prompt_text)])
+        await process_query(update, context, [types.Part(text=prompt_text)])
         return
 
     general_url = extract_general_url(text)
     if general_url:
         await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-        web_content = await fetch_webpage_content(general_url, context.bot_data['http_client'])
-        prompt_text = f"Проанализируй текст со страницы: {text}\n\nТЕКСТ:\n{web_content[:20000]}" if web_content else f"Не удалось загрузить страницу. Ответь, используя поиск: {text}"
-        await process_query(update, context, [Part.from_text(prompt_text)])
+        http_client = context.bot_data['http_client']
+        try:
+            response = await http_client.get(general_url, timeout=15.0, follow_redirects=True)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            for element in soup(["script", "style", "nav", "footer", "header", "aside"]): element.decompose()
+            web_content = ' '.join(soup.stripped_strings)
+            prompt_text = f"Проанализируй текст со страницы: {text}\n\nТЕКСТ:\n{web_content[:20000]}"
+        except Exception as e:
+            logger.error(f"Ошибка скрапинга {general_url}: {e}")
+            prompt_text = f"Не удалось загрузить страницу. Ответь, используя поиск: {text}"
+        await process_query(update, context, [types.Part(text=prompt_text)])
         return
         
-    await process_query(update, context, [Part.from_text(text)])
+    # Обычный текстовый запрос
+    search_results = await perform_web_search(text, context)
+    prompt_text = f"{text}\n\nРезультаты поиска:\n{search_results}" if search_results else text
+    await process_query(update, context, [types.Part(text=prompt_text)])
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, user = update.message, update.effective_user
+    message = update.message
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     photo_file = await message.photo[-1].get_file()
     photo_bytes = await photo_file.download_as_bytearray()
     
-    image_part = Part.from_data(data=photo_bytes, mime_type='image/jpeg')
+    image_part = types.Part(data=photo_bytes, mime_type='image/jpeg')
     client = context.bot_data['gemini_client']
     model = client.generative_model(DEFAULT_MODEL)
     
-    # --- Этап 1: Извлечение ---
-    extraction_prompt = "Проанализируй изображение. Если есть текст, извлеки его. Если нет, опиши ключевые объекты 1-3 словами."
-    response_extract = await model.generate_content_async([extraction_prompt, image_part])
+    # Этап 1: Извлечение
+    response_extract = await model.generate_content_async(["Опиши изображение 1-3 словами для поиска.", image_part])
     search_query = response_extract.text.strip()
     
-    # --- Этап 2: Поиск ---
+    # Этап 2: Поиск
     search_context_str = ""
     if search_query:
-        search_results, _ = await perform_web_search(search_query, context)
+        search_results = await perform_web_search(search_query, context)
         if search_results:
-            search_context_str = f"\n\n==== РЕЗУЛЬТАТЫ ПОИСКА по '{html.escape(search_query)}' ====\n{search_results}"
-            await message.reply_text(f"🔍 Нашел на картинке «_{html.escape(search_query[:60])}_»...", parse_mode=ParseMode.HTML, disable_notification=True)
+            search_context_str = f"\n\nРезультаты поиска по '{html.escape(search_query)}':\n{search_results}"
     
-    # --- Этап 3: Финальный анализ ---
+    # Этап 3: Финальный анализ
     final_prompt_text = f"Подробно опиши изображение и ответь на комментарий: '{message.caption or ''}'. {search_context_str}"
-    await process_query(update, context, [Part.from_text(final_prompt_text), image_part])
+    await process_query(update, context, [types.Part(text=final_prompt_text), image_part])
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, doc = update.message, update.message.document
     if not doc: return
     
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-    tg_file = await doc.get_file()
-    file_bytes = await tg_file.download_as_bytearray()
-
-    # --- ИЗМЕНЕНО: Загрузка через upload_file ---
-    client = context.bot_data['gemini_client']
-    file_part = await upload_file_to_google(client, file_bytes, doc.mime_type)
+    mime_type = doc.mime_type or "application/octet-stream"
+    if not (mime_type.startswith('text/') or mime_type == 'application/pdf'):
+        await message.reply_text(f"⚠️ Пока могу читать только текстовые файлы и PDF. Ваш тип: `{mime_type}`"); return
     
-    if not file_part:
-        await message.reply_text("❌ Не удалось загрузить файл для обработки."); return
-        
-    prompt_text = f"Проанализируй этот файл. Мой комментарий: '{message.caption or ''}'"
-    await process_query(update, context, [Part.from_text(prompt_text), file_part])
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    doc_file = await doc.get_file()
+    file_bytes = await doc_file.download_as_bytearray()
+
+    text = ""
+    if mime_type == 'application/pdf':
+        try: text = await asyncio.to_thread(extract_text, io.BytesIO(file_bytes))
+        except Exception as e: await message.reply_text(f"❌ Не удалось извлечь текст из PDF: {e}"); return
+    else:
+        try: text = file_bytes.decode('utf-8')
+        except UnicodeDecodeError: text = file_bytes.decode('cp1251', errors='ignore')
+    
+    prompt_text = f"Проанализируй текст из файла '{doc.file_name}'. Мой комментарий: '{message.caption or ''}'\n\nТЕКСТ:\n{text[:20000]}"
+    await process_query(update, context, [types.Part(text=prompt_text)])
 
 # --- ФУНКЦИИ ЗАПУСКА И ОСТАНОВКИ ---
 async def handle_telegram_webhook(request: aiohttp.web.Request):
@@ -320,17 +300,19 @@ async def run_web_server(application: Application, stop_event: asyncio.Event):
     app = aiohttp.web.Application()
     app['bot_app'] = application
     app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), handle_telegram_webhook)
-    runner, site = aiohttp.web.AppRunner(app), aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
     await site.start()
     await stop_event.wait()
     await runner.cleanup()
 async def main():
-    client = genai.Client(api_key=GOOGLE_API_KEY)
     persistence = PostgresPersistence(database_url=DATABASE_URL) if DATABASE_URL else None
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
     if persistence: builder.persistence(persistence)
     application = builder.build()
-    application.bot_data['gemini_client'] = client
+    
+    application.bot_data['gemini_client'] = genai.Client(api_key=GOOGLE_API_KEY)
     application.bot_data['http_client'] = httpx.AsyncClient()
 
     application.add_handler(CommandHandler("start", start))
@@ -338,7 +320,7 @@ async def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_and_links))
-    application.add_handler(MessageHandler(filters.VOICE, handle_file)) # Голос как файл
+    application.add_handler(MessageHandler(filters.VOICE, handle_text_and_links))
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
