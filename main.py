@@ -239,23 +239,19 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
             thinking_config['mode'] = 'auto'
             logger.info("Используется автоматический бюджет мышления.")
 
-        # В новом SDK `generation_config`
+        # --- ИСПРАВЛЕННЫЙ БЛОК ---
         request_config = types.GenerateContentConfig(
             temperature=1.0, 
             max_output_tokens=MAX_OUTPUT_TOKENS,
-            thinking_config=thinking_config
+            thinking_config=thinking_config,
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            system_instruction=system_instruction_text
         )
         
-        # системный промпт и тулзы теперь передаются на верхнем уровне
-        final_contents = context_for_model
-        
-        model = client.get_model(f'models/{DEFAULT_MODEL}')
-        
-        stream = await model.generate_content_async(
-            contents=final_contents, 
-            generation_config=request_config,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            system_instruction=system_instruction_text,
+        stream = await client.aio.models.generate_content_stream(
+            model=f'models/{DEFAULT_MODEL}',
+            contents=context_for_model,
+            generation_config=request_config
         )
 
         full_reply_text = await stream_and_send_reply(placeholder_message, stream)
@@ -266,7 +262,6 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # --- ИСПРАВЛЕННЫЙ БЛОК ---
     start_message = (
         "Я - Женя, лучший ИИ-ассистент на базе Google GEMINI 2.5 Flash:\n"
         "• 💬 Веду диалог, понимаю контекст, анализирую данные\n"
@@ -313,9 +308,10 @@ async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("🎤 Расшифровываю...")
     file_bytes = await (await replied_message.voice.get_file()).download_as_bytearray()
     client = context.bot_data['gemini_client']
-    model = client.get_model(f'models/{DEFAULT_MODEL}')
     try:
-        response = await model.generate_content_async(
+        # --- ИСПРАВЛЕННЫЙ БЛОК ---
+        response = await client.aio.models.generate_content(
+            model=f'models/{DEFAULT_MODEL}',
             contents=[{"text": "Расшифруй это аудио и верни только текст."}, types.Part(inline_data=types.Blob(mime_type=replied_message.voice.mime_type, data=file_bytes))]
         )
         await update.message.reply_text(f"<b>Транскрипт:</b>\n{html.escape(response.text)}", parse_mode=ParseMode.HTML)
@@ -397,7 +393,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, user = update.message, update.effective_user
     client = context.bot_data['gemini_client']
-    model = client.get_model(f'models/{DEFAULT_MODEL}')
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     photo_file = message.photo[-1]
     file_bytes = await (await context.bot.get_file(photo_file.file_id)).download_as_bytearray()
@@ -405,7 +400,11 @@ async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT
     extraction_prompt = "Проанализируй это изображение. Если на нем есть хорошо читаемый текст, извлеки его. Если текста нет, опиши ключевые объекты 1-3 словами. Ответ должен быть ОЧЕНЬ коротким и содержать только текст или слова, подходящие для веб-поиска."
     search_query = None
     try:
-        response_extract = await model.generate_content_async(contents=[extraction_prompt, media_part])
+        # --- ИСПРАВЛЕННЫЙ БЛОК ---
+        response_extract = await client.aio.models.generate_content(
+            model=f'models/{DEFAULT_MODEL}',
+            contents=[extraction_prompt, media_part]
+        )
         search_query = response_extract.text.strip()
     except Exception as e:
         logger.warning(f"Ошибка при извлечении ключевых слов с фото: {e}")
@@ -442,9 +441,11 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
     application = builder.build()
     await application.initialize()
     
-    # Инициализация клиентов один раз при старте
-    genai.configure(api_key=GOOGLE_API_KEY)
-    application.bot_data['gemini_client'] = genai
+    # --- ИСПРАВЛЕННЫЙ БЛОК ---
+    # Правильная инициализация клиента в новом SDK
+    # Ключ GOOGLE_API_KEY подхватывается из переменных окружения автоматически
+    client = genai.Client()
+    application.bot_data['gemini_client'] = client
     application.bot_data['http_client'] = httpx.AsyncClient()
 
     commands = [
