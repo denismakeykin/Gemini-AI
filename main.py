@@ -31,7 +31,6 @@ from telegram.error import BadRequest
 
 from google import genai
 from google.genai import types
-from google.generativeai.client import CachedContent
 
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from pdfminer.high_level import extract_text
@@ -154,7 +153,7 @@ def sanitize_telegram_html(raw_html: str) -> str:
     s = re.sub(r'</?(?!b>|i>|u>|s>|code>|pre>|a>|tg-spoiler>)\w+\s*[^>]*>', '', s)
     return s.strip()
 
-async def get_or_create_cache(context: ContextTypes.DEFAULT_TYPE, content_id: str, content_parts: List[Any]) -> CachedContent | None:
+async def get_or_create_cache(context: ContextTypes.DEFAULT_TYPE, content_id: str, content_parts: List[Any]) -> str | None:
     client = context.bot_data['gemini_client']
     cache_store = context.chat_data.setdefault("content_cache", {})
     
@@ -162,9 +161,12 @@ async def get_or_create_cache(context: ContextTypes.DEFAULT_TYPE, content_id: st
         cache_name, expiry_time = cache_store[content_id]
         if time.time() < expiry_time:
             logger.info(f"Используется существующий кэш: {cache_name}")
-            return CachedContent.get(name=cache_name)
+            return cache_name
         else:
-            logger.info(f"Кэш для {content_id} устарел.")
+            logger.info(f"Кэш для {content_id} устарел. Удаляем: {cache_name}")
+            # Безопасно пытаемся удалить старый кэш, но не падаем, если не вышло
+            try: await client.aio.caches.delete(name=cache_name)
+            except Exception as e: logger.warning(f"Не удалось удалить старый кэш {cache_name}: {e}")
             del cache_store[content_id]
 
     try:
@@ -173,7 +175,7 @@ async def get_or_create_cache(context: ContextTypes.DEFAULT_TYPE, content_id: st
         cache = await client.aio.caches.create(model=f'models/{DEFAULT_MODEL}', **cache_config)
         cache_store[content_id] = (cache.name, time.time() + CACHE_TTL_SECONDS)
         logger.info(f"Кэш {cache.name} успешно создан.")
-        return cache
+        return cache.name
     except Exception as e:
         logger.error(f"Не удалось создать кэш для {content_id}: {e}")
         return None
@@ -181,7 +183,6 @@ async def get_or_create_cache(context: ContextTypes.DEFAULT_TYPE, content_id: st
 # --- ГЛАВНЫЙ ОБРАБОТЧИК ЗАПРОСА ---
 async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str, content_parts: List[Any] = None, content_id: str = None):
     message = update.message
-    user = update.effective_user
     
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
@@ -207,30 +208,26 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         model_contents = list(chat_history)
         
         if content_id and content_parts:
-            cached_content = await get_or_create_cache(context, content_id, content_parts)
-            if cached_content:
-                config.cached_content = cached_content.name
-                model_contents.append({'role': 'user', 'parts': [{'text': user_text}]})
-            else:
-                model_contents.append({'role': 'user', 'parts': [{'text': user_text}] + content_parts})
-        else:
-            model_contents.append({'role': 'user', 'parts': [{'text': user_text}]})
-
+            cache_name = await get_or_create_cache(context, content_id, content_parts)
+            if cache_name:
+                config.cached_content = cache_name
+        
+        model_contents.append({'role': 'user', 'parts': [{'text': user_text}]})
+        
         client = context.bot_data['gemini_client']
         model = client.get_model(f"models/{DEFAULT_MODEL}")
         response = await model.generate_content_async(contents=model_contents, config=config)
 
         full_reply_text = sanitize_telegram_html(response.text)
-        sent_message = await message.reply_text(full_reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await message.reply_text(full_reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         
-        # Обновляем историю
         context.chat_data["history"] = [h.to_dict() for h in response.prompt.history]
         
     except Exception as e:
         logger.error(f"Критическая ошибка в process_query: {e}", exc_info=True)
         await message.reply_text(f"❌ Произошла серьезная ошибка: {str(e)[:500]}")
 
-# --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
+# --- ОБРАБОТЧИКИ ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Я - Женя, лучший ИИ-ассистент на базе Google GEMINI 2.5 Flash:\n"
@@ -273,11 +270,10 @@ async def select_thinking_callback(update: Update, context: ContextTypes.DEFAULT
 
 async def handle_text_or_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text or update.message.caption or ""
-    await process_query(update, context, user_text, content_parts=None, content_id=None)
+    await process_query(update, context, user_text)
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    user = update.effective_user
+    message, user = update.message, update.effective_user
     caption = message.caption or "Подробно опиши этот медиафайл."
     
     if message.photo:
@@ -323,7 +319,6 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
         BotCommand("start", "Инфо и помощь"),
         BotCommand("clear", "Очистить историю"),
         BotCommand("thinking", "Настроить режим размышлений"),
-        # Команда transcribe убрана, т.к. ее логика теперь в основном хендлере
         BotCommand("summarize_yt", "Конспект видео YouTube"),
         BotCommand("summarize_url", "Выжимка из статьи по ссылке")
     ]
