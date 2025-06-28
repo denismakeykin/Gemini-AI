@@ -24,10 +24,13 @@ from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, BasePersistence, CallbackQueryHandler
 from telegram.error import BadRequest
 
-# --- ИЗМЕНЕНО: Только публичные и стабильные импорты ---
 from google import genai
 from google.genai import types
-from google.genai.errors import ServerError, DeadlineExceeded
+# --- ИЗМЕНЕНО: Импортируем только те исключения, которые точно существуют ---
+from google.genai.errors import ServerError
+
+# УДАЛЕНО: youtube-transcript-api
+# from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -146,6 +149,7 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     logger.critical("Отсутствуют обязательные переменные окружения!")
     exit(1)
 
+# --- ИЗМЕНЕНО: СТРОГО gemini-2.5-flash ---
 DEFAULT_MODEL = 'gemini-2.5-flash'
 MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
@@ -248,13 +252,14 @@ async def upload_file_to_google(context: ContextTypes.DEFAULT_TYPE, tg_file: Fil
             )
             logger.info(f"Файл '{display_name}' успешно загружен. URI: {google_file.uri}")
             return google_file
-        except (ServerError, DeadlineExceeded) as e:
+        # --- ИЗМЕНЕНО: Ловим только существующий ServerError ---
+        except ServerError as e:
             last_exception = e
-            logger.warning(f"Попытка {attempt + 1}/3: Временная ошибка при загрузке файла '{display_name}': {e}")
-            await asyncio.sleep(2 ** attempt) # Экспоненциальная задержка: 1, 2, 4 сек
+            logger.warning(f"Попытка {attempt + 1}/3: Временная ошибка сервера при загрузке файла '{display_name}': {e}")
+            await asyncio.sleep(1.5 ** attempt) # Экспоненциальная задержка: 1, 1.5, 2.25 сек
         except Exception as e:
             logger.error(f"Непредвиденная ошибка при загрузке файла '{display_name}': {e}", exc_info=True)
-            return None # Выходим при других ошибках
+            return None
     
     logger.error(f"Не удалось загрузить файл '{display_name}' после 3 попыток. Последняя ошибка: {last_exception}")
     return None
@@ -405,9 +410,10 @@ async def summarize_yt_command(update: Update, context: ContextTypes.DEFAULT_TYP
 # --- ОСНОВНЫЕ ОБРАБОТЧИКИ СООБЩЕНИЙ ---
 async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE, video_id: str, original_url: str):
     logger.info(f"Обнаружена ссылка YouTube с ID {video_id}. Использую нативный API Gemini.")
-    file_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=original_url))
-    prompt_text = "Сделай краткий конспект этого видео с YouTube. Опиши его суть, основные моменты и выводы."
-    await process_query(update, context, [types.Part(text=prompt_text), file_part], content_type="youtube", content_id=video_id)
+    # --- ИЗМЕНЕНО: gemini-2.5-flash не поддерживает file_data, передаем как UrlContext ---
+    url_tool = types.Tool(url_context=types.UrlContext())
+    prompt_text = f"Сделай краткий конспект видео с YouTube по этой ссылке: {original_url}. Опиши его суть, основные моменты и выводы. Используй поиск, чтобы найти информацию о видео, если нужно."
+    await process_query(update, context, [types.Part(text=prompt_text)], content_type="youtube", content_id=video_id, tools=[url_tool])
 
 async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, user = update.message, update.effective_user
@@ -429,9 +435,10 @@ async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_
                         prompt_text = f"Это уточняющий вопрос к предыдущему контенту. Пользователь спрашивает: '{original_text}'. Проанализируй исходный материал еще раз и ответь."
                         parts = [types.Part(text=prompt_text)]
                         try:
+                            # --- ИЗМЕНЕНО: Для ответа на файл теперь тоже используем File API ---
                             if content_type in ["document", "audio", "video", "voice"]:
                                 file_uri = content_id 
-                                file_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=file_uri)) # MIME-тип здесь не критичен, модель сама разберется по URI
+                                file_part = types.Part(file_data=types.FileData(mime_type="application/octet-stream", file_uri=file_uri))
                                 await process_query(update, context, [parts[0], file_part], content_type=content_type, content_id=content_id)
                                 return
                             elif content_type == "image":
