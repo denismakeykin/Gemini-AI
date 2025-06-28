@@ -29,6 +29,7 @@ from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, BasePersistence, CallbackQueryHandler
 from telegram.error import BadRequest
 
+# ИЗМЕНЕНО: Правильный импорт нового SDK
 from google import genai
 from google.genai import types
 
@@ -91,7 +92,7 @@ class PostgresPersistence(BasePersistence):
                 continue
             finally:
                 if conn: self.db_pool.putconn(conn)
-        
+
         logger.error(f"Postgres: Не удалось выполнить запрос после {retries} попыток. Последняя ошибка: {last_exception}")
         return None
 
@@ -100,10 +101,10 @@ class PostgresPersistence(BasePersistence):
         res = self._execute("SELECT data FROM persistence_data WHERE key = %s;", (key,), fetch="one")
         return pickle.loads(res[0]) if res and res[0] else None
     def _set_pickled(self, key: str, data: object) -> None: self._execute("INSERT INTO persistence_data (key, data) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET data = %s;", (key, pickle.dumps(data), pickle.dumps(data)))
-    
+
     async def get_bot_data(self) -> dict: return await asyncio.to_thread(self._get_pickled, "bot_data") or {}
     async def update_bot_data(self, data: dict) -> None: await asyncio.to_thread(self._set_pickled, "bot_data", data)
-    
+
     async def get_chat_data(self) -> defaultdict[int, dict]:
         all_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'chat_data_%';", fetch="all")
         chat_data = defaultdict(dict)
@@ -113,7 +114,7 @@ class PostgresPersistence(BasePersistence):
                 except (ValueError, IndexError): logger.warning(f"Обнаружен некорректный ключ чата в БД: '{k}'. Запись пропущена.")
         return chat_data
     async def update_chat_data(self, chat_id: int, data: dict) -> None: await asyncio.to_thread(self._set_pickled, f"chat_data_{chat_id}", data)
-    
+
     async def get_user_data(self) -> defaultdict[int, dict]:
         all_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'user_data_%';", fetch="all")
         user_data = defaultdict(dict)
@@ -123,7 +124,7 @@ class PostgresPersistence(BasePersistence):
                 except (ValueError, IndexError): logger.warning(f"Обнаружен некорректный ключ пользователя в БД: '{k}'. Запись пропущена.")
         return user_data
     async def update_user_data(self, user_id: int, data: dict) -> None: await asyncio.to_thread(self._set_pickled, f"user_data_{user_id}", data)
-    
+
     async def drop_chat_data(self, chat_id: int) -> None: await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"chat_data_{chat_id}",))
     async def drop_user_data(self, user_id: int) -> None: await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"user_data_{user_id}",))
 
@@ -131,7 +132,7 @@ class PostgresPersistence(BasePersistence):
     async def update_callback_data(self, data: dict) -> None: pass
     async def get_conversations(self, name: str) -> dict: return {}
     async def update_conversation(self, name: str, key: tuple, new_state: object | None) -> None: pass
-    
+
     async def refresh_bot_data(self, bot_data: dict) -> None: data = await self.get_bot_data(); bot_data.update(data)
     async def refresh_chat_data(self, chat_id: int, chat_data: dict) -> None: data = await asyncio.to_thread(self._get_pickled, f"chat_data_{chat_id}") or {}; chat_data.update(data)
     async def refresh_user_data(self, user_id: int, user_data: dict) -> None: data = await asyncio.to_thread(self._get_pickled, f"user_data_{user_id}") or {}; user_data.update(data)
@@ -145,6 +146,7 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     logger.critical("Отсутствуют обязательные переменные окружения!")
     exit(1)
 
+# ИЗМЕНЕНО: Возвращение модели 'gemini-2.5-flash' по вашему требованию
 DEFAULT_MODEL = 'gemini-2.5-flash'
 MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
@@ -190,12 +192,12 @@ def html_safe_chunker(text: str, chunk_size: int = 4096) -> list[str]:
         if len(remaining_text) <= chunk_size:
             chunks.append(remaining_text)
             break
-        
+
         split_pos = remaining_text.rfind('\n', 0, chunk_size)
         if split_pos == -1: split_pos = chunk_size
 
         current_chunk = remaining_text[:split_pos]
-        
+
         temp_stack = list(tag_stack)
         for match in tag_regex.finditer(current_chunk):
             tag_name = match.group(1).lower()
@@ -203,10 +205,10 @@ def html_safe_chunker(text: str, chunk_size: int = 4096) -> list[str]:
                 if temp_stack and temp_stack[-1] == tag_name: temp_stack.pop()
             else:
                 temp_stack.append(tag_name)
-        
+
         closing_tags = ''.join(f'</{tag}>' for tag in reversed(temp_stack))
         chunks.append(current_chunk + closing_tags)
-        
+
         tag_stack = temp_stack
         opening_tags = ''.join(f'<{tag}>' for tag in tag_stack)
         remaining_text = opening_tags + remaining_text[split_pos:].lstrip()
@@ -216,7 +218,8 @@ def html_safe_chunker(text: str, chunk_size: int = 4096) -> list[str]:
 # --- ЛОГИКА ИСТОРИИ И КОНТЕКСТА ---
 async def _add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list, **kwargs):
     history = context.chat_data.setdefault("history", [])
-    entry = {"role": role, "parts": parts, **kwargs}
+    cleaned_parts = [p.get("text") if isinstance(p, dict) and "text" in p else p for p in parts]
+    entry = {"role": role, "parts": cleaned_parts, **kwargs}
     history.append(entry)
     while len(history) > MAX_HISTORY_MESSAGES:
         history.pop(0)
@@ -226,7 +229,7 @@ def build_context_for_model(chat_history: list) -> list:
     current_chars = 0
     for entry in reversed(chat_history):
         if not all(k in entry for k in ('role', 'parts')): continue
-        entry_text = "".join(p.get("text", "") for p in entry.get("parts", []) if isinstance(p, dict))
+        entry_text = "".join(p for p in entry.get("parts", []) if isinstance(p, str))
         entry_chars = len(entry_text)
         if current_chars + entry_chars > MAX_CONTEXT_CHARS and context_for_model:
             logger.info(f"Контекст обрезан. Учтено {len(context_for_model)} из {len(chat_history)} сообщений.")
@@ -259,27 +262,27 @@ async def stream_and_send_reply(message_to_edit: Message, stream: Coroutine) -> 
     except Exception as e:
         logger.error(f"Ошибка стриминга: {e}", exc_info=True)
         final_text = full_text + buffer + f"\n\n[❌ Ошибка стриминга: {str(e)[:100]}]"
-    
+
     return final_text
 
 async def send_final_reply(placeholder_message: Message, full_text: str, context: ContextTypes.DEFAULT_TYPE) -> Message:
     sanitized_text = sanitize_telegram_html(full_text)
     if not sanitized_text.strip(): sanitized_text = "🤖 Модель не дала ответа."
-    
+
     chunks = html_safe_chunker(sanitized_text)
-    
+
     sent_message = None
     try:
         await placeholder_message.edit_text(chunks[0])
         sent_message = placeholder_message
-        
+
         if len(chunks) > 1:
             for chunk in chunks[1:]:
                 sent_message = await context.bot.send_message(chat_id=placeholder_message.chat_id, text=chunk, parse_mode=ParseMode.HTML)
                 await asyncio.sleep(0.1)
     except Exception as e:
         logger.error(f"Критическая ошибка при финальной отправке ответа: {e}", exc_info=True)
-    
+
     return sent_message or placeholder_message
 
 # --- ГЛАВНЫЙ ПРОЦЕССОР ЗАПРОСОВ ---
@@ -288,10 +291,10 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     await _add_to_history(context, "user", prompt_parts, user_id=user.id, message_id=message.message_id, content_type=content_type, content_id=content_id)
     client = context.bot_data['gemini_client']
     placeholder_message = await message.reply_text("...")
-    
+
     try:
         context_for_model = build_context_for_model(context.chat_data.get("history", []))
-        
+
         thinking_budget_mode = context.user_data.get('thinking_budget', 'auto')
         thinking_config = {'mode': 'auto'}
         if thinking_budget_mode == 'max':
@@ -305,12 +308,14 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
             thinking_config=thinking_config
         )
         stream = await client.aio.models.generate_content_stream(
-            model=f'models/{DEFAULT_MODEL}', contents=context_for_model, config=request_config
+            model=f'models/{DEFAULT_MODEL}',
+            contents=context_for_model,
+            config=request_config
         )
         full_reply_text = await stream_and_send_reply(placeholder_message, stream)
         final_message = await send_final_reply(placeholder_message, full_reply_text, context)
-
-        await _add_to_history(context, "model", [{"text": full_reply_text}], bot_message_id=final_message.message_id)
+        
+        await _add_to_history(context, "model", [full_reply_text], bot_message_id=final_message.message_id)
     except Exception as e:
         logger.error(f"Критическая ошибка в process_query: {e}", exc_info=True)
         await placeholder_message.edit_text(f"❌ Произошла серьезная ошибка: {str(e)[:500]}")
@@ -367,7 +372,7 @@ async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         response = await client.aio.models.generate_content(
             model=f'models/{DEFAULT_MODEL}',
-            contents=[{"text": "Расшифруй это аудио и верни только текст."}, types.Part(inline_data=types.Blob(mime_type=replied_message.voice.mime_type, data=file_bytes))]
+            contents=["Расшифруй это аудио и верни только текст.", types.Part(inline_data=types.Blob(mime_type=replied_message.voice.mime_type, data=file_bytes))]
         )
         await update.message.reply_text(f"<b>Транскрипт:</b>\n{html.escape(response.text)}", parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -381,7 +386,7 @@ async def summarize_url_command(update: Update, context: ContextTypes.DEFAULT_TY
     content = await fetch_webpage_content(url, context.bot_data['http_client'])
     if not content: await update.message.reply_text("❌ Не удалось получить содержимое страницы."); return
     prompt = f"Сделай краткую выжимку (summary) по тексту с веб-страницы: {url}\n\nТЕКСТ:\n{content}"
-    await process_query(update, context, [{"text": prompt}], content_type="webpage", content_id=url)
+    await process_query(update, context, [prompt], content_type="webpage", content_id=url)
 
 async def summarize_yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_id = extract_youtube_id(" ".join(context.args))
@@ -391,7 +396,7 @@ async def summarize_yt_command(update: Update, context: ContextTypes.DEFAULT_TYP
         transcript = " ".join([d['text'] for d in await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, video_id, languages=['ru', 'en'])])
     except Exception as e: await update.message.reply_text(f"❌ Ошибка получения субтитров: {e}"); return
     prompt = f"Сделай краткий конспект по транскрипту видео с YouTube.\n\nТРАНСКРИПТ:\n{transcript}"
-    await process_query(update, context, [{"text": prompt}], content_type="youtube", content_id=video_id)
+    await process_query(update, context, [prompt], content_type="youtube", content_id=video_id)
 
 # --- ОСНОВНЫЕ ОБРАБОТЧИКИ СООБЩЕНИЙ ---
 async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -407,7 +412,7 @@ async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_
                     content_type, content_id = prev_user_turn.get("content_type"), prev_user_turn.get("content_id")
                     if content_type and content_id:
                         prompt_text = f"Это уточняющий вопрос к предыдущему контенту. Пользователь спрашивает: '{original_text}'. Проанализируй исходный материал еще раз и ответь."
-                        parts = [{"text": prompt_text}]
+                        parts = [prompt_text]
                         try:
                             if content_type in ["image", "video", "voice"]:
                                 file_bytes = await(await context.bot.get_file(content_id)).download_as_bytearray()
@@ -416,21 +421,22 @@ async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_
                                 parts.append(types.Part(inline_data=types.Blob(mime_type=mime, data=file_bytes)))
                             elif content_type == "document":
                                 file_bytes = await(await context.bot.get_file(content_id)).download_as_bytearray()
-                                parts[0]["text"] += f"\n\nТЕКСТ ДОКУМЕНТА:\n{file_bytes.decode('utf-8', 'ignore')}"
+                                parts[0] += f"\n\nТЕКСТ ДОКУМЕНТА:\n{file_bytes.decode('utf-8', 'ignore')}"
                             await process_query(update, context, parts, content_type=content_type, content_id=content_id)
                             return
                         except Exception as e:
                             await message.reply_text(f"❌ Не удалось получить исходный контент для повторного анализа: {e}")
                             return
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user.id, user_name=html.escape(user.first_name or ''))
-    await process_query(update, context, [{"text": f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(original_text)}"}])
+    prompt_parts = [f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(original_text)}"]
+    await process_query(update, context, prompt_parts)
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if message.photo:
         await handle_photo_with_search(update, context)
         return
-    
+
     caption = message.caption or "Опиши, что на этом медиафайле."
     if message.video:
         file_id, mime_type, content_type = message.video.file_id, message.video.mime_type, "video"
@@ -442,7 +448,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_bytes = await (await context.bot.get_file(file_id)).download_as_bytearray()
     media_part = types.Part(inline_data=types.Blob(mime_type=mime_type, data=file_bytes))
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))
-    text_part = {"text": f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(caption)}"}
+    text_part = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(caption)}"
     await process_query(update, context, [text_part, media_part], content_type=content_type, content_id=file_id)
 
 async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -465,7 +471,7 @@ async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT
     if search_query and len(search_query) > 2:
         await message.reply_text(f"🔍 Нашел на картинке «_{html.escape(search_query[:60])}_», ищу информацию...", parse_mode=ParseMode.HTML)
         final_text_prompt += f"\n\nПроанализируй изображение, а также используй поиск, чтобы дополнить ответ по теме: '{search_query}'."
-    final_prompt_parts = [{"text": final_text_prompt}, media_part]
+    final_prompt_parts = [final_text_prompt, media_part]
     await process_query(update, context, final_prompt_parts, content_type="image", content_id=photo_file.file_id)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -483,7 +489,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption or "Проанализируй содержимое этого файла."
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))
     prompt = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}Проанализируй текст из файла '{doc.file_name}'. Мой комментарий: '{caption}'\n\nТЕКСТ:\n{text}"
-    await process_query(update, context, [{"text": prompt}], content_type="document", content_id=doc.file_id)
+    await process_query(update, context, [prompt], content_type="document", content_id=doc.file_id)
 
 # --- НОВЫЙ МЕХАНИЗМ ЗАПУСКА ---
 async def worker(application: Application, update_queue: asyncio.Queue):
@@ -513,11 +519,11 @@ async def run_web_server(update_queue: asyncio.Queue, stop_event: asyncio.Event)
             return aiohttp.web.Response(status=500)
     app.router.add_post(f"/{GEMINI_WEBHOOK_PATH.strip('/')}", webhook_handler)
     app.router.add_get('/', lambda r: aiohttp.web.Response(text="Bot is running"))
-    
+
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
     site = aiohttp.web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000")))
-    
+
     try:
         await site.start()
         logger.info(f"Веб-сервер запущен на порту {os.getenv('PORT', '10000')}.")
@@ -530,7 +536,7 @@ async def main():
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, stop_event.set)
-    
+
     update_queue = asyncio.Queue()
 
     persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
@@ -538,9 +544,11 @@ async def main():
     if persistence: builder.persistence(persistence)
     application = builder.build()
 
+    # ИЗМЕНЕНО: Правильная инициализация клиента согласно новому SDK `google-genai`
+    # Ключ API будет автоматически подхвачен из переменной окружения GOOGLE_API_KEY
     application.bot_data['gemini_client'] = genai.Client()
     application.bot_data['http_client'] = httpx.AsyncClient()
-    
+
     handlers = [
         CommandHandler("start", start), CommandHandler("clear", clear_history),
         CommandHandler("thinking", thinking_command), CommandHandler("transcribe", transcribe_command),
@@ -552,16 +560,16 @@ async def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_and_replies)
     ]
     application.add_handlers(handlers)
-    
+
     web_task, worker_task = None, None
     try:
         web_task = asyncio.create_task(run_web_server(update_queue, stop_event))
-        
+
         await application.initialize()
         logger.info("Приложение инициализировано.")
-        
+
         worker_task = asyncio.create_task(worker(application, update_queue))
-        
+
         webhook_url = f"{WEBHOOK_HOST.rstrip('/')}/{GEMINI_WEBHOOK_PATH.strip('/')}"
         await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES, secret_token=os.getenv('WEBHOOK_SECRET_TOKEN'))
         logger.info(f"Вебхук установлен: {webhook_url}")
@@ -573,7 +581,7 @@ async def main():
         ]
         await application.bot.set_my_commands(commands)
         logger.info("Команды бота установлены.")
-        
+
         await stop_event.wait()
 
     finally:
