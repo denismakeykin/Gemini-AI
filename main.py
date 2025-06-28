@@ -31,7 +31,6 @@ from telegram.error import BadRequest
 
 from google import genai
 from google.genai import types
-from google.genai.caching import CachedContent
 
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from pdfminer.high_level import extract_text
@@ -192,9 +191,12 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         )
         
         model_contents = list(history)
-        current_user_parts = [{'text': user_text}]
+        current_user_parts = [{'text': user_text}] if user_text else []
         
         if content_id and content_parts:
+            # Если есть контент, он всегда идет в запросе
+            current_user_parts.extend(content_parts)
+            # И мы также пытаемся найти для него кэш
             cache_store = context.chat_data.setdefault("content_cache", {})
             cached_item = cache_store.get(content_id)
             cache = None
@@ -218,17 +220,17 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, user
 
             if cache:
                 config.cached_content = cache.name
-            else:
-                current_user_parts.extend(content_parts)
-        
+
         model_contents.append({'role': 'user', 'parts': current_user_parts})
         
         client = context.bot_data['gemini_client']
-        response = await client.aio.models.generate_content(contents=model_contents, config=config, model=f"models/{DEFAULT_MODEL}")
+        model = client.get_model(f"models/{DEFAULT_MODEL}")
+        response = await model.generate_content_async(contents=model_contents, config=config)
 
         full_reply_text = sanitize_telegram_html(response.text)
         await message.reply_text(full_reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         
+        # Обновляем историю, сохраняя последние N сообщений
         history.append({'role': 'user', 'parts': current_user_parts})
         history.append({'role': 'model', 'parts': [{'text': full_reply_text}]})
         context.chat_data["history"] = history[-MAX_HISTORY_MESSAGES:]
@@ -279,9 +281,6 @@ async def select_thinking_callback(update: Update, context: ContextTypes.DEFAULT
 
 async def handle_text_or_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text or ""
-    # Для голосовых сообщений, просто передаем пустой текст, чтобы запустить process_query,
-    # который затем проверит наличие кэшированного контента.
-    # Фактическая расшифровка голоса происходит в `process_query` если нужно.
     await process_query(update, context, user_text)
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -321,7 +320,7 @@ async def summarize_url_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text(f"🌐 Читаю и кэширую страницу: {url}")
     content = await fetch_webpage_content(url, context.bot_data['http_client'])
     if not content: await update.message.reply_text("❌ Не удалось получить содержимое страницы."); return
-    prompt_text = f"Сделай краткую выжимку (summary) по тексту с этой веб-страницы."
+    prompt_text = "Сделай краткую выжимку (summary) по тексту с этой веб-страницы."
     await process_query(update, context, prompt_text, content_parts=[{'text': content}], content_id=url)
 
 async def summarize_yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -331,7 +330,7 @@ async def summarize_yt_command(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         transcript = " ".join([d['text'] for d in await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, video_id, languages=['ru', 'en'])])
     except Exception as e: await update.message.reply_text(f"❌ Ошибка получения субтитров: {e}"); return
-    prompt_text = f"Сделай краткий конспект по транскрипту этого видео."
+    prompt_text = "Сделай краткий конспект по транскрипту этого видео."
     await process_query(update, context, prompt_text, content_parts=[{'text': transcript}], content_id=f"yt_{video_id}")
     
 # --- НАСТРОЙКА И ЗАПУСК БОТА ---
@@ -362,8 +361,7 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
         CallbackQueryHandler(select_thinking_callback, pattern="^set_thinking_"),
         MessageHandler(filters.PHOTO | filters.VIDEO, handle_media),
         MessageHandler(filters.Document, handle_document),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_or_voice),
-        MessageHandler(filters.VOICE, handle_text_or_voice)
+        MessageHandler((filters.TEXT | filters.VOICE) & ~filters.COMMAND, handle_text_or_voice)
     ]
     application.add_handlers(handlers)
     await application.bot.set_my_commands(commands)
