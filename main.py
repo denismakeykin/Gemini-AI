@@ -236,15 +236,14 @@ def build_context_for_model(chat_history: list) -> list:
         if not raw_parts:
             continue
 
-        # ИЗМЕНЕНО: Сначала "ремонтируем" и очищаем parts
+        # ИЗМЕНЕНО: Бронебойная логика. Сначала "ремонтируем", потом используем.
         repaired_parts = [
             types.Part(text=p) if isinstance(p, str) else p 
-            for p in raw_parts if p is not None
+            for p in raw_parts if p is not None and (isinstance(p, str) or hasattr(p, 'text'))
         ]
         if not repaired_parts:
             continue
 
-        # Теперь безопасно считаем символы
         entry_text = "".join(getattr(p, 'text', '') for p in repaired_parts)
         entry_chars = len(entry_text)
         
@@ -252,7 +251,6 @@ def build_context_for_model(chat_history: list) -> list:
             logger.info(f"Контекст обрезан. Учтено {len(context_for_model)} из {len(chat_history)} сообщений.")
             break
         
-        # И безопасно создаем объект Content
         try:
             content_object = types.Content(role=entry["role"], parts=repaired_parts)
             context_for_model.insert(0, content_object)
