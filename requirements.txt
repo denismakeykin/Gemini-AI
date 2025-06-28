@@ -6,5 +6,5 @@ youtube-transcript-api
 pdfminer.six
 httpx
 beautifulsoup4
-pydantic
-aiohttp  # <<< ДОБАВЛЕНА НЕДОСТАЮЩАЯ БИБЛИОТЕКА ДЛЯ ВЕБ-СЕРВЕРА
+aiohttp
+duckduckgo-search
