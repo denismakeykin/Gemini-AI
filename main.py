@@ -232,13 +232,11 @@ def build_context_for_model(chat_history: list) -> list:
         if not all(k in entry for k in ('role', 'parts')):
             continue
 
-        # ИЗМЕНЕНО: Полностью переработанная логика для 100% надежности
-        # 1. Сначала извлекаем и "санитизируем" parts
         raw_parts = entry.get("parts", [])
         if not raw_parts:
             continue
 
-        # 2. "Ремонтируем" parts: убираем None и оборачиваем строки в objects.Part
+        # ИЗМЕНЕНО: Сначала "ремонтируем" и очищаем parts
         repaired_parts = [
             types.Part(text=p) if isinstance(p, str) else p 
             for p in raw_parts if p is not None
@@ -246,16 +244,15 @@ def build_context_for_model(chat_history: list) -> list:
         if not repaired_parts:
             continue
 
-        # 3. Теперь безопасно считаем символы, используя уже очищенный список
+        # Теперь безопасно считаем символы
         entry_text = "".join(getattr(p, 'text', '') for p in repaired_parts)
         entry_chars = len(entry_text)
         
-        # 4. Проверяем лимит
         if current_chars + entry_chars > MAX_CONTEXT_CHARS and context_for_model:
             logger.info(f"Контекст обрезан. Учтено {len(context_for_model)} из {len(chat_history)} сообщений.")
             break
         
-        # 5. Создаем финальный объект Content из очищенных данных
+        # И безопасно создаем объект Content
         try:
             content_object = types.Content(role=entry["role"], parts=repaired_parts)
             context_for_model.insert(0, content_object)
