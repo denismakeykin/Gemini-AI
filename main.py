@@ -138,7 +138,8 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     logger.critical("Отсутствуют обязательные переменные окружения!")
     exit(1)
 
-DEFAULT_MODEL = 'gemini-1.5-flash'
+# --- ИСПРАВЛЕННАЯ СТРОКА ---
+DEFAULT_MODEL = 'gemini-2.5-flash'
 MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
 MAX_CONTEXT_CHARS = 100000
@@ -211,7 +212,6 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         else:
             logger.info("Используется автоматический бюджет мышления.")
         
-        # Правильно создаем объект конфигурации
         request_config = types.GenerateContentConfig(
             temperature=1.0, 
             max_output_tokens=MAX_OUTPUT_TOKENS,
@@ -220,7 +220,6 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
             system_instruction=system_instruction_text
         )
         
-        # Используем НЕ-стриминговый метод generate_content
         response = await client.aio.models.generate_content(
             model=f'models/{DEFAULT_MODEL}',
             contents=context_for_model,
@@ -228,8 +227,10 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         )
 
         full_reply_text = sanitize_telegram_html(response.text)
-        await message.reply_text(full_reply_text, parse_mode=ParseMode.HTML)
-        await _add_to_history(context, "model", [{"text": full_reply_text}])
+        # Отправляем ответ новым сообщением, а не редактируем старое
+        sent_message = await message.reply_text(full_reply_text, parse_mode=ParseMode.HTML)
+        # Сохраняем ID нового сообщения в историю
+        await _add_to_history(context, "model", [{"text": full_reply_text}], bot_message_id=sent_message.message_id)
 
     except Exception as e:
         logger.error(f"Критическая ошибка в process_query: {e}", exc_info=True)
@@ -238,7 +239,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_message = (
-        "Я - Женя, лучший ИИ-ассистент на базе Google GEMINI 1.5 Flash:\n"
+        "Я - Женя, лучший ИИ-ассистент на базе Google GEMINI 2.5 Flash:\n"
         "• 💬 Веду диалог, понимаю контекст, анализирую данные\n"
         "• 🎤 Понимаю голосовые сообщения, могу переводить в текст\n"
         "• 🖼 Анализирую изображения и видео (до 20 мб)\n"
@@ -319,11 +320,31 @@ async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_
     message, user = update.message, update.effective_user
     original_text = (message.text or "").strip()
     if not original_text: return
+    
     if message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id:
-        # Логика для ответов на сообщения бота (уточняющие вопросы)
-        # Эта логика должна быть упрощена, т.к. message_id ответа теперь не сохраняется
-        # Пока оставляем как есть, но это может работать не идеально
-        pass 
+        history = context.chat_data.get("history", [])
+        for i in range(len(history) - 1, -1, -1):
+            if history[i].get("bot_message_id") == message.reply_to_message.message_id:
+                prev_user_turn = history[i-1] if i > 0 else None
+                if prev_user_turn and prev_user_turn.get("role") == "user":
+                    content_type, content_id = prev_user_turn.get("content_type"), prev_user_turn.get("content_id")
+                    if content_type and content_id:
+                        prompt_text = f"Это уточняющий вопрос к предыдущему контенту. Пользователь спрашивает: '{original_text}'. Проанализируй исходный материал еще раз и ответь."
+                        parts = [{"text": prompt_text}]
+                        try:
+                            if content_type in ["image", "video", "voice"]:
+                                file_bytes = await(await context.bot.get_file(content_id)).download_as_bytearray()
+                                mime, _ = mimetypes.guess_type(content_id)
+                                if not mime: mime = {'image': 'image/jpeg', 'voice': 'audio/ogg', 'video': 'video/mp4'}.get(content_type)
+                                parts.append(types.Part(inline_data=types.Blob(mime_type=mime, data=file_bytes)))
+                            elif content_type == "document":
+                                file_bytes = await(await context.bot.get_file(content_id)).download_as_bytearray()
+                                parts[0]["text"] += f"\n\nТЕКСТ ДОКУМЕНТА:\n{file_bytes.decode('utf-8', 'ignore')}"
+                            await process_query(update, context, parts, content_type=content_type, content_id=content_id)
+                            return
+                        except Exception as e:
+                            await message.reply_text(f"❌ Не удалось получить исходный контент для повторного анализа: {e}")
+                            return
     
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user.id, user_name=html.escape(user.first_name or ''))
     await process_query(update, context, [{"text": f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(original_text)}"}])
@@ -371,7 +392,6 @@ async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT
     if search_query and len(search_query) > 2:
         await message.reply_text(f"🔍 Нашел на картинке «_{html.escape(search_query[:60])}_», ищу информацию...", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     
-    # Теперь запрос на анализ фото тоже пойдет через общую функцию
     await process_query(update, context, [{"text": final_text_prompt}, media_part], content_type="image", content_id=photo_file.file_id)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
