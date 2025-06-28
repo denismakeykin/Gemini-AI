@@ -140,7 +140,7 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     exit(1)
 
 DEFAULT_MODEL = 'gemini-2.5-flash-001'
-MAX_HISTORY_MESSAGES = 100
+MAX_HISTORY_MESSAGES = 50
 MAX_OUTPUT_TOKENS = 8192
 USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow"
 CACHE_TTL_SECONDS = 3600
@@ -192,9 +192,9 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, user
         )
         
         model_contents = list(history)
+        current_user_parts = [{'text': user_text}]
         
         if content_id and content_parts:
-            # Пытаемся получить/создать кэш
             cache_store = context.chat_data.setdefault("content_cache", {})
             cached_item = cache_store.get(content_id)
             cache = None
@@ -209,9 +209,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, user
                 try:
                     logger.info(f"Создается новый кэш для {content_id}")
                     cache = await context.bot_data['gemini_client'].aio.caches.create(
-                        model=f'models/{DEFAULT_MODEL}',
-                        contents=content_parts,
-                        ttl=datetime.timedelta(seconds=CACHE_TTL_SECONDS)
+                        model=f'models/{DEFAULT_MODEL}', contents=content_parts, ttl=datetime.timedelta(seconds=CACHE_TTL_SECONDS)
                     )
                     cache_store[content_id] = {'name': cache.name, 'expiry': time.time() + CACHE_TTL_SECONDS}
                     logger.info(f"Кэш {cache.name} успешно создан.")
@@ -220,21 +218,18 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, user
 
             if cache:
                 config.cached_content = cache.name
-                model_contents.append({'role': 'user', 'parts': [{'text': user_text}]})
-            else: # Если кэш не создался, отправляем контент напрямую
-                model_contents.append({'role': 'user', 'parts': [{'text': user_text}] + content_parts})
-        else: # Обычный текстовый запрос без кэшируемого контента
-            model_contents.append({'role': 'user', 'parts': [{'text': user_text}]})
-
+            else:
+                current_user_parts.extend(content_parts)
+        
+        model_contents.append({'role': 'user', 'parts': current_user_parts})
+        
         client = context.bot_data['gemini_client']
-        model = client.get_model(f"models/{DEFAULT_MODEL}")
-        response = await model.generate_content_async(contents=model_contents, config=config)
+        response = await client.aio.models.generate_content(contents=model_contents, config=config, model=f"models/{DEFAULT_MODEL}")
 
         full_reply_text = sanitize_telegram_html(response.text)
-        sent_message = await message.reply_text(full_reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await message.reply_text(full_reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         
-        # Обновляем историю, сохраняя последние N сообщений
-        history.append({'role': 'user', 'parts': [{'text': user_text}]})
+        history.append({'role': 'user', 'parts': current_user_parts})
         history.append({'role': 'model', 'parts': [{'text': full_reply_text}]})
         context.chat_data["history"] = history[-MAX_HISTORY_MESSAGES:]
         
@@ -244,21 +239,50 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, user
 
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Я - Женя, лучший ИИ-ассистент...", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await update.message.reply_text(
+        "Я - Женя, лучший ИИ-ассистент на базе Google GEMINI 2.5 Flash:\n"
+        "• 💬 Веду диалог, понимаю контекст, анализирую данные\n"
+        "• 🎤 Понимаю голосовые сообщения, могу переводить в текст\n"
+        "• 🖼 Анализирую изображения и видео (до 20 мб)\n"
+        "• 📄 Читаю репосты, txt, pdf и веб-страницы\n"
+        "• 🌐 Использую умный Google-поиск и огромный объем собственных знаний\n\n"
+        "<b>Команды:</b>\n"
+        "/summarize_yt <i>ссылка</i> - Конспект видео с YouTube\n"
+        "/summarize_url <i>ссылка</i> - Выжимка из статьи\n"
+        "/thinking - Настроить режим размышлений\n"
+        "/clear - Очистить историю чата\n\n"
+        "(!) Пользуясь ботом, вы автоматически соглашаетесь на отправку сообщений для получения ответов через Google Gemini API.",
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    )
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.clear()
     await update.message.reply_text("🧹 История этого чата очищена.")
 
 async def thinking_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    current_mode = context.user_data.get('thinking_mode', 'auto')
+    keyboard = [
+        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'auto' else ''}Авто (Рекомендуется)", callback_data="set_thinking_auto")],
+        [InlineKeyboardButton(f"{'✅ ' if current_mode == 'max' else ''}Максимум (Медленнее)", callback_data="set_thinking_max")],
+    ]
+    await update.message.reply_text("Выберите режим размышлений модели:", reply_markup=InlineKeyboardMarkup(keyboard))
+
 async def select_thinking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений)
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split('_')[-1]
+    context.user_data['thinking_mode'] = choice
+    text = "✅ Режим размышлений установлен на **'Авто'**.\nЭто обеспечивает лучший баланс скорости и качества."
+    if choice == 'max':
+        text = "✅ Режим размышлений установлен на **'Максимум'**.\nОтветы могут быть качественнее, но и дольше."
+    await query.edit_message_text(text.replace("**", "<b>"), parse_mode=ParseMode.HTML)
 
 async def handle_text_or_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, user = update.message, update.effective_user
-    user_text = message.text or ""
-    await process_query(update, context, user_text, content_parts=None, content_id=None)
+    user_text = update.message.text or ""
+    # Для голосовых сообщений, просто передаем пустой текст, чтобы запустить process_query,
+    # который затем проверит наличие кэшированного контента.
+    # Фактическая расшифровка голоса происходит в `process_query` если нужно.
+    await process_query(update, context, user_text)
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, user = update.message, update.effective_user
