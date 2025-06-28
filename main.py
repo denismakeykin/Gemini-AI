@@ -143,7 +143,7 @@ MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
 MAX_CONTEXT_CHARS = 100000
 USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow"
-MEDIA_CONTEXT_TURNS_TTL = 4 # Сколько ходов назад бот будет помнить медиаконтекст
+MEDIA_CONTEXT_TURNS_TTL = 8 # Сколько ходов назад бот будет помнить медиаконтекст
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_current_time_str() -> str: return datetime.datetime.now(pytz.timezone(TARGET_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -377,19 +377,8 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, user = update.message, update.effective_user
     caption = message.caption or "Подробно опиши этот медиафайл."
     
-    search_query = None
     if message.photo:
         content_type, file_id, mime_type = "image", message.photo[-1].file_id, 'image/jpeg'
-        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-        file_bytes_for_search = await (await context.bot.get_file(file_id)).download_as_bytearray()
-        try:
-            extraction_prompt = "Проанализируй это изображение. Если на нем есть хорошо читаемый текст, извлеки его. Если текста нет, опиши ключевые объекты 1-3 словами. Ответ должен быть ОЧЕНЬ коротким и содержать только текст или слова, подходящие для веб-поиска."
-            response_extract = await context.bot_data['gemini_client'].aio.models.generate_content(model=f'models/{DEFAULT_MODEL}', contents=[extraction_prompt, types.Part(inline_data=types.Blob(mime_type=mime_type, data=file_bytes_for_search))])
-            search_query = response_extract.text.strip()
-            if search_query:
-                await message.reply_text(f"🔍 Нашел на картинке «_{html.escape(search_query[:60])}_», ищу информацию...", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        except Exception as e:
-            logger.warning(f"Ошибка при извлечении ключевых слов с фото: {e}")
     elif message.video:
         content_type, file_id, mime_type = "video", message.video.file_id, message.video.mime_type
     else: return
