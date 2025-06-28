@@ -69,7 +69,7 @@ class PostgresPersistence(BasePersistence):
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=dsn)
         logger.info(f"Пул соединений с БД (пере)создан.")
 
-    # ИЗМЕНЕНО: Исправлена логика обработки ошибок для предотвращения PoolError
+
     def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=3):
         if not self.db_pool: raise ConnectionError("Пул соединений не инициализирован.")
         last_exception = None
@@ -226,19 +226,31 @@ async def _add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: 
     while len(history) > MAX_HISTORY_MESSAGES:
         history.pop(0)
 
+# ИЗМЕНЕНО: Функция теперь возвращает список объектов types.Content
 def build_context_for_model(chat_history: list) -> list:
     context_for_model = []
     current_chars = 0
     for entry in reversed(chat_history):
         if not all(k in entry for k in ('role', 'parts')): continue
-        entry_text = "".join(p for p in entry.get("parts", []) if isinstance(p, str))
+        
+        entry_text = ""
+        # Проверяем, что parts существует и не пуст
+        if entry.get("parts"):
+            entry_text = "".join(p for p in entry["parts"] if isinstance(p, str))
+
         entry_chars = len(entry_text)
         if current_chars + entry_chars > MAX_CONTEXT_CHARS and context_for_model:
             logger.info(f"Контекст обрезан. Учтено {len(context_for_model)} из {len(chat_history)} сообщений.")
             break
-        clean_entry = {"role": entry["role"], "parts": entry["parts"]}
-        context_for_model.insert(0, clean_entry)
-        current_chars += entry_chars
+        
+        try:
+            # Превращаем сырой словарь из истории в объект нужного класса
+            content_object = types.Content(role=entry["role"], parts=entry["parts"])
+            context_for_model.insert(0, content_object)
+            current_chars += entry_chars
+        except Exception as e:
+            logger.warning(f"Не удалось преобразовать запись истории в Content: {e}. Запись: {entry}")
+            
     return context_for_model
 
 # --- ФУНКЦИИ ОТВЕТА ---
