@@ -218,15 +218,16 @@ def html_safe_chunker(text: str, chunk_size: int = 4096) -> list[str]:
     return chunks
 
 # --- ЛОГИКА ИСТОРИИ И КОНТЕКСТА ---
+# ИЗМЕНЕНО: Убрана некорректная "очистка", которая портила данные.
 async def _add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list, **kwargs):
     history = context.chat_data.setdefault("history", [])
-    cleaned_parts = [p.get("text") if isinstance(p, dict) and "text" in p else p for p in parts]
-    entry = {"role": role, "parts": cleaned_parts, **kwargs}
+    # Сохраняем "parts" как есть, без упрощения.
+    # Это могут быть строки, объекты types.Part и т.д.
+    entry = {"role": role, "parts": parts, **kwargs}
     history.append(entry)
     while len(history) > MAX_HISTORY_MESSAGES:
         history.pop(0)
 
-# ИЗМЕНЕНО: Функция теперь возвращает список объектов types.Content
 def build_context_for_model(chat_history: list) -> list:
     context_for_model = []
     current_chars = 0
@@ -234,9 +235,9 @@ def build_context_for_model(chat_history: list) -> list:
         if not all(k in entry for k in ('role', 'parts')): continue
         
         entry_text = ""
-        # Проверяем, что parts существует и не пуст
         if entry.get("parts"):
-            entry_text = "".join(p for p in entry["parts"] if isinstance(p, str))
+            # Расчет длины только для текстовых частей
+            entry_text = "".join(p if isinstance(p, str) else getattr(p, 'text', '') for p in entry["parts"])
 
         entry_chars = len(entry_text)
         if current_chars + entry_chars > MAX_CONTEXT_CHARS and context_for_model:
@@ -400,7 +401,7 @@ async def transcribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         response = await client.aio.models.generate_content(
             model=DEFAULT_MODEL,
-            contents=["Расшифруй это аудио и верни только текст.", types.Part(inline_data=types.Blob(mime_type=replied_message.voice.mime_type, data=file_bytes))]
+            contents=[types.Part(text="Расшифруй это аудио и верни только текст."), types.Part(inline_data=types.Blob(mime_type=replied_message.voice.mime_type, data=file_bytes))]
         )
         await update.message.reply_text(f"<b>Транскрипт:</b>\n{html.escape(response.text)}", parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -415,7 +416,7 @@ async def summarize_url_command(update: Update, context: ContextTypes.DEFAULT_TY
     content = await fetch_webpage_content(url, context.bot_data['http_client'])
     if not content: await update.message.reply_text("❌ Не удалось получить содержимое страницы."); return
     prompt = f"Сделай краткую выжимку (summary) по тексту с веб-страницы: {url}\n\nТЕКСТ:\n{content}"
-    await process_query(update, context, [prompt], content_type="webpage", content_id=url)
+    await process_query(update, context, [types.Part(text=prompt)], content_type="webpage", content_id=url)
 
 async def summarize_yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_id = extract_youtube_id(" ".join(context.args))
@@ -426,7 +427,7 @@ async def summarize_yt_command(update: Update, context: ContextTypes.DEFAULT_TYP
         transcript = " ".join([d['text'] for d in await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, video_id, languages=['ru', 'en'])])
     except Exception as e: await update.message.reply_text(f"❌ Ошибка получения субтитров: {e}"); return
     prompt = f"Сделай краткий конспект по транскрипту видео с YouTube.\n\nТРАНСКРИПТ:\n{transcript}"
-    await process_query(update, context, [prompt], content_type="youtube", content_id=video_id)
+    await process_query(update, context, [types.Part(text=prompt)], content_type="youtube", content_id=video_id)
 
 # --- ОСНОВНЫЕ ОБРАБОТЧИКИ СООБЩЕНИЙ ---
 async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -445,7 +446,7 @@ async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_
                     if content_type and content_id:
                         logger.info(f"Обработка ответа на сообщение с контентом (тип: {content_type})")
                         prompt_text = f"Это уточняющий вопрос к предыдущему контенту. Пользователь спрашивает: '{original_text}'. Проанализируй исходный материал еще раз и ответь."
-                        parts = [prompt_text]
+                        parts = [types.Part(text=prompt_text)]
                         try:
                             if content_type in ["image", "video", "voice"]:
                                 file_bytes = await(await context.bot.get_file(content_id)).download_as_bytearray()
@@ -454,7 +455,8 @@ async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_
                                 parts.append(types.Part(inline_data=types.Blob(mime_type=mime, data=file_bytes)))
                             elif content_type == "document":
                                 file_bytes = await(await context.bot.get_file(content_id)).download_as_bytearray()
-                                parts[0] += f"\n\nТЕКСТ ДОКУМЕНТА:\n{file_bytes.decode('utf-8', 'ignore')}"
+                                # Обновляем текст в первом Part
+                                parts[0].text += f"\n\nТЕКСТ ДОКУМЕНТА:\n{file_bytes.decode('utf-8', 'ignore')}"
                             await process_query(update, context, parts, content_type=content_type, content_id=content_id)
                             return
                         except Exception as e:
@@ -463,7 +465,7 @@ async def handle_text_and_replies(update: Update, context: ContextTypes.DEFAULT_
                             return
                             
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user.id, user_name=html.escape(user.first_name or ''))
-    prompt_parts = [f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(original_text)}"]
+    prompt_parts = [types.Part(text=f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(original_text)}")]
     await process_query(update, context, prompt_parts)
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -484,7 +486,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_bytes = await (await context.bot.get_file(file_id)).download_as_bytearray()
     media_part = types.Part(inline_data=types.Blob(mime_type=mime_type, data=file_bytes))
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user.id, user_name=html.escape(user.first_name or ''))
-    text_part = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(caption)}"
+    text_part = types.Part(text=f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(caption)}")
     await process_query(update, context, [text_part, media_part], content_type=content_type, content_id=file_id)
 
 async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -498,7 +500,7 @@ async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT
     extraction_prompt = "Проанализируй это изображение. Если на нем есть хорошо читаемый текст, извлеки его. Если текста нет, опиши ключевые объекты 1-3 словами. Ответ должен быть ОЧЕНЬ коротким и содержать только текст или слова, подходящие для веб-поиска."
     search_query = None
     try:
-        response_extract = await client.aio.models.generate_content(model=DEFAULT_MODEL, contents=[extraction_prompt, media_part])
+        response_extract = await client.aio.models.generate_content(model=DEFAULT_MODEL, contents=[types.Part(text=extraction_prompt), media_part])
         search_query = response_extract.text.strip()
     except Exception as e:
         logger.warning(f"Ошибка при извлечении ключевых слов с фото: {e}")
@@ -508,7 +510,7 @@ async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT
     if search_query and len(search_query) > 2:
         await message.reply_text(f"🔍 Нашел на картинке «_{html.escape(search_query[:60])}_», ищу информацию...", parse_mode=ParseMode.HTML)
         final_text_prompt += f"\n\nПроанализируй изображение, а также используй поиск, чтобы дополнить ответ по теме: '{search_query}'."
-    final_prompt_parts = [final_text_prompt, media_part]
+    final_prompt_parts = [types.Part(text=final_text_prompt), media_part]
     await process_query(update, context, final_prompt_parts, content_type="image", content_id=photo_file.file_id)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -527,7 +529,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = update.message.caption or "Проанализируй содержимое этого файла."
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))
     prompt = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}Проанализируй текст из файла '{doc.file_name}'. Мой комментарий: '{caption}'\n\nТЕКСТ:\n{text}"
-    await process_query(update, context, [prompt], content_type="document", content_id=doc.file_id)
+    await process_query(update, context, [types.Part(text=prompt)], content_type="document", content_id=doc.file_id)
 
 # --- НОВЫЙ МЕХАНИЗМ ЗАПУСКА ---
 async def worker(application: Application, update_queue: asyncio.Queue):
