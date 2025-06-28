@@ -12,7 +12,7 @@ from psycopg2 import pool
 import io
 import html
 import time
-from typing import Coroutine, Tuple, Any
+from typing import List, Dict, Any
 import mimetypes
 import json
 
@@ -143,6 +143,7 @@ MAX_HISTORY_MESSAGES = 100
 MAX_OUTPUT_TOKENS = 8192
 MAX_CONTEXT_CHARS = 100000
 USER_ID_PREFIX_FORMAT, TARGET_TIMEZONE = "[User {user_id}; Name: {user_name}]: ", "Europe/Moscow"
+MEDIA_CONTEXT_TURNS_TTL = 4 # Сколько ходов назад бот будет помнить медиаконтекст
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_current_time_str() -> str: return datetime.datetime.now(pytz.timezone(TARGET_TIMEZONE)).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -177,37 +178,41 @@ async def _add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: 
     while len(history) > MAX_HISTORY_MESSAGES:
         history.pop(0)
 
-def build_context_for_model(chat_history: list) -> list:
+def build_context_for_model(chat_history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     context_for_model = []
     current_chars = 0
     for entry in reversed(chat_history):
-        # Пропускаем системные сообщения, если они вдруг попали в историю
-        if entry.get("role") == "system" or not all(k in entry for k in ('role', 'parts')):
-            continue
+        if not all(k in entry for k in ('role', 'parts')): continue
         entry_text = "".join(p.get("text", "") for p in entry.get("parts", []) if isinstance(p, dict))
         entry_chars = len(entry_text)
         if current_chars + entry_chars > MAX_CONTEXT_CHARS and context_for_model:
             logger.info(f"Контекст обрезан. Учтено {len(context_for_model)} из {len(chat_history)} сообщений.")
             break
-        clean_entry = {"role": entry["role"], "parts": entry["parts"]}
-        context_for_model.insert(0, clean_entry)
-        current_chars += entry_chars
+        # Формируем чистую запись для API
+        clean_parts = []
+        for part in entry.get("parts", []):
+            if isinstance(part, dict) and "text" in part:
+                clean_parts.append({"text": part["text"]})
+            elif isinstance(part, types.Part): # Если это уже готовая часть (например, медиа)
+                 clean_parts.append(part)
+        if clean_parts:
+            context_for_model.insert(0, {"role": entry["role"], "parts": clean_parts})
+            current_chars += entry_chars
     return context_for_model
 
 # --- ОБРАБОТЧИК ЗАПРОСА ---
 async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list, content_type: str = None, content_id: str = None):
-    message, user = update.message, update.effective_user
+    message = update.message
+    user = update.effective_user
+    
+    # Мы добавляем в историю сообщение "user" только здесь, один раз.
     await _add_to_history(context, "user", prompt_parts, user_id=user.id, message_id=message.message_id, content_type=content_type, content_id=content_id)
-    client = context.bot_data['gemini_client']
     
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
     try:
+        # Строим контекст из истории
         chat_history = build_context_for_model(context.chat_data.get("history", []))
-        
-        # --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ ---
-        # Помещаем системный промпт в начало контекста, а не в конфиг
-        final_contents = [{"role": "system", "parts": [{"text": system_instruction_text}]}] + chat_history
         
         thinking_mode = context.user_data.get('thinking_mode', 'auto')
         thinking_config = {}
@@ -217,22 +222,26 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
         else:
             logger.info("Используется автоматический бюджет мышления.")
         
-        # Конфиг теперь не содержит system_instruction
+        # Правильно создаем объект config
         config = types.GenerateContentConfig(
             temperature=1.0, 
             max_output_tokens=MAX_OUTPUT_TOKENS,
             thinking_config=thinking_config,
-            tools=[types.Tool(google_search=types.GoogleSearch())]
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            system_instruction=system_instruction_text # Системный промпт живет здесь
         )
         
-        response = await client.aio.models.generate_content(
+        # Передаем его в generate_content под правильным именем 'config'
+        response = await context.bot_data['gemini_client'].aio.models.generate_content(
             model=f'models/{DEFAULT_MODEL}',
-            contents=final_contents, # Используем новый, дополненный контекст
+            contents=chat_history,
             config=config
         )
 
         full_reply_text = sanitize_telegram_html(response.text)
         sent_message = await message.reply_text(full_reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        
+        # Сохраняем ответ модели в историю
         await _add_to_history(context, "model", [{"text": full_reply_text}], bot_message_id=sent_message.message_id)
 
     except Exception as e:
@@ -304,8 +313,8 @@ async def summarize_url_command(update: Update, context: ContextTypes.DEFAULT_TY
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     content = await fetch_webpage_content(url, context.bot_data['http_client'])
     if not content: await update.message.reply_text("❌ Не удалось получить содержимое страницы."); return
-    prompt = f"Сделай краткую выжимку (summary) по тексту с веб-страницы: {url}\n\nТЕКСТ:\n{content}"
-    await process_query(update, context, [{"text": prompt}], content_type="webpage", content_id=url)
+    prompt_text = f"Сделай краткую выжимку (summary) по тексту с веб-страницы: {url}\n\nТЕКСТ:\n{content}"
+    await process_query(update, context, [{"text": prompt_text}], content_type="webpage", content_id=url)
 
 async def summarize_yt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_id = extract_youtube_id(" ".join(context.args))
@@ -315,54 +324,40 @@ async def summarize_yt_command(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         transcript = " ".join([d['text'] for d in await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, video_id, languages=['ru', 'en'])])
     except Exception as e: await update.message.reply_text(f"❌ Ошибка получения субтитров: {e}"); return
-    prompt = f"Сделай краткий конспект по транскрипту видео с YouTube.\n\nТРАНСКРИПТ:\n{transcript}"
-    await process_query(update, context, [{"text": prompt}], content_type="youtube", content_id=video_id)
+    prompt_text = f"Сделай краткий конспект по транскрипту видео с YouTube.\n\nТРАНСКРИПТ:\n{transcript}"
+    await process_query(update, context, [{"text": prompt_text}], content_type="youtube", content_id=video_id)
 
 async def find_and_re_analyze_context(update: Update, context: ContextTypes.DEFAULT_TYPE, original_text: str) -> bool:
     history = context.chat_data.get("history", [])
-    if len(history) < 2: return False
+    if len(history) < 1: return False
 
-    last_bot_turn = history[-1]
-    last_user_turn = history[-2]
+    # Ищем последнее сообщение от пользователя с медиа
+    last_media_turn = None
+    for i in range(len(history) - 1, -1, -1):
+        turn = history[i]
+        if turn.get("role") == "user" and turn.get("content_type") in ["image", "video", "document", "webpage", "youtube"]:
+            # Проверяем, как давно это было. Если слишком давно, игнорируем.
+            if (len(history) - 1 - i) <= MEDIA_CONTEXT_TURNS_TTL:
+                last_media_turn = turn
+            break
 
-    is_follow_up = (
-        last_user_turn.get("role") == "user" and
-        last_bot_turn.get("role") == "model" and
-        last_user_turn.get("content_type") in ["image", "video", "document", "webpage", "youtube"]
-    )
+    if not last_media_turn: return False
 
-    if not is_follow_up: return False
-
-    logger.info(f"Обнаружен уточняющий вопрос к медиа-контексту типа '{last_user_turn['content_type']}'.")
+    logger.info(f"Обнаружен уточняющий вопрос к медиа-контексту типа '{last_media_turn['content_type']}'.")
     
-    content_type = last_user_turn["content_type"]
-    content_id = last_user_turn["content_id"]
-    
+    # Теперь мы нашли "якорь". Мы должны передать его вместе с новым вопросом.
+    # Медиа-часть из старого сообщения
+    original_media_parts = [p for p in last_media_turn.get("parts", []) if not isinstance(p, dict) or "text" not in p]
+    # Текст нового вопроса
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))
-    prompt_text = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}Это уточняющий вопрос к предыдущему материалу. Пользователь спрашивает: '{original_text}'. Проанализируй ИСХОДНЫЙ материал еще раз с учетом этого вопроса и ответь."
-    parts = [{"text": prompt_text}]
-
-    try:
-        if content_type in ["image", "video", "document"]:
-            file_bytes = await (await context.bot.get_file(content_id)).download_as_bytearray()
-            mime, _ = mimetypes.guess_type(content_id if isinstance(content_id, str) else "file.bin")
-            if not mime: mime = {'image': 'image/jpeg', 'video': 'video/mp4', 'document': 'application/octet-stream'}.get(content_type)
-            parts.append(types.Part(inline_data=types.Blob(mime_type=mime, data=file_bytes)))
-        
-        elif content_type == "webpage":
-            content = await fetch_webpage_content(content_id, context.bot_data['http_client'])
-            if not content: raise ValueError("Не удалось повторно загрузить веб-страницу")
-            parts[0]["text"] += f"\n\nТЕКСТ СО СТРАНИЦЫ:\n{content}"
-        elif content_type == "youtube":
-            transcript = " ".join([d['text'] for d in await asyncio.to_thread(YouTubeTranscriptApi.get_transcript, content_id, languages=['ru', 'en'])])
-            parts[0]["text"] += f"\n\nТРАНСКРИПТ ВИДЕО:\n{transcript}"
-
-        await process_query(update, context, parts, content_type=content_type, content_id=content_id)
-        return True
-    except Exception as e:
-        logger.error(f"Не удалось получить исходный контент для повторного анализа: {e}")
-        await update.message.reply_text(f"❌ Не удалось получить исходный контент для повторного анализа: {e}")
-        return True
+    new_text_part = {"text": f"(Текущая дата: {get_current_time_str()})\n{user_prefix}Это уточняющий вопрос к предыдущему материалу. Пользователь спрашивает: '{original_text}'. Проанализируй ИСХОДНЫЙ материал еще раз с учетом этого вопроса и ответь."}
+    
+    # Объединяем новый текст и старое медиа
+    final_prompt_parts = [new_text_part] + original_media_parts
+    
+    # Запускаем process_query с этой новой "склеенной" информацией
+    await process_query(update, context, final_prompt_parts, content_type=last_media_turn["content_type"], content_id=last_media_turn["content_id"])
+    return True
 
 async def handle_text_or_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -373,14 +368,10 @@ async def handle_text_or_voice(update: Update, context: ContextTypes.DEFAULT_TYP
         file_bytes = await (await message.voice.get_file()).download_as_bytearray()
         client = context.bot_data['gemini_client']
         try:
-            # Сначала просто расшифровываем
-            response = await client.aio.models.generate_content(
-                model=f'models/{DEFAULT_MODEL}',
-                contents=[{"text": "Расшифруй это аудио и верни только текст."}, types.Part(inline_data=types.Blob(mime_type=message.voice.mime_type, data=file_bytes))]
-            )
+            response = await client.aio.models.generate_content(model=f'models/{DEFAULT_MODEL}', contents=[{"text": "Расшифруй это аудио и верни только текст."}, types.Part(inline_data=types.Blob(mime_type=message.voice.mime_type, data=file_bytes))])
             original_text = response.text.strip()
-            # Показываем пользователю, что мы расшифровали
-            await message.reply_text(f"<i>Вы сказали: «{html.escape(original_text)}»</i>", parse_mode=ParseMode.HTML)
+            if original_text:
+                 await message.reply_text(f"<i>Вы сказали: «{html.escape(original_text)}»</i>", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         except Exception as e:
             await message.reply_text(f"❌ Не смог расшифровать голосовое: {e}")
             return
@@ -393,51 +384,26 @@ async def handle_text_or_voice(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))
-    await process_query(update, context, [{"text": f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(original_text)}"}])
+    prompt_text = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(original_text)}"
+    await process_query(update, context, [{"text": prompt_text}])
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, user = update.message, update.effective_user
+    message, user = update.message
     
     caption = message.caption or "Подробно опиши этот медиафайл."
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user.id, user_name=html.escape(user.first_name or ''))
+    text_part = {"text": f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(caption)}"}
     
     if message.photo:
-        await handle_photo_with_search(update, context)
-        return
-
-    if message.video:
+        file_id, mime_type, content_type = message.photo[-1].file_id, 'image/jpeg', "image"
+    elif message.video:
         file_id, mime_type, content_type = message.video.file_id, message.video.mime_type, "video"
     else: return
 
     file_bytes = await (await context.bot.get_file(file_id)).download_as_bytearray()
     media_part = types.Part(inline_data=types.Blob(mime_type=mime_type, data=file_bytes))
-    text_part = {"text": f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(caption)}"}
     
     await process_query(update, context, [text_part, media_part], content_type=content_type, content_id=file_id)
-
-async def handle_photo_with_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, user = update.message, update.effective_user
-    client = context.bot_data['gemini_client']
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-    photo_file = message.photo[-1]
-    file_bytes = await (await context.bot.get_file(photo_file.file_id)).download_as_bytearray()
-    media_part = types.Part(inline_data=types.Blob(mime_type='image/jpeg', data=file_bytes))
-    extraction_prompt = "Проанализируй это изображение. Если на нем есть хорошо читаемый текст, извлеки его. Если текста нет, опиши ключевые объекты 1-3 словами. Ответ должен быть ОЧЕНЬ коротким и содержать только текст или слова, подходящие для веб-поиска."
-    search_query = None
-    try:
-        response_extract = await client.aio.models.generate_content(model=f'models/{DEFAULT_MODEL}', contents=[extraction_prompt, media_part])
-        search_query = response_extract.text.strip()
-    except Exception as e:
-        logger.warning(f"Ошибка при извлечении ключевых слов с фото: {e}")
-    
-    caption = message.caption or "Подробно опиши это изображение."
-    user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=user.id, user_name=html.escape(user.first_name or ''))
-    final_text_prompt = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}{html.escape(caption)}"
-    
-    if search_query and len(search_query) > 2:
-        await message.reply_text(f"🔍 Нашел на картинке «_{html.escape(search_query[:60])}_», ищу информацию...", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    
-    await process_query(update, context, [{"text": final_text_prompt}, media_part], content_type="image", content_id=photo_file.file_id)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
@@ -452,10 +418,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: text = file_bytes.decode('utf-8')
         except UnicodeDecodeError: text = file_bytes.decode('cp1251', errors='ignore')
     if error or text is None: await update.message.reply_text(error or "❌ Не удалось прочитать файл."); return
+    
     caption = update.message.caption or "Проанализируй содержимое этого файла."
     user_prefix = USER_ID_PREFIX_FORMAT.format(user_id=update.effective_user.id, user_name=html.escape(update.effective_user.first_name or ''))
-    prompt = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}Проанализируй текст из файла '{doc.file_name}'. Мой комментарий: '{caption}'\n\nТЕКСТ:\n{text}"
-    await process_query(update, context, [{"text": prompt}], content_type="document", content_id=doc.file_id)
+    prompt_text = f"(Текущая дата: {get_current_time_str()})\n{user_prefix}Проанализируй текст из файла '{doc.file_name}'. Мой комментарий: '{caption}'\n\nТЕКСТ:\n{text}"
+    await process_query(update, context, [{"text": prompt_text}], content_type="document", content_id=doc.file_id)
 
 # --- НАСТРОЙКА И ЗАПУСК БОТА ---
 async def setup_bot_and_server(stop_event: asyncio.Event):
@@ -488,7 +455,7 @@ async def setup_bot_and_server(stop_event: asyncio.Event):
         MessageHandler(filters.PHOTO | filters.VIDEO, handle_media),
         MessageHandler(filters.Document.TEXT | filters.Document.PDF, handle_document),
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_or_voice),
-        MessageHandler(filters.VOICE, handle_text_or_voice) # Отдельный хендлер для голоса
+        MessageHandler(filters.VOICE, handle_text_or_voice)
     ]
     application.add_handlers(handlers)
     await application.bot.set_my_commands(commands)
