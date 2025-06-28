@@ -229,26 +229,34 @@ def build_context_for_model(chat_history: list) -> list:
     context_for_model = []
     current_chars = 0
     for entry in reversed(chat_history):
-        if not all(k in entry for k in ('role', 'parts')): continue
-        
-        entry_text = ""
-        if parts := entry.get("parts"):
-            # ИЗМЕНЕНО: Добавлена проверка `if p` для защиты от None
-            entry_text = "".join(p if isinstance(p, str) else getattr(p, 'text', '') for p in parts if p)
+        if not all(k in entry for k in ('role', 'parts')):
+            continue
 
+        # ИЗМЕНЕНО: Полностью переработанная логика для 100% надежности
+        # 1. Сначала извлекаем и "санитизируем" parts
+        raw_parts = entry.get("parts", [])
+        if not raw_parts:
+            continue
+
+        # 2. "Ремонтируем" parts: убираем None и оборачиваем строки в objects.Part
+        repaired_parts = [
+            types.Part(text=p) if isinstance(p, str) else p 
+            for p in raw_parts if p is not None
+        ]
+        if not repaired_parts:
+            continue
+
+        # 3. Теперь безопасно считаем символы, используя уже очищенный список
+        entry_text = "".join(getattr(p, 'text', '') for p in repaired_parts)
         entry_chars = len(entry_text)
+        
+        # 4. Проверяем лимит
         if current_chars + entry_chars > MAX_CONTEXT_CHARS and context_for_model:
             logger.info(f"Контекст обрезан. Учтено {len(context_for_model)} из {len(chat_history)} сообщений.")
             break
         
+        # 5. Создаем финальный объект Content из очищенных данных
         try:
-            # ИЗМЕНЕНО: Добавлена проверка `if p is not None` для полной защиты от "проклятых" записей.
-            repaired_parts = [
-                types.Part(text=p) if isinstance(p, str) else p 
-                for p in entry.get("parts", []) if p is not None
-            ]
-            if not repaired_parts: continue # Пропускаем записи без валидных частей
-
             content_object = types.Content(role=entry["role"], parts=repaired_parts)
             context_for_model.insert(0, content_object)
             current_chars += entry_chars
