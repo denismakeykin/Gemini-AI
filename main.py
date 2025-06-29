@@ -1,6 +1,6 @@
-# Версия 5.8 'Final Validation Fix'
+# Версия 5.9 'Final Validation'
 # Исправлена ошибка ValidationError путем очистки истории перед отправкой в API.
-# Обновлен стартовый текст и убрана платная функция.
+# Обновлен стартовый текст.
 
 import logging
 import os
@@ -169,6 +169,7 @@ class PostgresPersistence(BasePersistence):
     def close(self):
         if self.db_pool: self.db_pool.closeall()
 
+
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value): return context.user_data.get(key, default_value)
 def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value): context.user_data[key] = value
@@ -235,7 +236,7 @@ def build_history_for_request(chat_history: list) -> list:
             if current_chars + entry_text_len > MAX_CONTEXT_CHARS:
                 logger.info(f"Достигнут лимит контекста ({MAX_CONTEXT_CHARS} симв). История обрезана до {len(clean_history)} сообщений.")
                 break
-            # Очищаем запись от наших служебных полей
+            # Очищаем запись от наших служебных полей, оставляя только нужное API
             clean_entry = {"role": entry["role"], "parts": entry["parts"]}
             clean_history.append(clean_entry)
             current_chars += entry_text_len
@@ -283,8 +284,7 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'thinking_mode' not in context.user_data: set_user_setting(context, 'thinking_mode', 'auto')
-    
-    start_text = f"""Я - Женя, лучший ИИ-ассистент на основе <b>Google GEMINI 2.5 Flash</b>:
+    start_text = """Я - Женя, лучший ИИ-ассистент на основе <b>Google GEMINI 2.5 Flash</b>:
 
 💬 <b>Диалог:</b> Помнит и понимает контекст.
 🎤 <b>Голосовые:</b> Понимает, умеет переводить в текст.
@@ -297,7 +297,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Команда /config позволяет вам выбрать "силу мышления", переключаясь между авто и максимальным анализом.
 
 (!) Пользуясь ботом, Вы автоматически соглашаетесь на отправку сообщений и файлов для получения ответов через Google Gemini API."""
-    
     await update.message.reply_html(start_text)
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -417,34 +416,28 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     message = await update.message.reply_text("🔎 Ищу по смыслу в нашей истории...")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    
     history = context.chat_data.get("history", [])
     if len(history) < 2:
         await message.edit_text("История чата слишком коротка для поиска."); return
-    
     client = context.bot_data['gemini_client']
     try:
         query_embedding_response = await client.aio.models.embed_content(model=EMBEDDING_MODEL_NAME, content=query)
         query_vector = np.array(query_embedding_response['embedding'])
-        
         history_entries = [entry for entry in history if entry.get('role') in ('user', 'model') and entry.get('parts')]
         if not history_entries:
              await message.edit_text("В истории нет сообщений для поиска."); return
-        
         history_texts = [entry['parts'][0]['text'] for entry in history_entries]
         history_embeddings_response = await client.aio.models.embed_content(model=EMBEDDING_MODEL_NAME, content=history_texts)
         history_embeddings = history_embeddings_response['embedding']
-
         similarities = [np.dot(query_vector, np.array(e)) for e in history_embeddings]
         top_3_indices = np.argsort(similarities)[-3:][::-1]
-        
         result_text = "<b>🔍 Нашел в истории 3 самых похожих сообщения:</b>\n\n"
         for i in top_3_indices:
-            entry = history_entries[i]
+            entry_index_in_history = history_texts.index(history_texts[i])
+            entry = history_entries[entry_index_in_history]
             role = "Вы" if entry.get('role') == 'user' else "Я"
             text_preview = html.escape(entry['parts'][0]['text'][:200]) + "..."
             result_text += f"<b>{role}:</b> «<i>{text_preview}</i>»\n----------\n"
-            
         await message.edit_text(result_text, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error(f"Ошибка при семантическом поиске: {e}", exc_info=True)
