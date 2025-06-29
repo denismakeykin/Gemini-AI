@@ -1,6 +1,6 @@
-# Версия 5.7 'Deployment Ready'
-# Исправлена ошибка 'unexpected keyword argument' для system_instruction.
-# Обновлен стартовый текст. Добавлено напоминание об установке numpy.
+# Версия 5.8 'Final Validation Fix'
+# Исправлена ошибка ValidationError путем очистки истории перед отправкой в API.
+# Обновлен стартовый текст и убрана платная функция.
 
 import logging
 import os
@@ -18,7 +18,7 @@ import base64
 import datetime
 import pytz
 import json
-import numpy as np # Для векторных вычислений. НЕ ЗАБУДЬТЕ ДОБАВИТЬ 'numpy' в requirements.txt
+import numpy as np # НЕ ЗАБУДЬТЕ ДОБАВИТЬ 'numpy' в requirements.txt
 
 import httpx
 import aiohttp
@@ -169,7 +169,6 @@ class PostgresPersistence(BasePersistence):
     def close(self):
         if self.db_pool: self.db_pool.closeall()
 
-
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value): return context.user_data.get(key, default_value)
 def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value): context.user_data[key] = value
@@ -226,18 +225,22 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, **kwargs):
     chat_history.append(kwargs)
     if context.application.persistence:
         await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
+
+# ИЗМЕНЕНО: Функция теперь возвращает чистый список словарей, понятный API
 def build_history_for_request(chat_history: list) -> list:
-    history, current_chars = [], 0
+    clean_history, current_chars = [], 0
     for entry in reversed(chat_history):
         if entry.get("role") in ("user", "model") and "cache_name" not in entry:
             entry_text_len = sum(len(part.get("text", "")) for part in entry.get("parts", []))
             if current_chars + entry_text_len > MAX_CONTEXT_CHARS:
-                logger.info(f"Достигнут лимит контекста ({MAX_CONTEXT_CHARS} симв). История обрезана до {len(history)} сообщений.")
+                logger.info(f"Достигнут лимит контекста ({MAX_CONTEXT_CHARS} симв). История обрезана до {len(clean_history)} сообщений.")
                 break
-            history.append(entry)
+            # Очищаем запись от наших служебных полей
+            clean_entry = {"role": entry["role"], "parts": entry["parts"]}
+            clean_history.append(clean_entry)
             current_chars += entry_text_len
-    history.reverse()
-    return history
+    clean_history.reverse()
+    return clean_history
 
 # --- ЯДРО ЛОГИКИ: УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ЗАПРОСОВ ---
 async def generate_response(client: genai.Client, user_prompt_parts: list, context: ContextTypes.DEFAULT_TYPE, cache_name: str | None = None, response_schema=None) -> str:
@@ -250,8 +253,6 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
     thinking_mode = get_user_setting(context, 'thinking_mode', 'auto')
     thinking_budget = -1 if thinking_mode == 'auto' else 24576
     thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
-    
-    # ИЗМЕНЕНО: system_instruction теперь передается внутри GenerateContentConfig
     config = types.GenerateContentConfig(
         safety_settings=SAFETY_SETTINGS, tools=DEFAULT_TOOLS,
         thinking_config=thinking_config, cached_content=cache_name,
@@ -426,10 +427,11 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query_embedding_response = await client.aio.models.embed_content(model=EMBEDDING_MODEL_NAME, content=query)
         query_vector = np.array(query_embedding_response['embedding'])
         
-        history_texts = [entry['parts'][0]['text'] for entry in history if entry.get('role') in ('user', 'model') and entry.get('parts')]
-        if not history_texts:
+        history_entries = [entry for entry in history if entry.get('role') in ('user', 'model') and entry.get('parts')]
+        if not history_entries:
              await message.edit_text("В истории нет сообщений для поиска."); return
         
+        history_texts = [entry['parts'][0]['text'] for entry in history_entries]
         history_embeddings_response = await client.aio.models.embed_content(model=EMBEDDING_MODEL_NAME, content=history_texts)
         history_embeddings = history_embeddings_response['embedding']
 
@@ -438,8 +440,7 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         result_text = "<b>🔍 Нашел в истории 3 самых похожих сообщения:</b>\n\n"
         for i in top_3_indices:
-            entry_index_in_history = history_texts.index(history_texts[i])
-            entry = history[entry_index_in_history]
+            entry = history_entries[i]
             role = "Вы" if entry.get('role') == 'user' else "Я"
             text_preview = html.escape(entry['parts'][0]['text'][:200]) + "..."
             result_text += f"<b>{role}:</b> «<i>{text_preview}</i>»\n----------\n"
