@@ -64,11 +64,9 @@ class PostgresPersistence(BasePersistence):
         else:
              dsn = f"{dsn}?{keepalive_options}"
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=dsn)
-        logger.info(f"Пул соединений с БД (пере)создан.")
 
     def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=3):
         if not self.db_pool: raise ConnectionError("Пул соединений не инициализирован.")
-        last_exception = None
         for attempt in range(retries):
             conn = None
             try:
@@ -80,13 +78,11 @@ class PostgresPersistence(BasePersistence):
                     conn.commit()
                 return True
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-                logger.warning(f"Postgres: Ошибка соединения (попытка {attempt + 1}/{retries}): {e}. Попытка переподключения...")
-                last_exception = e
+                logger.warning(f"Postgres: Ошибка соединения (попытка {attempt + 1}/{retries}): {e}")
                 if conn: self.db_pool.putconn(conn, close=True)
                 if attempt < retries - 1: self._connect(); time.sleep(1 + attempt)
             finally:
                 if conn: self.db_pool.putconn(conn)
-        logger.error(f"Postgres: Не удалось выполнить запрос после {retries} попыток. Последняя ошибка: {last_exception}")
         return None
     
     def _initialize_db(self): self._execute("CREATE TABLE IF NOT EXISTS persistence_data (key TEXT PRIMARY KEY, data BYTEA NOT NULL);")
@@ -164,18 +160,28 @@ async def perform_web_search(query: str, context: ContextTypes.DEFAULT_TYPE) -> 
     return search_results
 
 # --- ГЛАВНАЯ ФУНКЦИЯ ОБРАЩЕНИЯ К GEMINI ---
-async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list):
+async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_parts: list[types.Part]):
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     history = context.chat_data.setdefault("history", [])
-    history.append({"role": "user", "parts": [part.to_dict() for part in prompt_parts]})
+    
+    # --- ИЗМЕНЕНО: Корректная сериализация Part в словарь для истории ---
+    parts_for_history = []
+    for part in prompt_parts:
+        if hasattr(part, 'text'):
+            parts_for_history.append({'text': part.text})
+        elif hasattr(part, 'data'):
+            parts_for_history.append({'inline_data': {'mime_type': part.data.mime_type, 'data': part.data.data}})
+            
+    history.append({"role": "user", "parts": parts_for_history})
     
     client = context.bot_data['gemini_client']
     model = client.generative_model(DEFAULT_MODEL, safety_settings=SAFETY_SETTINGS, system_instruction=system_instruction_text)
     
     try:
-        response = await model.generate_content_async(history[-MAX_HISTORY_MESSAGES:])
+        # --- ИЗМЕНЕНО: Передаем историю и текущие части в API ---
+        response = await model.generate_content_async(history[-MAX_HISTORY_MESSAGES:] + [{"role": "user", "parts": prompt_parts}])
         reply_text = response.text
         
         history.append({"role": "model", "parts": [{"text": reply_text}]})
@@ -189,7 +195,6 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я Женя, ваш ассистент. Просто напишите мне, отправьте фото или файл.")
-
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     context.chat_data.clear()
@@ -301,7 +306,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = client.generative_model(DEFAULT_MODEL)
     response = await model.generate_content_async([types.Part(text="Расшифруй аудио и ответь на него."), types.Part(data=file_bytes, mime_type="audio/ogg")])
     
-    await process_query(update, context, [types.Part(text=response.text)])
+    # --- ИЗМЕНЕНО: Отправляем расшифрованный текст в основной обработчик ---
+    message.text = response.text # Подменяем текст сообщения на расшифрованный
+    await handle_text_and_links(update, context)
 
 # --- ФУНКЦИИ ЗАПУСКА И ОСТАНОВКИ ---
 async def handle_telegram_webhook(request: aiohttp.web.Request):
@@ -339,7 +346,6 @@ async def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_and_links))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    # --- ИЗМЕНЕНО: Добавлена инициализация приложения ---
     await application.initialize()
 
     stop_event = asyncio.Event()
