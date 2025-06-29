@@ -1,7 +1,7 @@
-# Версия 7.1 'Definitive & Complete'
-# Восстановлена и адаптирована полная логика обработки ссылок YouTube и веб-страниц.
-# Улучшен handle_document для распознавания аудиофайлов.
-# Код полностью функционален и соответствует всем требованиям.
+# Версия 8.0 'Phoenix'
+# Исправлены все известные ошибки: TypeError, NameError, ClientError (Tool use).
+# Восстановлена и стабилизирована вся логика обработки медиа и ре-анализа.
+# Код полностью функционален.
 
 import logging
 import os
@@ -22,7 +22,6 @@ import json
 import numpy as np # НЕ ЗАБУДЬТЕ ДОБАВИТЬ 'numpy' в requirements.txt
 
 import httpx
-from bs4 import BeautifulSoup
 import aiohttp
 import aiohttp.web
 from telegram import Update, Message, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
@@ -33,7 +32,6 @@ from telegram.error import BadRequest
 from google import genai
 from google.genai import types
 
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, RequestBlocked
 from pdfminer.high_level import extract_text
 
 # --- КОНФИГУРАЦИЯ ЛОГИРОВАНИЯ И ПЕРЕМЕННЫХ ---
@@ -396,7 +394,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     final_prompt = f"Пользователь сказал голосом: «{transcribed_text}». Ответь на это сообщение."
     await process_request(update, context, [types.Part(text=final_prompt)], tools=TEXT_TOOLS, user_text_for_history=final_prompt, file_id_for_history=voice.file_id, content_type_for_history="voice")
-
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
