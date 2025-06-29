@@ -1,6 +1,3 @@
-# Версия 5.1 'Stabilized & Enhanced'
-# Исправлена ошибка 'from_function', улучшена логика контекста.
-
 import logging
 import os
 import asyncio
@@ -27,8 +24,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from telegram.error import BadRequest
 
 from google import genai
-from google.generativeai import types
-from google.generativeai import protos
+from google.genai import types
 
 from pdfminer.high_level import extract_text
 
@@ -51,7 +47,6 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 MODEL_NAME = 'gemini-2.5-flash' 
 IMAGEN_MODEL_NAME = 'imagen-3.0-generate-001'
 MAX_OUTPUT_TOKENS = 8192
-# ИЗМЕНЕНО: Новая константа для управления контекстом по символам
 MAX_CONTEXT_CHARS = 120000 
 
 # --- ОПРЕДЕЛЕНИЕ ИНСТРУМЕНТОВ ДЛЯ МОДЕЛИ ---
@@ -64,28 +59,24 @@ def get_current_time(timezone: str = "Europe/Moscow") -> str:
     except pytz.UnknownTimeZoneError:
         return f"Error: Unknown timezone '{timezone}'."
 
-# ИЗМЕНЕНО: Исправление ошибки 'AttributeError: from_function'
-# Используем более надежный, "ручной" способ объявления функции, который совместим с разными версиями SDK.
-function_declaration = protos.FunctionDeclaration(
+function_declaration = types.FunctionDeclaration(
     name='get_current_time',
     description="Gets the current date and time for a specified timezone. Default is Moscow.",
-    parameters=protos.Schema(
-        type=protos.Type.OBJECT,
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
         properties={
-            'timezone': protos.Schema(type=protos.Type.STRING, description="Timezone to get the current time for, e.g., 'Europe/Moscow' or 'America/New_York'")
+            'timezone': types.Schema(type=types.Type.STRING, description="Timezone to get the current time for, e.g., 'Europe/Moscow' or 'America/New_York'")
         }
     )
 )
 
-# Полный набор инструментов
 DEFAULT_TOOLS = [
     types.Tool(google_search=types.GoogleSearch()),
     types.Tool(url_context=types.UrlContext()),
-    types.Tool(function_declarations=[function_declaration]), # Используем явно созданную схему
+    types.Tool(function_declarations=[function_declaration]),
     types.Tool(code_execution=types.ToolCodeExecution())
 ]
 
-# Настройки безопасности
 SAFETY_SETTINGS = [
     types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
     for c in (types.HarmCategory.HARM_CATEGORY_HARASSMENT, types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -103,7 +94,6 @@ except FileNotFoundError:
 
 # --- КЛАСС PERSISTENCE (без изменений) ---
 class PostgresPersistence(BasePersistence):
-    # ... (весь код класса PostgresPersistence без изменений)
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
@@ -233,13 +223,10 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, **kwargs):
     chat_history.append(kwargs)
     if context.application.persistence:
         await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
-
-# ИЗМЕНЕНО: Новая функция сборки истории по лимиту символов
 def build_history_for_request(chat_history: list) -> list:
     history, current_chars = [], 0
     for entry in reversed(chat_history):
         if entry.get("role") in ("user", "model") and "cache_name" not in entry:
-            # Считаем длину текста в 'parts'
             entry_text_len = sum(len(part.get("text", "")) for part in entry.get("parts", []))
             if current_chars + entry_text_len > MAX_CONTEXT_CHARS:
                 logger.info(f"Достигнут лимит контекста ({MAX_CONTEXT_CHARS} симв). История обрезана до {len(history)} сообщений.")
@@ -272,19 +259,14 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
             model=MODEL_NAME, contents=request_contents, config=config,
             system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
         )
-        # Обработка вызова функции
-        if response.candidates[0].content.parts[0].function_call:
+        if response.candidates and response.candidates[0].content and response.candidates[0].content.parts and response.candidates[0].content.parts[0].function_call:
              function_call = response.candidates[0].content.parts[0].function_call
              if function_call.name == 'get_current_time':
                  args = function_call.args
                  result = get_current_time(timezone=args.get('timezone', 'Europe/Moscow'))
-                 # Отправляем результат обратно модели для формирования ответа
                  response = await client.aio.models.generate_content(
-                     model=MODEL_NAME,
-                     config=config,
-                     contents=request_contents + [
-                         types.Part(function_response=types.FunctionResponse(name='get_current_time', response={'result': result}))
-                     ]
+                     model=MODEL_NAME, config=config,
+                     contents=request_contents + [types.Part(function_response=types.FunctionResponse(name='get_current_time', response={'result': result}))]
                  )
         logger.info(f"({log_prefix}) ChatID: {chat_id} | Ответ получен. Кэш: {bool(cache_name)}, Мышление: {thinking_mode}, Схема: {bool(response_schema)}")
         return response.text
@@ -295,16 +277,26 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'thinking_mode' not in context.user_data: set_user_setting(context, 'thinking_mode', 'auto')
-    start_text = (
-        f"Привет! Я - Женя, лучший ИИ-ассистент на основе <b>Google Gemini {MODEL_NAME}</b>.\n\n"
-        "<b>Мои возможности:</b>\n"
-        "• 💬 <b>Веду диалог на любые темы, запоминаю контекст и пользователя.</b>\n"
-        "• 🎤 <b>Голосовые сообщения: понимаю и умею переводить в текст.</b>\n"
-        "• 🌐 <b>Использую умный поиск Google, 🧠 огромный объем собственных знаний и мышление.</b>\n"
-        "• 📸🖼🔗 <b>Анализирую изображения и видео, txt и pdf (до 20 мб) и веб-страницы.</b>\n"
-         "Команда /config для выбора силы мышления.\n"
-         "(!) Пользуясь ботом, вы автоматически соглашаетесь на отправку сообщений и файлов для получения ответов через Google Gemini API."
-    )
+    
+    # ИЗМЕНЕНО: Используем ваш новый стартовый текст
+    start_text = f"""Привет! Я - Женя, лучший ИИ-ассистент на основе <b>Google Gemini {MODEL_NAME}</b>.
+
+<b>Мои возможности</b>:
+• 💬 <b>Свободный диалог: Вы можете общаться на любые темы, как с человеком. Он помнит предыдущие реплики и понимает контекст разговора.</b>
+• 🎤 <b>Голосовые сообщения: понимаю и умею переводить в текст.</b>
+• 🌐 <b>Использует умный поиск Google, 🧠 огромный объем собственных знаний и мышление.</b>
+
+<b>Анализ</b>:
+• 📸<b>Изображения</b>: Отправьте любую картинку или фотографию. Женя опишет, что на ней, найдет инфо об объектах и ответит на ваши вопросы.
+• 🖼<b>Видео</b>: Отправьте видео до 50 МБ или ссылку на YouTube. Женя сможет сделать пересказ или ответить на вопросы по содержанию.
+• <b>Документы</b>: Отправьте файл в формате pdf, txt или json (до 20 МБ). Женя проанализирует содержимое и вы можете задавать по нему  вопросы.
+• 🔗 <b>Веб-страницы</b>: Вставьте любую ссылку на статью или сайт. Женя сможет сделать краткое изложение или найти нужную информацию.
+• <b>Генерация изображений</b>: Команды /draw [ваше описание] нарисует по вашему запросу, используя Imagen-3.
+• Команда /recipe [название блюда] не просто найдет рецепт, а вернет его в четком, структурированном виде: ингредиенты, шаги, описание.
+
+Команда /config позволяет вам выбрать "силу мышления", переключаясь между авто и максимальным анализом.
+(!) Пользуясь ботом, Вы автоматически соглашаетесь на отправку сообщений и файлов для получения ответов через Google Gemini API."""
+    
     await update.message.reply_html(start_text)
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
