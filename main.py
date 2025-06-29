@@ -1,3 +1,7 @@
+# Версия 5.5 'Definitive Fix & Polish'
+# Исправлена ошибка KeyError через изменение порядка инициализации.
+# Обновлен стартовый текст.
+
 import logging
 import os
 import asyncio
@@ -138,11 +142,8 @@ class PostgresPersistence(BasePersistence):
         res = self._execute("SELECT data FROM persistence_data WHERE key = %s;", (key,), fetch="one")
         return pickle.loads(res[0]) if res and res[0] else None
     def _set_pickled(self, key: str, data: object) -> None: self._execute("INSERT INTO persistence_data (key, data) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET data = %s;", (key, pickle.dumps(data), pickle.dumps(data)))
-    
-    # ИЗМЕНЕНО: Исключаем bot_data из персистентности, чтобы избежать ошибки KeyError
     async def get_bot_data(self) -> dict: return {}
     async def update_bot_data(self, data: dict) -> None: pass
-
     async def get_chat_data(self) -> defaultdict[int, dict]:
         all_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'chat_data_%';", fetch="all")
         chat_data = defaultdict(dict)
@@ -280,7 +281,7 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'thinking_mode' not in context.user_data: set_user_setting(context, 'thinking_mode', 'auto')
-    start_text = """Я - Женя, лучший ИИ-ассистент на основе <b>Google GEMINI 2.5 Flash</b>:
+    start_text = f"""Я - Женя, лучший ИИ-ассистент на основе <b>Google GEMINI {MODEL_NAME}</b>:
 
 💬 <b>Диалог:</b> Помнит и понимает контекст.
 🎤 <b>Голосовые:</b> Понимает, умеет переводить в текст.
@@ -481,7 +482,13 @@ async def main():
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
     if persistence: builder.persistence(persistence)
     application = builder.build()
+    
+    # ИЗМЕНЕНО: Правильный порядок инициализации
+    # Сначала инициализируем приложение (загружается персистентность)
+    await application.initialize()
+    # И только потом добавляем несериализуемые объекты в bot_data
     application.bot_data['gemini_client'] = genai.Client()
+    
     commands = [
         BotCommand("start", "Инфо и начало работы"),
         BotCommand("config", "Настроить режим мышления"),
@@ -501,7 +508,6 @@ async def main():
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    await application.initialize()
     await application.bot.set_my_commands(commands)
     
     stop_event = asyncio.Event()
