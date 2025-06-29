@@ -1,7 +1,7 @@
-# Версия 10.1 'Final & Polished'
-# Исправлена логика обработки аудиофайлов.
-# Удалены нерабочие библиотеки, обработка ссылок теперь полностью через UrlContext.
-# Улучшена обработка ошибок, обновлен стартовый текст.
+# Версия 12.0 'API Compliant'
+# Полностью переписана логика обработки видео, аудио и YouTube в строгом соответствии с документацией genai.txt.
+# Используется File API для загрузки медиафайлов.
+# Исправлена передача YouTube URL через types.FileData.
 
 import logging
 import os
@@ -57,6 +57,7 @@ MAX_CONTEXT_CHARS = 120000
 
 # --- ОПРЕДЕЛЕНИЕ ИНСТРУМЕНТОВ ДЛЯ МОДЕЛИ ---
 def get_current_time(timezone: str = "Europe/Moscow") -> str:
+    """Gets the current date and time for a specified timezone. Default is Moscow."""
     try:
         now_utc = datetime.datetime.now(pytz.utc)
         target_tz = pytz.timezone(timezone)
@@ -67,7 +68,10 @@ def get_current_time(timezone: str = "Europe/Moscow") -> str:
 function_declaration = types.FunctionDeclaration(
     name='get_current_time',
     description="Gets the current date and time for a specified timezone. Default is Moscow.",
-    parameters=types.Schema(type=types.Type.OBJECT, properties={'timezone': types.Schema(type=types.Type.STRING)})
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={'timezone': types.Schema(type=types.Type.STRING, description="Timezone, e.g., 'Europe/Moscow'")}
+    )
 )
 
 TEXT_TOOLS = [
@@ -285,7 +289,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'thinking_mode' not in context.user_data: set_user_setting(context, 'thinking_mode', 'auto')
-    start_text = """Я - Женя, лучший чат-бот ИИ на основе <b>Google Gemini 2.5 Flash</b> с авторскими настройками. Навыки:
+    start_text = """Я - Женя, лучший ИИ-ассистент на основе <b>Google Gemini 2.5 Flash</b> с авторскими настройками. Навыки:
 🎤💬 <b>Голосовые и текстовые сообщения</b> - понимаю и отвечаю; могу переводить ГС в текст.
 🌐🧠 <b>Использую огромный объем знаний, интеллектуальный поиск Google и логическое мышление.</b>
 📸🖼 <b>Изображения:</b> опишу, найдет инфо об объектах, возьмет текст, отвечу на вопросы.
@@ -293,7 +297,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🔗 <b>Веб-страницы, файлы pdf, txt, json:</b> сделаю изложение, найду информацию.
 
 • Команда /recipe [название блюда]: найдет рецепт и вернет его в четком, структурированном виде.
-• Команда /config позволяет выбрать 'силу мышления', переключаясь между авто и максимум.
+• Команда /config позволяет вам выбрать 'силу мышления', переключаясь между авто и максимум.
 
 (!) Пользуясь ботом, Вы автоматически соглашаетесь на отправку своих сообщений и файлов для получения ответов через Google Gemini API."""
     await update.message.reply_html(start_text)
@@ -420,13 +424,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         file = await context.bot.get_file(prev_user_entry["file_id"])
                         file_bytes = await file.download_as_bytearray()
                         
-                        mime_map = {"photo": "image/jpeg", "voice": "audio/ogg", "video": "video/mp4"}
+                        mime_map = {"photo": "image/jpeg", "voice": "audio/ogg", "video": "video/mp4", "audio": "audio/mpeg"}
                         mime_type = mime_map.get(prev_user_entry["content_type"], "application/octet-stream")
                         
                         reanalyze_prompt = f"Это уточняющий вопрос: '{text}'. Ответь на него, учитывая предыдущий контекст и этот файл."
                         reanalyze_parts = [types.Part(text=reanalyze_prompt), types.Part(inline_data=types.Blob(mime_type=mime_type, data=file_bytes))]
                         
-                        tools = MEDIA_TOOLS if prev_user_entry["content_type"] in ["photo", "video", "voice"] else TEXT_TOOLS
+                        tools = MEDIA_TOOLS if prev_user_entry["content_type"] in ["photo", "video", "voice", "audio"] else TEXT_TOOLS
                         
                         full_history = build_history_for_request(history)
                         request_contents = full_history + reanalyze_parts
