@@ -1,5 +1,5 @@
-# Версия 5.0 'Definitive Edition'
-# Архитектура на основе полного набора инструментов, кэширования и всех продвинутых функций.
+# Версия 5.1 'Stabilized & Enhanced'
+# Исправлена ошибка 'from_function', улучшена логика контекста.
 
 import logging
 import os
@@ -27,7 +27,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from telegram.error import BadRequest
 
 from google import genai
-from google.genai import types
+from google.generativeai import types
+from google.generativeai import protos
 
 from pdfminer.high_level import extract_text
 
@@ -48,9 +49,10 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 
 # --- КОНСТАНТЫ И НАСТРОЙКИ МОДЕЛЕЙ ---
 MODEL_NAME = 'gemini-2.5-flash' 
-IMAGEN_MODEL_NAME = 'imagen-3.0-generate-001' # Модель для генерации изображений
+IMAGEN_MODEL_NAME = 'imagen-3.0-generate-001'
 MAX_OUTPUT_TOKENS = 8192
-MAX_HISTORY_PAIRS = 10
+# ИЗМЕНЕНО: Новая константа для управления контекстом по символам
+MAX_CONTEXT_CHARS = 120000 
 
 # --- ОПРЕДЕЛЕНИЕ ИНСТРУМЕНТОВ ДЛЯ МОДЕЛИ ---
 def get_current_time(timezone: str = "Europe/Moscow") -> str:
@@ -62,12 +64,25 @@ def get_current_time(timezone: str = "Europe/Moscow") -> str:
     except pytz.UnknownTimeZoneError:
         return f"Error: Unknown timezone '{timezone}'."
 
+# ИЗМЕНЕНО: Исправление ошибки 'AttributeError: from_function'
+# Используем более надежный, "ручной" способ объявления функции, который совместим с разными версиями SDK.
+function_declaration = protos.FunctionDeclaration(
+    name='get_current_time',
+    description="Gets the current date and time for a specified timezone. Default is Moscow.",
+    parameters=protos.Schema(
+        type=protos.Type.OBJECT,
+        properties={
+            'timezone': protos.Schema(type=protos.Type.STRING, description="Timezone to get the current time for, e.g., 'Europe/Moscow' or 'America/New_York'")
+        }
+    )
+)
+
 # Полный набор инструментов
 DEFAULT_TOOLS = [
-    types.Tool(google_search=types.GoogleSearch()),          # Поиск
-    types.Tool(url_context=types.UrlContext()),              # Анализ URL
-    types.Tool.from_function(get_current_time),              # Вызов нашей функции
-    types.Tool(code_execution=types.ToolCodeExecution())     # Выполнение кода самой моделью
+    types.Tool(google_search=types.GoogleSearch()),
+    types.Tool(url_context=types.UrlContext()),
+    types.Tool(function_declarations=[function_declaration]), # Используем явно созданную схему
+    types.Tool(code_execution=types.ToolCodeExecution())
 ]
 
 # Настройки безопасности
@@ -213,20 +228,26 @@ async def send_reply(target_message: Message, text: str) -> Message | None:
             return sent_message
     except Exception as e: logger.error(f"Критическая ошибка отправки ответа: {e}", exc_info=True)
     return None
-def build_history_for_request(chat_history: list) -> list:
-    history, pairs = [], 0
-    for entry in reversed(chat_history):
-        if entry.get("role") in ("user", "model") and "cache_name" not in entry:
-            history.append(entry)
-            if entry.get("role") == "user": pairs += 1
-        if pairs >= MAX_HISTORY_PAIRS: break
-    history.reverse()
-    return history
 async def add_to_history(context: ContextTypes.DEFAULT_TYPE, **kwargs):
     chat_history = context.chat_data.setdefault("history", [])
     chat_history.append(kwargs)
     if context.application.persistence:
         await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
+
+# ИЗМЕНЕНО: Новая функция сборки истории по лимиту символов
+def build_history_for_request(chat_history: list) -> list:
+    history, current_chars = [], 0
+    for entry in reversed(chat_history):
+        if entry.get("role") in ("user", "model") and "cache_name" not in entry:
+            # Считаем длину текста в 'parts'
+            entry_text_len = sum(len(part.get("text", "")) for part in entry.get("parts", []))
+            if current_chars + entry_text_len > MAX_CONTEXT_CHARS:
+                logger.info(f"Достигнут лимит контекста ({MAX_CONTEXT_CHARS} симв). История обрезана до {len(history)} сообщений.")
+                break
+            history.append(entry)
+            current_chars += entry_text_len
+    history.reverse()
+    return history
 
 # --- ЯДРО ЛОГИКИ: УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ЗАПРОСОВ ---
 async def generate_response(client: genai.Client, user_prompt_parts: list, context: ContextTypes.DEFAULT_TYPE, cache_name: str | None = None, response_schema=None) -> str:
@@ -251,6 +272,20 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
             model=MODEL_NAME, contents=request_contents, config=config,
             system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
         )
+        # Обработка вызова функции
+        if response.candidates[0].content.parts[0].function_call:
+             function_call = response.candidates[0].content.parts[0].function_call
+             if function_call.name == 'get_current_time':
+                 args = function_call.args
+                 result = get_current_time(timezone=args.get('timezone', 'Europe/Moscow'))
+                 # Отправляем результат обратно модели для формирования ответа
+                 response = await client.aio.models.generate_content(
+                     model=MODEL_NAME,
+                     config=config,
+                     contents=request_contents + [
+                         types.Part(function_response=types.FunctionResponse(name='get_current_time', response={'result': result}))
+                     ]
+                 )
         logger.info(f"({log_prefix}) ChatID: {chat_id} | Ответ получен. Кэш: {bool(cache_name)}, Мышление: {thinking_mode}, Схема: {bool(response_schema)}")
         return response.text
     except Exception as e:
@@ -402,12 +437,9 @@ async def draw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dish = " ".join(context.args)
     if not dish:
-        await update.message.reply_text("Укажите блюдо. Пример: /recipe паста карбонара")
-        return
+        await update.message.reply_text("Укажите блюдо. Пример: /recipe паста карбонара"); return
     message = await update.message.reply_text(f"📖 Ищу рецепт для «{dish}»...")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    
-    # Схема для структурированного вывода
     recipe_schema = types.Schema(
         type=types.Type.OBJECT,
         properties={
@@ -420,7 +452,6 @@ async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     prompt = f"Найди и предоставь рецепт для блюда: {dish}. Верни ответ строго в формате JSON по заданной схеме."
     response_text = await generate_response(context.bot_data['gemini_client'], [types.Part(text=prompt)], context, response_schema=recipe_schema)
-    
     try:
         recipe_data = json.loads(response_text)
         formatted_recipe = (
@@ -432,7 +463,6 @@ async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.edit_text(formatted_recipe, parse_mode=ParseMode.HTML)
     except (json.JSONDecodeError, KeyError):
         await message.edit_text(f"❌ Модель вернула некорректные данные. Попробуйте снова.\n\nОтвет модели:\n`{response_text}`", parse_mode=ParseMode.HTML)
-
 
 # --- ЗАПУСК БОТА И ВЕБ-СЕРВЕРА ---
 async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
@@ -463,9 +493,7 @@ async def main():
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
     if persistence: builder.persistence(persistence)
     application = builder.build()
-
     application.bot_data['gemini_client'] = genai.Client()
-    
     commands = [
         BotCommand("start", "Инфо и начало работы"),
         BotCommand("config", "Настроить режим мышления"),
@@ -473,7 +501,6 @@ async def main():
         BotCommand("recipe", "Найти рецепт блюда"),
         BotCommand("clear", "Очистить историю чата")
     ]
-    
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("config", config_command))
     application.add_handler(CommandHandler("clear", clear_command))
@@ -492,7 +519,6 @@ async def main():
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, stop_event.set)
-
     try:
         webhook_url = f"{WEBHOOK_HOST.rstrip('/')}/{GEMINI_WEBHOOK_PATH.strip('/')}"
         await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
