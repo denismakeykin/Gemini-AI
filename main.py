@@ -1,7 +1,3 @@
-# Версия 6.2 'Final Toolset'
-# Исправлена ошибка '...is not supported for code execution' путем разделения наборов инструментов для текста и медиа.
-# Обновлен стартовый текст.
-
 import logging
 import os
 import asyncio
@@ -64,28 +60,25 @@ def get_current_time(timezone: str = "Europe/Moscow") -> str:
     except pytz.UnknownTimeZoneError:
         return f"Error: Unknown timezone '{timezone}'."
 
-# ИЗМЕНЕНО: Гранулярное разделение наборов инструментов
-# Для текста (с выполнением кода)
+function_declaration = types.FunctionDeclaration(
+    name='get_current_time',
+    description="Gets the current date and time for a specified timezone. Default is Moscow.",
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={'timezone': types.Schema(type=types.Type.STRING, description="Timezone, e.g., 'Europe/Moscow'")}
+    )
+)
+
 TEXT_TOOLS = [
     types.Tool(google_search=types.GoogleSearch()),
     types.Tool(url_context=types.UrlContext()),
     types.Tool(code_execution=types.ToolCodeExecution())
 ]
-# Для медиа (без выполнения кода)
 MEDIA_TOOLS = [
     types.Tool(google_search=types.GoogleSearch()),
     types.Tool(url_context=types.UrlContext()),
 ]
-# Для вызова функций
-FUNCTION_CALLING_TOOLS = [
-    types.Tool(function_declarations=[
-        types.FunctionDeclaration(
-            name='get_current_time',
-            description="Gets the current date and time for a specified timezone. Default is Moscow.",
-            parameters=types.Schema(type=types.Type.OBJECT, properties={'timezone': types.Schema(type=types.Type.STRING)})
-        )
-    ])
-]
+FUNCTION_CALLING_TOOLS = [types.Tool(function_declarations=[function_declaration])]
 
 SAFETY_SETTINGS = [
     types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
@@ -234,14 +227,23 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, **kwargs):
     chat_history.append(kwargs)
     if context.application.persistence:
         await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
+
+# ИЗМЕНЕНО: Функция теперь корректно работает с объектами Part
 def build_history_for_request(chat_history: list) -> list:
     clean_history, current_chars = [], 0
     for entry in reversed(chat_history):
-        if entry.get("role") in ("user", "model"):
-            entry_text_len = sum(len(part.get("text", "")) for part in entry.get("parts", []))
+        # Мы храним в истории объекты Part, а не словари
+        if isinstance(entry.get("parts"), list) and entry.get("role") in ("user", "model"):
+            entry_text_len = 0
+            # Проверяем, что part - это объект, а не словарь
+            for part in entry["parts"]:
+                if isinstance(part, types.Part) and hasattr(part, 'text'):
+                    entry_text_len += len(part.text)
+
             if current_chars + entry_text_len > MAX_CONTEXT_CHARS:
                 logger.info(f"Достигнут лимит контекста ({MAX_CONTEXT_CHARS} симв). История обрезана до {len(clean_history)} сообщений.")
                 break
+            
             clean_entry = {"role": entry["role"], "parts": entry["parts"]}
             clean_history.append(clean_entry)
             current_chars += entry_text_len
@@ -320,20 +322,20 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.application.persistence.drop_chat_data(update.effective_chat.id)
     await update.message.reply_text("История чата и связанные данные очищены.")
 
-async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, request_contents: list, tools: list):
+# ИЗМЕНЕНО: Унифицированный обработчик запросов, который выбирает нужный набор инструментов
+async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, tools: list):
     message = update.message
     client = context.bot_data['gemini_client']
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
     history = build_history_for_request(context.chat_data.get("history", []))
-    final_contents = history + request_contents
+    request_contents = history + content_parts
     
-    reply_text = await generate_response(client, final_contents, context, tools=tools)
+    reply_text = await generate_response(client, request_contents, context, tools=tools)
     sent_message = await send_reply(message, reply_text)
     
-    # Сохраняем в историю только исходный запрос пользователя, а не всю историю
-    await add_to_history(context, role="user", parts=request_contents, message_id=message.message_id)
-    await add_to_history(context, role="model", parts=[{"text": reply_text}], bot_message_id=sent_message.message_id if sent_message else None)
+    await add_to_history(context, role="user", parts=content_parts, message_id=message.message_id)
+    await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], bot_message_id=sent_message.message_id if sent_message else None)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.caption or "Опиши это изображение."
@@ -379,9 +381,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or update.message.caption or "").strip()
     if not text: return
     context.chat_data['id'], context.user_data['id'] = update.message.chat_id, update.message.from_user.id
-    # Логика ре-анализа пока опущена для стабильности, ее можно вернуть позже
+    # Логика ре-анализа пока опущена для стабильности
     await process_request(update, context, [types.Part(text=text)], tools=TEXT_TOOLS)
-
 
 # --- НОВЫЕ КОМАНДЫ ---
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -393,7 +394,9 @@ async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = "Сколько сейчас времени?"
     if context.args: prompt += f" в { ' '.join(context.args) }"
     client = context.bot_data['gemini_client']
-    reply_text = await generate_response(client, [types.Part(text=prompt)], context, use_function_calling=True)
+    history = build_history_for_request(context.chat_data.get("history", []))
+    request_contents = history + [types.Part(text=prompt)]
+    reply_text = await generate_response(client, request_contents, context, tools=FUNCTION_CALLING_TOOLS)
     await message.edit_text(reply_text)
     
 async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
