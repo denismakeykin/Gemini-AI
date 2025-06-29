@@ -67,8 +67,10 @@ class PostgresPersistence(BasePersistence):
 
     def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=3):
         if not self.db_pool: raise ConnectionError("Пул соединений не инициализирован.")
+        last_exception = None
         for attempt in range(retries):
             conn = None
+            connection_handled = False
             try:
                 conn = self.db_pool.getconn()
                 with conn.cursor() as cur:
@@ -79,10 +81,18 @@ class PostgresPersistence(BasePersistence):
                 return True
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
                 logger.warning(f"Postgres: Ошибка соединения (попытка {attempt + 1}/{retries}): {e}")
-                if conn: self.db_pool.putconn(conn, close=True)
-                if attempt < retries - 1: self._connect(); time.sleep(1 + attempt)
+                last_exception = e
+                if conn:
+                    self.db_pool.putconn(conn, close=True)
+                    connection_handled = True
+                if attempt < retries - 1:
+                    self._connect(); time.sleep(1 + attempt)
+                continue
             finally:
-                if conn: self.db_pool.putconn(conn)
+                if conn and not connection_handled:
+                    self.db_pool.putconn(conn)
+        
+        logger.error(f"Postgres: Не удалось выполнить запрос после {retries} попыток. Последняя ошибка: {last_exception}")
         return None
     
     def _initialize_db(self): self._execute("CREATE TABLE IF NOT EXISTS persistence_data (key TEXT PRIMARY KEY, data BYTEA NOT NULL);")
@@ -109,8 +119,7 @@ class PostgresPersistence(BasePersistence):
     
     async def drop_chat_data(self, chat_id: int) -> None:
         await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"chat_data_{chat_id}",))
-    async def drop_user_data(self, user_id: int) -> None:
-        await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"user_data_{user_id}",))
+    async def drop_user_data(self, user_id: int) -> None: pass
     
     async def get_callback_data(self) -> dict | None: return None
     async def update_callback_data(self, data: dict) -> None: pass
@@ -166,13 +175,15 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
 
     history = context.chat_data.setdefault("history", [])
     
-    # --- ИЗМЕНЕНО: Корректная сериализация Part в словарь для истории ---
+    # --- ИЗМЕНЕНО: Исправлена сериализация Part в словарь для истории ---
     parts_for_history = []
     for part in prompt_parts:
-        if hasattr(part, 'text'):
+        if hasattr(part, 'text') and part.text:
             parts_for_history.append({'text': part.text})
         elif hasattr(part, 'data'):
-            parts_for_history.append({'inline_data': {'mime_type': part.data.mime_type, 'data': part.data.data}})
+            # Кодируем бинарные данные для сохранения в JSON-совместимом виде
+            encoded_data = base64.b64encode(part.data).decode('utf-8')
+            parts_for_history.append({'inline_data': {'mime_type': part.mime_type, 'data': encoded_data}})
             
     history.append({"role": "user", "parts": parts_for_history})
     
@@ -180,8 +191,20 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     model = client.generative_model(DEFAULT_MODEL, safety_settings=SAFETY_SETTINGS, system_instruction=system_instruction_text)
     
     try:
-        # --- ИЗМЕНЕНО: Передаем историю и текущие части в API ---
-        response = await model.generate_content_async(history[-MAX_HISTORY_MESSAGES:] + [{"role": "user", "parts": prompt_parts}])
+        # Для API нам нужны реальные бинарные данные, а не base64
+        # Собираем историю заново для отправки в API
+        api_history = []
+        for entry in history[-MAX_HISTORY_MESSAGES:]:
+            api_parts = []
+            for p in entry['parts']:
+                if 'text' in p:
+                    api_parts.append(types.Part(text=p['text']))
+                elif 'inline_data' in p:
+                    decoded_data = base64.b64decode(p['inline_data']['data'])
+                    api_parts.append(types.Part(data=decoded_data, mime_type=p['inline_data']['mime_type']))
+            api_history.append({'role': entry['role'], 'parts': api_parts})
+
+        response = await model.generate_content_async(api_history)
         reply_text = response.text
         
         history.append({"role": "model", "parts": [{"text": reply_text}]})
@@ -206,7 +229,6 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def extract_general_url(text: str) -> str | None:
     match = re.search(r'https?://[^\s<>"\'`]+', text)
     return match.group(0).rstrip('.,?!') if match else None
-
 def extract_youtube_id(url_text: str) -> str | None:
     match = re.search(r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})", url_text)
     return match.group(1) if match else None
@@ -306,8 +328,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model = client.generative_model(DEFAULT_MODEL)
     response = await model.generate_content_async([types.Part(text="Расшифруй аудио и ответь на него."), types.Part(data=file_bytes, mime_type="audio/ogg")])
     
-    # --- ИЗМЕНЕНО: Отправляем расшифрованный текст в основной обработчик ---
-    message.text = response.text # Подменяем текст сообщения на расшифрованный
+    message.text = response.text
     await handle_text_and_links(update, context)
 
 # --- ФУНКЦИИ ЗАПУСКА И ОСТАНОВКИ ---
@@ -357,7 +378,8 @@ async def main():
         await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
         await run_web_server(application, stop_event)
     finally:
-        await application.bot_data['http_client'].aclose()
+        if application.bot_data.get('http_client'):
+            await application.bot_data['http_client'].aclose()
         if persistence: persistence.close()
 
 if __name__ == '__main__':
