@@ -227,23 +227,18 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, **kwargs):
     chat_history.append(kwargs)
     if context.application.persistence:
         await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
-
-# ИЗМЕНЕНО: Функция теперь корректно работает с объектами Part
 def build_history_for_request(chat_history: list) -> list:
     clean_history, current_chars = [], 0
     for entry in reversed(chat_history):
-        # Мы храним в истории объекты Part, а не словари
-        if isinstance(entry.get("parts"), list) and entry.get("role") in ("user", "model"):
+        if entry.get("role") in ("user", "model"):
             entry_text_len = 0
-            # Проверяем, что part - это объект, а не словарь
-            for part in entry["parts"]:
-                if isinstance(part, types.Part) and hasattr(part, 'text'):
-                    entry_text_len += len(part.text)
-
+            if isinstance(entry.get("parts"), list):
+                for part in entry["parts"]:
+                    if isinstance(part, types.Part) and hasattr(part, 'text'):
+                        entry_text_len += len(part.text)
             if current_chars + entry_text_len > MAX_CONTEXT_CHARS:
                 logger.info(f"Достигнут лимит контекста ({MAX_CONTEXT_CHARS} симв). История обрезана до {len(clean_history)} сообщений.")
                 break
-            
             clean_entry = {"role": entry["role"], "parts": entry["parts"]}
             clean_history.append(clean_entry)
             current_chars += entry_text_len
@@ -294,7 +289,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🖼<b>Видео до 50 МБ или ссылка на YouTube:</b> Сделает пересказ или ответит на вопросы по содержанию.
 🔗 <b>Веб-страницы, pdf, txt или json до 20 МБ:</b> Сделает изложение или найдет информацию.
 
-• Команда /recipe [название блюда] не просто найдет рецепт, а вернет его в четком, структурированном виде: ингредиенты, шаги, описание.
+• Команда /recipe [название блюда] найдет рецепт и вернет его в четком, структурированном виде.
 • Команда /config позволяет вам выбрать "силу мышления", переключаясь между авто и максимальным анализом.
 
 (!) Пользуясь ботом, Вы автоматически соглашаетесь на отправку сообщений и файлов для получения ответов через Google Gemini API."""
@@ -322,19 +317,26 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.application.persistence.drop_chat_data(update.effective_chat.id)
     await update.message.reply_text("История чата и связанные данные очищены.")
 
-# ИЗМЕНЕНО: Унифицированный обработчик запросов, который выбирает нужный набор инструментов
-async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, tools: list):
+async def process_media_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list):
     message = update.message
     client = context.bot_data['gemini_client']
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-    
     history = build_history_for_request(context.chat_data.get("history", []))
     request_contents = history + content_parts
-    
-    reply_text = await generate_response(client, request_contents, context, tools=tools)
+    reply_text = await generate_response(client, request_contents, context, tools=MEDIA_TOOLS)
     sent_message = await send_reply(message, reply_text)
-    
     await add_to_history(context, role="user", parts=content_parts, message_id=message.message_id)
+    await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], bot_message_id=sent_message.message_id if sent_message else None)
+
+async def process_text_request(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    message = update.message
+    client = context.bot_data['gemini_client']
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    history = build_history_for_request(context.chat_data.get("history", []))
+    request_contents = history + [types.Part(text=text)]
+    reply_text = await generate_response(client, request_contents, context, tools=TEXT_TOOLS)
+    sent_message = await send_reply(message, reply_text)
+    await add_to_history(context, role="user", parts=[types.Part(text=text)], message_id=message.message_id)
     await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], bot_message_id=sent_message.message_id if sent_message else None)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -342,7 +344,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_file = await update.message.photo[-1].get_file()
     photo_bytes = await photo_file.download_as_bytearray()
     content_parts = [types.Part(text=user_text), types.Part(inline_data=types.Blob(mime_type='image/jpeg', data=photo_bytes))]
-    await process_request(update, context, content_parts, tools=MEDIA_TOOLS)
+    await process_media_request(update, context, content_parts)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
@@ -358,7 +360,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except UnicodeDecodeError: text_content = doc_bytes.decode('cp1251', errors='ignore')
     user_text = update.message.caption or f"Проанализируй содержимое файла '{doc.file_name}'."
     file_prompt = f"{user_text}\n\n--- СОДЕРЖИМОЕ ФАЙЛА ---\n{text_content[:30000]}\n--- КОНЕЦ ФАЙЛА ---"
-    await process_request(update, context, [types.Part(text=file_prompt)], tools=TEXT_TOOLS)
+    await process_text_request(update, context, file_prompt)
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video = update.message.video
@@ -367,22 +369,40 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_bytes = await video_file.download_as_bytearray()
     user_text = update.message.caption or "Опиши это видео и сделай краткий пересказ."
     content_parts = [types.Part(text=user_text), types.Part(inline_data=types.Blob(mime_type=video.mime_type, data=video_bytes))]
-    await process_request(update, context, content_parts, tools=MEDIA_TOOLS)
+    await process_media_request(update, context, content_parts)
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    voice = update.message.voice
+    message = update.message
+    client = context.bot_data['gemini_client']
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    voice = message.voice
     voice_file = await voice.get_file()
     voice_bytes = await voice_file.download_as_bytearray()
-    user_text = "Расшифруй это голосовое сообщение и ответь на него по существу."
-    content_parts = [types.Part(text=user_text), types.Part(inline_data=types.Blob(mime_type=voice.mime_type, data=voice_bytes))]
-    await process_request(update, context, content_parts, tools=MEDIA_TOOLS)
+    
+    # Шаг 1: Транскрипция
+    transcription_prompt = "Transcribe this audio file and return only the text."
+    transcription_parts = [types.Part(text=transcription_prompt), types.Part(inline_data=types.Blob(mime_type=voice.mime_type, data=voice_bytes))]
+    
+    # Для транскрипции не нужны сложные инструменты
+    transcribed_text = await generate_response(client, transcription_parts, context, tools=[])
+    
+    if not transcribed_text or transcribed_text.startswith("❌"):
+        await message.reply_text("Не удалось распознать речь. Попробуйте снова.")
+        return
+        
+    logger.info(f"ChatID: {message.chat_id} | Голос расшифрован: '{transcribed_text}'")
+    
+    # Шаг 2: Обработка как обычный текст
+    final_prompt = f"Пользователь сказал голосом: «{transcribed_text}». Ответь на это сообщение."
+    await process_text_request(update, context, final_prompt)
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or update.message.caption or "").strip()
     if not text: return
     context.chat_data['id'], context.user_data['id'] = update.message.chat_id, update.message.from_user.id
     # Логика ре-анализа пока опущена для стабильности
-    await process_request(update, context, [types.Part(text=text)], tools=TEXT_TOOLS)
+    await process_text_request(update, context, text)
 
 # --- НОВЫЕ КОМАНДЫ ---
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
