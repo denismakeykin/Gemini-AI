@@ -12,6 +12,7 @@ from psycopg2 import pool
 import io
 import html
 import time
+import base64
 
 import httpx
 from bs4 import BeautifulSoup
@@ -46,13 +47,8 @@ class PostgresPersistence(BasePersistence):
         super().__init__()
         self.db_pool = None
         self.dsn = database_url
-        try:
-            self._connect()
-            self._initialize_db()
-        except psycopg2.Error as e:
-            logger.critical(f"PostgresPersistence: Не удалось подключиться к БД: {e}")
-            raise
-
+        try: self._connect(); self._initialize_db()
+        except psycopg2.Error as e: logger.critical(f"PostgresPersistence: Не удалось подключиться к БД: {e}"); raise
     def _connect(self):
         if self.db_pool:
             try: self.db_pool.closeall()
@@ -61,16 +57,13 @@ class PostgresPersistence(BasePersistence):
         keepalive_options = "keepalives=1&keepalives_idle=60&keepalives_interval=10&keepalives_count=5"
         if "?" in dsn:
              if "keepalives" not in dsn: dsn = f"{dsn}&{keepalive_options}"
-        else:
-             dsn = f"{dsn}?{keepalive_options}"
+        else: dsn = f"{dsn}?{keepalive_options}"
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=dsn)
-
     def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=3):
         if not self.db_pool: raise ConnectionError("Пул соединений не инициализирован.")
         last_exception = None
         for attempt in range(retries):
-            conn = None
-            connection_handled = False
+            conn = None; connection_handled = False
             try:
                 conn = self.db_pool.getconn()
                 with conn.cursor() as cur:
@@ -82,28 +75,20 @@ class PostgresPersistence(BasePersistence):
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
                 logger.warning(f"Postgres: Ошибка соединения (попытка {attempt + 1}/{retries}): {e}")
                 last_exception = e
-                if conn:
-                    self.db_pool.putconn(conn, close=True)
-                    connection_handled = True
-                if attempt < retries - 1:
-                    self._connect(); time.sleep(1 + attempt)
+                if conn: self.db_pool.putconn(conn, close=True); connection_handled = True
+                if attempt < retries - 1: self._connect(); time.sleep(1 + attempt)
                 continue
             finally:
-                if conn and not connection_handled:
-                    self.db_pool.putconn(conn)
-        
+                if conn and not connection_handled: self.db_pool.putconn(conn)
         logger.error(f"Postgres: Не удалось выполнить запрос после {retries} попыток. Последняя ошибка: {last_exception}")
         return None
-    
     def _initialize_db(self): self._execute("CREATE TABLE IF NOT EXISTS persistence_data (key TEXT PRIMARY KEY, data BYTEA NOT NULL);")
     def _get_pickled(self, key: str) -> object | None:
         res = self._execute("SELECT data FROM persistence_data WHERE key = %s;", (key,), fetch="one")
         return pickle.loads(res[0]) if res and res[0] else None
     def _set_pickled(self, key: str, data: object) -> None: self._execute("INSERT INTO persistence_data (key, data) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET data = %s;", (key, pickle.dumps(data), pickle.dumps(data)))
-    
     async def get_bot_data(self) -> dict: return await asyncio.to_thread(self._get_pickled, "bot_data") or {}
     async def update_bot_data(self, data: dict) -> None: await asyncio.to_thread(self._set_pickled, "bot_data", data)
-    
     async def get_chat_data(self) -> defaultdict[int, dict]:
         all_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'chat_data_%';", fetch="all")
         chat_data = defaultdict(dict)
@@ -112,15 +97,11 @@ class PostgresPersistence(BasePersistence):
                 try: chat_data[int(k.split('_')[-1])] = pickle.loads(d)
                 except (ValueError, IndexError): logger.warning(f"Обнаружен некорректный ключ чата в БД: '{k}'. Запись пропущена.")
         return chat_data
-    
     async def update_chat_data(self, chat_id: int, data: dict) -> None: await asyncio.to_thread(self._set_pickled, f"chat_data_{chat_id}", data)
     async def get_user_data(self) -> defaultdict[int, dict]: return defaultdict(dict)
     async def update_user_data(self, user_id: int, data: dict) -> None: pass
-    
-    async def drop_chat_data(self, chat_id: int) -> None:
-        await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"chat_data_{chat_id}",))
+    async def drop_chat_data(self, chat_id: int) -> None: await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"chat_data_{chat_id}",))
     async def drop_user_data(self, user_id: int) -> None: pass
-    
     async def get_callback_data(self) -> dict | None: return None
     async def update_callback_data(self, data: dict) -> None: pass
     async def get_conversations(self, name: str) -> dict: return {}
@@ -142,7 +123,6 @@ WEBHOOK_HOST = os.getenv('WEBHOOK_HOST')
 GEMINI_WEBHOOK_PATH = os.getenv('GEMINI_WEBHOOK_PATH')
 DATABASE_URL = os.getenv('DATABASE_URL')
 DEFAULT_MODEL = 'gemini-2.5-flash'
-MAX_HISTORY_MESSAGES = 50
 SAFETY_SETTINGS = [
     {"category": c, "threshold": types.HarmBlockThreshold.BLOCK_NONE} for c in 
     (types.HarmCategory.HARM_CATEGORY_HARASSMENT, types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, 
@@ -173,42 +153,19 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-    history = context.chat_data.setdefault("history", [])
-    
-    # --- ИЗМЕНЕНО: Исправлена сериализация Part в словарь для истории ---
-    parts_for_history = []
-    for part in prompt_parts:
-        if hasattr(part, 'text') and part.text:
-            parts_for_history.append({'text': part.text})
-        elif hasattr(part, 'data'):
-            # Кодируем бинарные данные для сохранения в JSON-совместимом виде
-            encoded_data = base64.b64encode(part.data).decode('utf-8')
-            parts_for_history.append({'inline_data': {'mime_type': part.mime_type, 'data': encoded_data}})
-            
-    history.append({"role": "user", "parts": parts_for_history})
-    
+    # --- ИЗМЕНЕНО: Используем client.chats для управления диалогом ---
     client = context.bot_data['gemini_client']
-    model = client.generative_model(DEFAULT_MODEL, safety_settings=SAFETY_SETTINGS, system_instruction=system_instruction_text)
-    
-    try:
-        # Для API нам нужны реальные бинарные данные, а не base64
-        # Собираем историю заново для отправки в API
-        api_history = []
-        for entry in history[-MAX_HISTORY_MESSAGES:]:
-            api_parts = []
-            for p in entry['parts']:
-                if 'text' in p:
-                    api_parts.append(types.Part(text=p['text']))
-                elif 'inline_data' in p:
-                    decoded_data = base64.b64decode(p['inline_data']['data'])
-                    api_parts.append(types.Part(data=decoded_data, mime_type=p['inline_data']['mime_type']))
-            api_history.append({'role': entry['role'], 'parts': api_parts})
+    chat_session = context.chat_data.get('chat_session')
+    if not chat_session:
+        # Создаем новый чат с системной инструкцией
+        chat_session = client.chats.create(model=DEFAULT_MODEL, system_instruction=system_instruction_text, safety_settings=SAFETY_SETTINGS)
+        context.chat_data['chat_session'] = chat_session
+        logger.info(f"Создан новый чат-объект Gemini для чата {chat_id}")
 
-        response = await model.generate_content_async(api_history)
+    try:
+        # Отправляем сообщение в существующий чат
+        response = await chat_session.send_message_async(content=prompt_parts)
         reply_text = response.text
-        
-        history.append({"role": "model", "parts": [{"text": reply_text}]})
-        context.chat_data['history'] = history[-MAX_HISTORY_MESSAGES:]
         
         await update.message.reply_html(reply_text, disable_web_page_preview=True)
     except Exception as e:
@@ -220,7 +177,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я Женя, ваш ассистент. Просто напишите мне, отправьте фото или файл.")
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    context.chat_data.clear()
+    context.chat_data.clear() # Очищаем и chat_session
     if context.application.persistence:
         await context.application.persistence.drop_chat_data(chat_id)
     await update.message.reply_text("История чата очищена.")
@@ -281,9 +238,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     image_part = types.Part(data=photo_bytes, mime_type='image/jpeg')
     client = context.bot_data['gemini_client']
-    model = client.generative_model(DEFAULT_MODEL)
     
-    response_extract = await model.generate_content_async(["Опиши изображение 1-3 словами для поиска.", image_part])
+    response_extract = await client.models.generate_content(
+        model=DEFAULT_MODEL, 
+        contents=["Опиши изображение 1-3 словами для поиска.", image_part]
+    )
     search_query = response_extract.text.strip()
     
     search_context_str = ""
@@ -323,13 +282,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     voice_file = await message.voice.get_file()
     file_bytes = await voice_file.download_as_bytearray()
-
-    client = context.bot_data['gemini_client']
-    model = client.generative_model(DEFAULT_MODEL)
-    response = await model.generate_content_async([types.Part(text="Расшифруй аудио и ответь на него."), types.Part(data=file_bytes, mime_type="audio/ogg")])
     
-    message.text = response.text
-    await handle_text_and_links(update, context)
+    voice_part = types.Part(data=file_bytes, mime_type="audio/ogg")
+    
+    prompt_text = "Расшифруй аудио и ответь на него."
+    await process_query(update, context, [types.Part(text=prompt_text), voice_part])
 
 # --- ФУНКЦИИ ЗАПУСКА И ОСТАНОВКИ ---
 async def handle_telegram_webhook(request: aiohttp.web.Request):
