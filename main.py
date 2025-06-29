@@ -1,5 +1,6 @@
-# Версия 5.6 'Free Tier Aligned'
-# Удалена платная функция /draw. Добавлена бесплатная и мощная функция /find (умный поиск по истории).
+# Версия 5.7 'Deployment Ready'
+# Исправлена ошибка 'unexpected keyword argument' для system_instruction.
+# Обновлен стартовый текст. Добавлено напоминание об установке numpy.
 
 import logging
 import os
@@ -17,7 +18,7 @@ import base64
 import datetime
 import pytz
 import json
-import numpy as np # Для векторных вычислений
+import numpy as np # Для векторных вычислений. НЕ ЗАБУДЬТЕ ДОБАВИТЬ 'numpy' в requirements.txt
 
 import httpx
 import aiohttp
@@ -49,7 +50,7 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 
 # --- КОНСТАНТЫ И НАСТРОЙКИ МОДЕЛЕЙ ---
 MODEL_NAME = 'gemini-2.5-flash' 
-EMBEDDING_MODEL_NAME = 'text-embedding-004' # Новая бесплатная модель
+EMBEDDING_MODEL_NAME = 'text-embedding-004'
 MAX_OUTPUT_TOKENS = 8192
 MAX_CONTEXT_CHARS = 120000 
 
@@ -94,9 +95,8 @@ except FileNotFoundError:
     SYSTEM_INSTRUCTION = "You are a helpful and friendly assistant named Zhenya."
 
 
-# --- КЛАСС PERSISTENCE (без изменений) ---
+# --- КЛАСС PERSISTENCE ---
 class PostgresPersistence(BasePersistence):
-    # ... (весь код класса PostgresPersistence без изменений)
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
@@ -250,17 +250,19 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
     thinking_mode = get_user_setting(context, 'thinking_mode', 'auto')
     thinking_budget = -1 if thinking_mode == 'auto' else 24576
     thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
+    
+    # ИЗМЕНЕНО: system_instruction теперь передается внутри GenerateContentConfig
     config = types.GenerateContentConfig(
         safety_settings=SAFETY_SETTINGS, tools=DEFAULT_TOOLS,
-        thinking_config=thinking_config, cached_content=cache_name
+        thinking_config=thinking_config, cached_content=cache_name,
+        system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
     )
     if response_schema:
         config.response_mime_type = "application/json"
         config.response_schema = response_schema
     try:
         response = await client.aio.models.generate_content(
-            model=MODEL_NAME, contents=request_contents, config=config,
-            system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
+            model=MODEL_NAME, contents=request_contents, config=config
         )
         if response.candidates and response.candidates[0].content and response.candidates[0].content.parts and response.candidates[0].content.parts[0].function_call:
              function_call = response.candidates[0].content.parts[0].function_call
@@ -280,6 +282,7 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'thinking_mode' not in context.user_data: set_user_setting(context, 'thinking_mode', 'auto')
+    
     start_text = f"""Я - Женя, лучший ИИ-ассистент на основе <b>Google GEMINI 2.5 Flash</b>:
 
 💬 <b>Диалог:</b> Помнит и понимает контекст.
@@ -289,11 +292,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🖼<b>Видео до 50 МБ или ссылка на YouTube:</b> Сделает пересказ или ответит на вопросы по содержанию.
 🔗 <b>Веб-страницы, pdf, txt или json до 20 МБ:</b> Сделает изложение или найдет информацию.
 
-🖼<b>Imagen-3:</b> Создаст изображение по команде /draw [ваше описание].
 • Команда /recipe [название блюда] не просто найдет рецепт, а вернет его в четком, структурированном виде: ингредиенты, шаги, описание.
 • Команда /config позволяет вам выбрать "силу мышления", переключаясь между авто и максимальным анализом.
 
 (!) Пользуясь ботом, Вы автоматически соглашаетесь на отправку сообщений и файлов для получения ответов через Google Gemini API."""
+    
     await update.message.reply_html(start_text)
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -420,26 +423,23 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     client = context.bot_data['gemini_client']
     try:
-        # Векторизуем запрос
-        query_embedding = await client.aio.models.embed_content(model=EMBEDDING_MODEL_NAME, content=query)
-        query_vector = np.array(query_embedding['embedding'])
+        query_embedding_response = await client.aio.models.embed_content(model=EMBEDDING_MODEL_NAME, content=query)
+        query_vector = np.array(query_embedding_response['embedding'])
         
-        # Собираем тексты из истории для векторизации
         history_texts = [entry['parts'][0]['text'] for entry in history if entry.get('role') in ('user', 'model') and entry.get('parts')]
         if not history_texts:
              await message.edit_text("В истории нет сообщений для поиска."); return
         
-        history_embeddings = await client.aio.models.embed_content(model=EMBEDDING_MODEL_NAME, content=history_texts)
-        
-        # Считаем схожесть
-        similarities = [np.dot(query_vector, np.array(e)) for e in history_embeddings['embedding']]
-        
-        # Находим 3 самых похожих
+        history_embeddings_response = await client.aio.models.embed_content(model=EMBEDDING_MODEL_NAME, content=history_texts)
+        history_embeddings = history_embeddings_response['embedding']
+
+        similarities = [np.dot(query_vector, np.array(e)) for e in history_embeddings]
         top_3_indices = np.argsort(similarities)[-3:][::-1]
         
         result_text = "<b>🔍 Нашел в истории 3 самых похожих сообщения:</b>\n\n"
         for i in top_3_indices:
-            entry = history[i] # Индекс в history совпадает с history_texts
+            entry_index_in_history = history_texts.index(history_texts[i])
+            entry = history[entry_index_in_history]
             role = "Вы" if entry.get('role') == 'user' else "Я"
             text_preview = html.escape(entry['parts'][0]['text'][:200]) + "..."
             result_text += f"<b>{role}:</b> «<i>{text_preview}</i>»\n----------\n"
