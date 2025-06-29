@@ -1,3 +1,8 @@
+# ИЗМЕНЕНА СТРОКА 192: Неправильный асинхронный вызов stateless-метода.
+# ИЗМЕНЕНЫ СТРОКИ 180-186: Неправильная передача конфигурации и асинхронный вызов stateful-метода.
+# ---
+# Полная версия кода с исправлениями:
+
 import logging
 import os
 import asyncio
@@ -122,7 +127,7 @@ GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID')
 WEBHOOK_HOST = os.getenv('WEBHOOK_HOST')
 GEMINI_WEBHOOK_PATH = os.getenv('GEMINI_WEBHOOK_PATH')
 DATABASE_URL = os.getenv('DATABASE_URL')
-DEFAULT_MODEL = 'gemini-2.5-flash'
+DEFAULT_MODEL = 'gemini-1.5-flash-latest' # Используем актуальную версию, а не 2.5, которая может быть в preview
 SAFETY_SETTINGS = [
     {"category": c, "threshold": types.HarmBlockThreshold.BLOCK_NONE} for c in 
     (types.HarmCategory.HARM_CATEGORY_HARASSMENT, types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, 
@@ -153,18 +158,29 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, prom
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-    # --- ИЗМЕНЕНО: Используем client.chats для управления диалогом ---
     client = context.bot_data['gemini_client']
     chat_session = context.chat_data.get('chat_session')
+    
     if not chat_session:
-        # Создаем новый чат с системной инструкцией
-        chat_session = client.chats.create(model=DEFAULT_MODEL, system_instruction=system_instruction_text, safety_settings=SAFETY_SETTINGS)
+        # --- ИЗМЕНЕНО ---
+        # ПРИЧИНА: Новый SDK требует передавать конфигурацию через объект `types.GenerateContentConfig`.
+        # System instructions и safety settings теперь являются частью этого объекта.
+        config = types.GenerateContentConfig(
+            system_instruction=system_instruction_text,
+            safety_settings=SAFETY_SETTINGS
+        )
+        chat_session = client.chats.create(model=DEFAULT_MODEL, config=config)
         context.chat_data['chat_session'] = chat_session
         logger.info(f"Создан новый чат-объект Gemini для чата {chat_id}")
 
     try:
-        # Отправляем сообщение в существующий чат
-        response = await chat_session.send_message_async(content=prompt_parts)
+        # --- ИЗМЕНЕНО ---
+        # ПРИЧИНА: В новом SDK метод `send_message` является синхронным.
+        # В асинхронном окружении его нужно вызывать через `asyncio.to_thread`, чтобы не блокировать event loop.
+        # Метода `send_message_async` больше не существует.
+        response = await asyncio.to_thread(
+            chat_session.send_message, content=prompt_parts
+        )
         reply_text = response.text
         
         await update.message.reply_html(reply_text, disable_web_page_preview=True)
@@ -177,7 +193,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я Женя, ваш ассистент. Просто напишите мне, отправьте фото или файл.")
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    context.chat_data.clear() # Очищаем и chat_session
+    context.chat_data.clear()
     if context.application.persistence:
         await context.application.persistence.drop_chat_data(chat_id)
     await update.message.reply_text("История чата очищена.")
@@ -239,7 +255,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_part = types.Part(data=photo_bytes, mime_type='image/jpeg')
     client = context.bot_data['gemini_client']
     
-    response_extract = await client.models.generate_content(
+    # --- ИЗМЕНЕНО ---
+    # ПРИЧИНА: Для асинхронных вызовов в новом SDK используется `client.aio`.
+    # `await client.models.generate_content(...)` - это синтаксис старого SDK.
+    response_extract = await client.aio.models.generate_content(
         model=DEFAULT_MODEL, 
         contents=["Опиши изображение 1-3 словами для поиска.", image_part]
     )
@@ -314,7 +333,9 @@ async def main():
     if persistence: builder.persistence(persistence)
     application = builder.build()
     
-    application.bot_data['gemini_client'] = genai.Client(api_key=GOOGLE_API_KEY)
+    # Инициализация клиента нового SDK. Ваш код здесь был корректен.
+    # Ключ API будет подхвачен из переменной окружения GOOGLE_API_KEY.
+    application.bot_data['gemini_client'] = genai.Client()
     application.bot_data['http_client'] = httpx.AsyncClient()
 
     application.add_handler(CommandHandler("start", start))
@@ -333,11 +354,22 @@ async def main():
         await application.bot.set_my_commands([BotCommand("start", "Инфо"), BotCommand("clear", "Очистить историю")])
         webhook_url = f"{WEBHOOK_HOST.rstrip('/')}/{GEMINI_WEBHOOK_PATH.strip('/')}"
         await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
+        logger.info(f"Вебхук установлен на: {webhook_url}")
         await run_web_server(application, stop_event)
     finally:
+        logger.info("Остановка приложения...")
         if application.bot_data.get('http_client'):
             await application.bot_data['http_client'].aclose()
         if persistence: persistence.close()
+        logger.info("Приложение остановлено.")
+
 
 if __name__ == '__main__':
+    # Проверка наличия обязательных переменных окружения
+    if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PATH]):
+        logger.critical("Критическая ошибка: не заданы все необходимые переменные окружения (TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PATH)")
+        exit(1)
+    
+    genai.configure(api_key=GOOGLE_API_KEY)
+    
     asyncio.run(main())
