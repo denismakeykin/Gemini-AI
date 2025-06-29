@@ -1,6 +1,5 @@
-# Версия 5.5 'Definitive Fix & Polish'
-# Исправлена ошибка KeyError через изменение порядка инициализации.
-# Обновлен стартовый текст.
+# Версия 5.6 'Free Tier Aligned'
+# Удалена платная функция /draw. Добавлена бесплатная и мощная функция /find (умный поиск по истории).
 
 import logging
 import os
@@ -18,6 +17,7 @@ import base64
 import datetime
 import pytz
 import json
+import numpy as np # Для векторных вычислений
 
 import httpx
 import aiohttp
@@ -49,7 +49,7 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 
 # --- КОНСТАНТЫ И НАСТРОЙКИ МОДЕЛЕЙ ---
 MODEL_NAME = 'gemini-2.5-flash' 
-IMAGEN_MODEL_NAME = 'imagen-3.0-generate-001'
+EMBEDDING_MODEL_NAME = 'text-embedding-004' # Новая бесплатная модель
 MAX_OUTPUT_TOKENS = 8192
 MAX_CONTEXT_CHARS = 120000 
 
@@ -68,9 +68,7 @@ function_declaration = types.FunctionDeclaration(
     description="Gets the current date and time for a specified timezone. Default is Moscow.",
     parameters=types.Schema(
         type=types.Type.OBJECT,
-        properties={
-            'timezone': types.Schema(type=types.Type.STRING, description="Timezone to get the current time for, e.g., 'Europe/Moscow' or 'America/New_York'")
-        }
+        properties={'timezone': types.Schema(type=types.Type.STRING, description="Timezone, e.g., 'Europe/Moscow'")}
     )
 )
 
@@ -96,8 +94,9 @@ except FileNotFoundError:
     SYSTEM_INSTRUCTION = "You are a helpful and friendly assistant named Zhenya."
 
 
-# --- КЛАСС PERSISTENCE ---
+# --- КЛАСС PERSISTENCE (без изменений) ---
 class PostgresPersistence(BasePersistence):
+    # ... (весь код класса PostgresPersistence без изменений)
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
@@ -281,7 +280,7 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'thinking_mode' not in context.user_data: set_user_setting(context, 'thinking_mode', 'auto')
-    start_text = f"""Я - Женя, лучший ИИ-ассистент на основе <b>Google GEMINI {MODEL_NAME}</b>:
+    start_text = f"""Я - Женя, лучший ИИ-ассистент на основе <b>Google GEMINI 2.5 Flash</b>:
 
 💬 <b>Диалог:</b> Помнит и понимает контекст.
 🎤 <b>Голосовые:</b> Понимает, умеет переводить в текст.
@@ -406,23 +405,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await add_to_history(context, role="user", parts=[{"text": text}], message_id=message.message_id)
     await add_to_history(context, role="model", parts=[{"text": reply_text}], bot_message_id=sent_message.message_id if sent_message else None)
 
-# --- НОВЫЕ КОМАНДЫ С ПРОДВИНУТЫМ ФУНКЦИОНАЛОМ ---
-async def draw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = " ".join(context.args)
-    if not prompt:
-        await update.message.reply_text("Пожалуйста, укажите, что нарисовать. Пример: /draw футуристический город в стиле киберпанк")
+# --- НОВЫЕ КОМАНДЫ ---
+async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("Укажите, что найти в истории. Пример: /find о чем мы говорили вчера про рецепты?")
         return
-    message = await update.message.reply_text("🎨 Думаю над вашим шедевром...")
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
+    message = await update.message.reply_text("🔎 Ищу по смыслу в нашей истории...")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    
+    history = context.chat_data.get("history", [])
+    if len(history) < 2:
+        await message.edit_text("История чата слишком коротка для поиска."); return
+    
+    client = context.bot_data['gemini_client']
     try:
-        client = context.bot_data['gemini_client']
-        response = await client.aio.models.generate_images(model=IMAGEN_MODEL_NAME, prompt=prompt)
-        image_bytes = response.generated_images[0].image.image_bytes
-        await update.message.reply_photo(photo=InputFile(io.BytesIO(image_bytes), filename=f"{prompt[:20]}.png"), caption=f"🖼️ «{prompt}»")
-        await message.delete()
+        # Векторизуем запрос
+        query_embedding = await client.aio.models.embed_content(model=EMBEDDING_MODEL_NAME, content=query)
+        query_vector = np.array(query_embedding['embedding'])
+        
+        # Собираем тексты из истории для векторизации
+        history_texts = [entry['parts'][0]['text'] for entry in history if entry.get('role') in ('user', 'model') and entry.get('parts')]
+        if not history_texts:
+             await message.edit_text("В истории нет сообщений для поиска."); return
+        
+        history_embeddings = await client.aio.models.embed_content(model=EMBEDDING_MODEL_NAME, content=history_texts)
+        
+        # Считаем схожесть
+        similarities = [np.dot(query_vector, np.array(e)) for e in history_embeddings['embedding']]
+        
+        # Находим 3 самых похожих
+        top_3_indices = np.argsort(similarities)[-3:][::-1]
+        
+        result_text = "<b>🔍 Нашел в истории 3 самых похожих сообщения:</b>\n\n"
+        for i in top_3_indices:
+            entry = history[i] # Индекс в history совпадает с history_texts
+            role = "Вы" if entry.get('role') == 'user' else "Я"
+            text_preview = html.escape(entry['parts'][0]['text'][:200]) + "..."
+            result_text += f"<b>{role}:</b> «<i>{text_preview}</i>»\n----------\n"
+            
+        await message.edit_text(result_text, parse_mode=ParseMode.HTML)
     except Exception as e:
-        logger.error(f"Ошибка генерации изображения: {e}", exc_info=True)
-        await message.edit_text(f"❌ Не удалось нарисовать: {str(e)[:150]}")
+        logger.error(f"Ошибка при семантическом поиске: {e}", exc_info=True)
+        await message.edit_text(f"❌ Ошибка во время поиска: {str(e)[:150]}")
 
 async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dish = " ".join(context.args)
@@ -483,23 +508,20 @@ async def main():
     if persistence: builder.persistence(persistence)
     application = builder.build()
     
-    # ИЗМЕНЕНО: Правильный порядок инициализации
-    # Сначала инициализируем приложение (загружается персистентность)
     await application.initialize()
-    # И только потом добавляем несериализуемые объекты в bot_data
     application.bot_data['gemini_client'] = genai.Client()
     
     commands = [
         BotCommand("start", "Инфо и начало работы"),
         BotCommand("config", "Настроить режим мышления"),
-        BotCommand("draw", "Нарисовать изображение"),
+        BotCommand("find", "Умный поиск по истории"),
         BotCommand("recipe", "Найти рецепт блюда"),
         BotCommand("clear", "Очистить историю чата")
     ]
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("config", config_command))
     application.add_handler(CommandHandler("clear", clear_command))
-    application.add_handler(CommandHandler("draw", draw_command))
+    application.add_handler(CommandHandler("find", find_command))
     application.add_handler(CommandHandler("recipe", recipe_command))
     application.add_handler(CallbackQueryHandler(config_callback, pattern="^set_thinking_"))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
