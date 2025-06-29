@@ -1,5 +1,5 @@
-# Версия 5.9 'Final Validation'
-# Исправлена ошибка ValidationError путем очистки истории перед отправкой в API.
+# Версия 5.10 'Final Architecture'
+# Исправлена ошибка 'Tool use...unsupported' путем разделения наборов инструментов.
 # Обновлен стартовый текст.
 
 import logging
@@ -64,20 +64,24 @@ def get_current_time(timezone: str = "Europe/Moscow") -> str:
     except pytz.UnknownTimeZoneError:
         return f"Error: Unknown timezone '{timezone}'."
 
-function_declaration = types.FunctionDeclaration(
-    name='get_current_time',
-    description="Gets the current date and time for a specified timezone. Default is Moscow.",
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={'timezone': types.Schema(type=types.Type.STRING, description="Timezone, e.g., 'Europe/Moscow'")}
-    )
-)
-
-DEFAULT_TOOLS = [
+# ИЗМЕНЕНО: Разделяем инструменты
+# Базовый набор для всех запросов
+BASE_TOOLS = [
     types.Tool(google_search=types.GoogleSearch()),
     types.Tool(url_context=types.UrlContext()),
-    types.Tool(function_declarations=[function_declaration]),
     types.Tool(code_execution=types.ToolCodeExecution())
+]
+
+# Пользовательские функции, которые будут добавляться по необходимости
+CUSTOM_FUNCTION_DECLARATIONS = [
+    types.FunctionDeclaration(
+        name='get_current_time',
+        description="Gets the current date and time for a specified timezone. Default is Moscow.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={'timezone': types.Schema(type=types.Type.STRING, description="Timezone, e.g., 'Europe/Moscow'")}
+        )
+    )
 ]
 
 SAFETY_SETTINGS = [
@@ -97,6 +101,7 @@ except FileNotFoundError:
 
 # --- КЛАСС PERSISTENCE ---
 class PostgresPersistence(BasePersistence):
+    #... (код класса без изменений)
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
@@ -226,8 +231,6 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, **kwargs):
     chat_history.append(kwargs)
     if context.application.persistence:
         await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
-
-# ИЗМЕНЕНО: Функция теперь возвращает чистый список словарей, понятный API
 def build_history_for_request(chat_history: list) -> list:
     clean_history, current_chars = [], 0
     for entry in reversed(chat_history):
@@ -236,7 +239,6 @@ def build_history_for_request(chat_history: list) -> list:
             if current_chars + entry_text_len > MAX_CONTEXT_CHARS:
                 logger.info(f"Достигнут лимит контекста ({MAX_CONTEXT_CHARS} симв). История обрезана до {len(clean_history)} сообщений.")
                 break
-            # Очищаем запись от наших служебных полей, оставляя только нужное API
             clean_entry = {"role": entry["role"], "parts": entry["parts"]}
             clean_history.append(clean_entry)
             current_chars += entry_text_len
@@ -244,7 +246,7 @@ def build_history_for_request(chat_history: list) -> list:
     return clean_history
 
 # --- ЯДРО ЛОГИКИ: УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ЗАПРОСОВ ---
-async def generate_response(client: genai.Client, user_prompt_parts: list, context: ContextTypes.DEFAULT_TYPE, cache_name: str | None = None, response_schema=None) -> str:
+async def generate_response(client: genai.Client, user_prompt_parts: list, context: ContextTypes.DEFAULT_TYPE, cache_name: str | None = None, response_schema=None, custom_tools: list = None) -> str:
     chat_id = context.chat_data.get('id', 'Unknown')
     log_prefix = "UnifiedGen"
     request_contents = user_prompt_parts
@@ -254,8 +256,9 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
     thinking_mode = get_user_setting(context, 'thinking_mode', 'auto')
     thinking_budget = -1 if thinking_mode == 'auto' else 24576
     thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
+    tools_to_use = custom_tools if custom_tools else BASE_TOOLS
     config = types.GenerateContentConfig(
-        safety_settings=SAFETY_SETTINGS, tools=DEFAULT_TOOLS,
+        safety_settings=SAFETY_SETTINGS, tools=tools_to_use,
         thinking_config=thinking_config, cached_content=cache_name,
         system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
     )
@@ -263,9 +266,7 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
         config.response_mime_type = "application/json"
         config.response_schema = response_schema
     try:
-        response = await client.aio.models.generate_content(
-            model=MODEL_NAME, contents=request_contents, config=config
-        )
+        response = await client.aio.models.generate_content(model=MODEL_NAME, contents=request_contents, config=config)
         if response.candidates and response.candidates[0].content and response.candidates[0].content.parts and response.candidates[0].content.parts[0].function_call:
              function_call = response.candidates[0].content.parts[0].function_call
              if function_call.name == 'get_current_time':
