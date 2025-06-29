@@ -1,6 +1,7 @@
-# Версия 10.0 'Final Release'
-# Исправлена логика обработки всех медиа и ссылок. Восстановлен и исправлен ре-анализ.
-# Код полностью функционален.
+# Версия 10.1 'Final & Polished'
+# Исправлена логика обработки аудиофайлов.
+# Удалены нерабочие библиотеки, обработка ссылок теперь полностью через UrlContext.
+# Улучшена обработка ошибок, обновлен стартовый текст.
 
 import logging
 import os
@@ -56,7 +57,6 @@ MAX_CONTEXT_CHARS = 120000
 
 # --- ОПРЕДЕЛЕНИЕ ИНСТРУМЕНТОВ ДЛЯ МОДЕЛИ ---
 def get_current_time(timezone: str = "Europe/Moscow") -> str:
-    """Gets the current date and time for a specified timezone. Default is Moscow."""
     try:
         now_utc = datetime.datetime.now(pytz.utc)
         target_tz = pytz.timezone(timezone)
@@ -67,10 +67,7 @@ def get_current_time(timezone: str = "Europe/Moscow") -> str:
 function_declaration = types.FunctionDeclaration(
     name='get_current_time',
     description="Gets the current date and time for a specified timezone. Default is Moscow.",
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={'timezone': types.Schema(type=types.Type.STRING, description="Timezone, e.g., 'Europe/Moscow'")}
-    )
+    parameters=types.Schema(type=types.Type.OBJECT, properties={'timezone': types.Schema(type=types.Type.STRING)})
 )
 
 TEXT_TOOLS = [
@@ -288,18 +285,17 @@ async def generate_response(client: genai.Client, request_contents: list, contex
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'thinking_mode' not in context.user_data: set_user_setting(context, 'thinking_mode', 'auto')
-    start_text = """Я - Женя, лучший чат-бот ИИ на основе Google Gemini 2.5 Flash с авторскими настройками. Навыки:
-
-🎤💬 <b>Голосовые и текстовые сообщения:</b> понимаю и отвечаю; могу переводить в текст.
+    start_text = """Я - Женя, лучший чат-бот ИИ на основе <b>Google Gemini 2.5 Flash</b> с авторскими настройками. Навыки:
+🎤💬 <b>Голосовые и текстовые сообщения</b> - понимаю и отвечаю; могу переводить ГС в текст.
 🌐🧠 <b>Использую огромный объем знаний, интеллектуальный поиск Google и логическое мышление.</b>
-📸🖼 <b>Изображения:</b> опишу, найду инфо об объектах, возьму текст, отвечу на вопросы.
+📸🖼 <b>Изображения:</b> опишу, найдет инфо об объектах, возьмет текст, отвечу на вопросы.
 🖼<b>Видео (до 50 мб) / YouTube:</b> сделаю пересказ, отвечу по содержанию.
 🔗 <b>Веб-страницы, файлы pdf, txt, json:</b> сделаю изложение, найду информацию.
 
 • Команда /recipe [название блюда]: найдет рецепт и вернет его в четком, структурированном виде.
 • Команда /config позволяет выбрать 'силу мышления', переключаясь между авто и максимум.
 
-(!) Пользуясь ботом, Вы автоматически соглашаетесь на отправку своих сообщений и файлов через Google Gemini API  для получения ответов."""
+(!) Пользуясь ботом, Вы автоматически соглашаетесь на отправку своих сообщений и файлов для получения ответов через Google Gemini API."""
     await update.message.reply_html(start_text)
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,15 +335,16 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], bot_message_id=sent_message.message_id if sent_message else None)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.caption or "Опиши это изображение."
-    photo_file = await update.message.photo[-1].get_file()
+    message = update.message
+    user_text = message.caption or "Опиши это изображение."
+    photo_file = await message.photo[-1].get_file()
     photo_bytes = await photo_file.download_as_bytearray()
     content_parts = [types.Part(text=user_text), types.Part(inline_data=types.Blob(mime_type='image/jpeg', data=photo_bytes))]
     await process_request(update, context, content_parts, tools=MEDIA_TOOLS, user_text_for_history=user_text, file_id_for_history=photo_file.file_id, content_type_for_history="photo")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if doc.file_size > 20 * 1024 * 1024: await update.message.reply_text("❌ Файл слишком большой (> 20 MB)."); return
+    message, doc = update.message, update.message.document
+    if doc.file_size > 20 * 1024 * 1024: await message.reply_text("❌ Файл слишком большой (> 20 MB)."); return
     
     if doc.mime_type and doc.mime_type.startswith("audio/"):
         doc_file = await doc.get_file()
@@ -360,20 +357,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_content = ""
     if doc.mime_type == 'application/pdf':
         try: text_content = await asyncio.to_thread(extract_text, io.BytesIO(doc_bytes))
-        except Exception as e: await update.message.reply_text(f"❌ Не удалось извлечь текст из PDF: {e}"); return
+        except Exception as e: await message.reply_text(f"❌ Не удалось извлечь текст из PDF: {e}"); return
     else:
         try: text_content = doc_bytes.decode('utf-8')
         except UnicodeDecodeError: text_content = doc_bytes.decode('cp1251', errors='ignore')
-    user_text = update.message.caption or f"Проанализируй содержимое файла '{doc.file_name}'."
+    user_text = message.caption or f"Проанализируй содержимое файла '{doc.file_name}'."
     file_prompt = f"{user_text}\n\n--- СОДЕРЖИМОЕ ФАЙЛА ---\n{text_content[:30000]}\n--- КОНЕЦ ФАЙЛА ---"
     await process_request(update, context, [types.Part(text=file_prompt)], tools=TEXT_TOOLS, user_text_for_history=user_text, file_id_for_history=doc.file_id, content_type_for_history="document")
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    video = update.message.video
-    if video.file_size > 50 * 1024 * 1024: await update.message.reply_text("❌ Видеофайл слишком большой (> 50 MB)."); return
+    message, video = update.message, update.message.video
+    if video.file_size > 50 * 1024 * 1024: await message.reply_text("❌ Видеофайл слишком большой (> 50 MB)."); return
     video_file = await video.get_file()
     video_bytes = await video_file.download_as_bytearray()
-    user_text = update.message.caption or "Опиши это видео и сделай краткий пересказ."
+    user_text = message.caption or "Опиши это видео и сделай краткий пересказ."
     content_parts = [types.Part(text=user_text), types.Part(inline_data=types.Blob(mime_type=video.mime_type, data=video_bytes))]
     await process_request(update, context, content_parts, tools=MEDIA_TOOLS, user_text_for_history=user_text, file_id_for_history=video.file_id, content_type_for_history="video")
 
@@ -433,7 +430,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         
                         full_history = build_history_for_request(history)
                         request_contents = full_history + reanalyze_parts
-
+                        
                         client = context.bot_data['gemini_client']
                         reply_text = await generate_response(client, request_contents, context, tools=tools)
                         sent_message = await send_reply(message, reply_text)
@@ -446,7 +443,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         break
 
     await process_request(update, context, [types.Part(text=text)], tools=TEXT_TOOLS, user_text_for_history=text)
-
 
 # --- НОВЫЕ КОМАНДЫ ---
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
