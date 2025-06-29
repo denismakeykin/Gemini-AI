@@ -1,3 +1,6 @@
+# Версия 5.3 'Final Deployment'
+# Исправлена ошибка 'AttributeError: configure'. Код полностью соответствует новому SDK.
+
 import logging
 import os
 import asyncio
@@ -277,8 +280,6 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'thinking_mode' not in context.user_data: set_user_setting(context, 'thinking_mode', 'auto')
-    
-    # ИЗМЕНЕНО: Используем ваш новый стартовый текст
     start_text = f"""Привет! Я - Женя, лучший ИИ-ассистент на основе <b>Google Gemini {MODEL_NAME}</b>.
 
 <b>Мои возможности</b>:
@@ -291,12 +292,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • 🖼<b>Видео</b>: Отправьте видео до 50 МБ или ссылку на YouTube. Женя сможет сделать пересказ или ответить на вопросы по содержанию.
 • <b>Документы</b>: Отправьте файл в формате pdf, txt или json (до 20 МБ). Женя проанализирует содержимое и вы можете задавать по нему  вопросы.
 • 🔗 <b>Веб-страницы</b>: Вставьте любую ссылку на статью или сайт. Женя сможет сделать краткое изложение или найти нужную информацию.
-• <b>Генерация изображений</b>: Команды /draw [ваше описание] нарисует по вашему запросу, используя Imagen-3.
+• <b>Генерация изображений</b>: Команда /draw [ваше описание] нарисует по вашему запросу, используя Imagen-3.
 • Команда /recipe [название блюда] не просто найдет рецепт, а вернет его в четком, структурированном виде: ингредиенты, шаги, описание.
 
 Команда /config позволяет вам выбрать "силу мышления", переключаясь между авто и максимальным анализом.
 (!) Пользуясь ботом, Вы автоматически соглашаетесь на отправку сообщений и файлов для получения ответов через Google Gemini API."""
-    
     await update.message.reply_html(start_text)
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -454,7 +454,7 @@ async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await message.edit_text(formatted_recipe, parse_mode=ParseMode.HTML)
     except (json.JSONDecodeError, KeyError):
-        await message.edit_text(f"❌ Модель вернула некорректные данные. Попробуйте снова.\n\nОтвет модели:\n`{response_text}`", parse_mode=ParseMode.HTML)
+        await message.edit_text(f"❌ Модель вернула некорректные данные. Попробуйте снова.\n\nОтвет модели:\n`{html.escape(response_text)}`", parse_mode=ParseMode.HTML)
 
 # --- ЗАПУСК БОТА И ВЕБ-СЕРВЕРА ---
 async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
@@ -480,7 +480,7 @@ async def run_web_server(application: Application, stop_event: asyncio.Event):
     await runner.cleanup()
 
 async def main():
-    genai.configure(api_key=GOOGLE_API_KEY)
+    # ИЗМЕНЕНО: Удалена некорректная строка genai.configure()
     persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
     if persistence: builder.persistence(persistence)
