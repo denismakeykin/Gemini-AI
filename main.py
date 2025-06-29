@@ -1,6 +1,6 @@
-# Версия 5.10 'Final Architecture'
+# Версия 6.0 'Final Architecture'
 # Исправлена ошибка 'Tool use...unsupported' путем разделения наборов инструментов.
-# Обновлен стартовый текст.
+# Обновлен стартовый текст. Добавлена команда /time для демонстрации Function Calling.
 
 import logging
 import os
@@ -64,24 +64,26 @@ def get_current_time(timezone: str = "Europe/Moscow") -> str:
     except pytz.UnknownTimeZoneError:
         return f"Error: Unknown timezone '{timezone}'."
 
-# ИЗМЕНЕНО: Разделяем инструменты
-# Базовый набор для всех запросов
+# ИЗМЕНЕНО: Разделяем наборы инструментов
+# Базовый набор для всех обычных запросов
 BASE_TOOLS = [
     types.Tool(google_search=types.GoogleSearch()),
     types.Tool(url_context=types.UrlContext()),
     types.Tool(code_execution=types.ToolCodeExecution())
 ]
 
-# Пользовательские функции, которые будут добавляться по необходимости
-CUSTOM_FUNCTION_DECLARATIONS = [
-    types.FunctionDeclaration(
-        name='get_current_time',
-        description="Gets the current date and time for a specified timezone. Default is Moscow.",
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={'timezone': types.Schema(type=types.Type.STRING, description="Timezone, e.g., 'Europe/Moscow'")}
+# Набор инструментов только для вызова наших функций
+FUNCTION_CALLING_TOOLS = [
+    types.Tool(function_declarations=[
+        types.FunctionDeclaration(
+            name='get_current_time',
+            description="Gets the current date and time for a specified timezone. Default is Moscow.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={'timezone': types.Schema(type=types.Type.STRING, description="Timezone, e.g., 'Europe/Moscow'")}
+            )
         )
-    )
+    ])
 ]
 
 SAFETY_SETTINGS = [
@@ -246,7 +248,7 @@ def build_history_for_request(chat_history: list) -> list:
     return clean_history
 
 # --- ЯДРО ЛОГИКИ: УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ЗАПРОСОВ ---
-async def generate_response(client: genai.Client, user_prompt_parts: list, context: ContextTypes.DEFAULT_TYPE, cache_name: str | None = None, response_schema=None, custom_tools: list = None) -> str:
+async def generate_response(client: genai.Client, user_prompt_parts: list, context: ContextTypes.DEFAULT_TYPE, cache_name: str | None = None, response_schema=None, use_function_calling: bool = False) -> str:
     chat_id = context.chat_data.get('id', 'Unknown')
     log_prefix = "UnifiedGen"
     request_contents = user_prompt_parts
@@ -256,7 +258,10 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
     thinking_mode = get_user_setting(context, 'thinking_mode', 'auto')
     thinking_budget = -1 if thinking_mode == 'auto' else 24576
     thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
-    tools_to_use = custom_tools if custom_tools else BASE_TOOLS
+    
+    # ИЗМЕНЕНО: Выбираем правильный набор инструментов
+    tools_to_use = FUNCTION_CALLING_TOOLS if use_function_calling else BASE_TOOLS
+    
     config = types.GenerateContentConfig(
         safety_settings=SAFETY_SETTINGS, tools=tools_to_use,
         thinking_config=thinking_config, cached_content=cache_name,
@@ -266,7 +271,9 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
         config.response_mime_type = "application/json"
         config.response_schema = response_schema
     try:
-        response = await client.aio.models.generate_content(model=MODEL_NAME, contents=request_contents, config=config)
+        response = await client.aio.models.generate_content(
+            model=MODEL_NAME, contents=request_contents, config=config
+        )
         if response.candidates and response.candidates[0].content and response.candidates[0].content.parts and response.candidates[0].content.parts[0].function_call:
              function_call = response.candidates[0].content.parts[0].function_call
              if function_call.name == 'get_current_time':
@@ -285,7 +292,8 @@ async def generate_response(client: genai.Client, user_prompt_parts: list, conte
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'thinking_mode' not in context.user_data: set_user_setting(context, 'thinking_mode', 'auto')
-    start_text = """Я - Женя, лучший ИИ-ассистент на основе <b>Google GEMINI 2.5 Flash</b>:
+    
+    start_text = f"""Я - Женя, лучший ИИ-ассистент на основе <b>Google GEMINI 2.5 Flash</b>:
 
 💬 <b>Диалог:</b> Помнит и понимает контекст.
 🎤 <b>Голосовые:</b> Понимает, умеет переводить в текст.
@@ -298,6 +306,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • Команда /config позволяет вам выбрать "силу мышления", переключаясь между авто и максимальным анализом.
 
 (!) Пользуясь ботом, Вы автоматически соглашаетесь на отправку сообщений и файлов для получения ответов через Google Gemini API."""
+    
     await update.message.reply_html(start_text)
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -444,6 +453,23 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка при семантическом поиске: {e}", exc_info=True)
         await message.edit_text(f"❌ Ошибка во время поиска: {str(e)[:150]}")
 
+async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вызывает модель с инструментом для получения времени."""
+    message = await update.message.reply_text("🕰️ Уточняю время у модели...")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    
+    prompt = "Сколько сейчас времени?"
+    if context.args:
+        prompt += f" в { ' '.join(context.args) }"
+        
+    client = context.bot_data['gemini_client']
+    # Вызываем generate_response, явно передавая набор инструментов для вызова функций
+    reply_text = await generate_response(
+        client, [types.Part(text=prompt)], context,
+        use_function_calling=True
+    )
+    await message.edit_text(reply_text)
+    
 async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dish = " ".join(context.args)
     if not dish:
@@ -511,12 +537,14 @@ async def main():
         BotCommand("config", "Настроить режим мышления"),
         BotCommand("find", "Умный поиск по истории"),
         BotCommand("recipe", "Найти рецепт блюда"),
+        BotCommand("time", "Узнать точное время"),
         BotCommand("clear", "Очистить историю чата")
     ]
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("config", config_command))
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("find", find_command))
+    application.add_handler(CommandHandler("time", time_command))
     application.add_handler(CommandHandler("recipe", recipe_command))
     application.add_handler(CallbackQueryHandler(config_callback, pattern="^set_thinking_"))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
