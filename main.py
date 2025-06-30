@@ -1,8 +1,8 @@
-# Версия 21.4 'Stability Hotfix'
-# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (БД): Переработана функция _execute в PostgresPersistence с использованием try...finally для гарантированного возврата соединений в пул. Это решает ошибку `connection pool exhausted`.
-# 2. ИСПРАВЛЕНИЕ (ПАДЕНИЕ): Удалена ошибочная строка логирования (`t.to_proto()`), вызывавшая `AttributeError` и падение бота.
-# 3. ИСПРАВЛЕНИЕ (КОНФИГ): Добавлена обработка исключения `BadRequest` в `config_callback` для предотвращения ошибок при повторном нажатии на кнопки.
-# 4. Все остальные рабочие механики из v21.2 сохранены.
+# Версия 23.0 'Sticky Context'
+# 1. КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: Внедрен механизм "липкого контекста". Теперь после анализа файла ссылка на него сохраняется во временное хранилище `last_media_context`.
+# 2. УЛУЧШЕНО: `handle_message` теперь проверяет наличие `last_media_context` и, если он есть, прикрепляет его к текстовому запросу, позволяя задавать уточняющие вопросы к последнему проанализированному файлу.
+# 3. УЛУЧШЕНО: Отправка нового файла автоматически заменяет "липкий контекст", позволяя интуитивно переключать тему диалога.
+# 4. СОХРАНЕНО: Логика "амнезии" для основной истории (`history`) сохранена, что предотвращает переполнение токенов. Все остальные рабочие механики остаются в силе.
 
 import logging
 import os
@@ -50,6 +50,7 @@ MODEL_NAME = 'gemini-2.5-flash'
 YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
 MAX_CONTEXT_CHARS = 120000 
+MAX_HISTORY_PART_LEN = 4096
 
 # --- ОПРЕДЕЛЕНИЕ ИНСТРУМЕНТОВ ДЛЯ МОДЕЛИ ---
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
@@ -104,17 +105,14 @@ class PostgresPersistence(BasePersistence):
                 conn = self.db_pool.getconn()
                 with conn.cursor() as cur:
                     cur.execute(query, params)
-                    if fetch == "one":
-                        return cur.fetchone()
-                    if fetch == "all":
-                        return cur.fetchall()
+                    if fetch == "one": return cur.fetchone()
+                    if fetch == "all": return cur.fetchall()
                     conn.commit()
                 return True
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
                 logger.warning(f"Postgres: Ошибка соединения (попытка {attempt + 1}/{retries}): {e}")
                 last_exception = e
                 if conn:
-                    # Закрываем "сломанное" соединение, чтобы пул создал новое
                     self.db_pool.putconn(conn, close=True)
                     conn = None
                 if attempt < retries - 1:
@@ -122,11 +120,10 @@ class PostgresPersistence(BasePersistence):
                     self._connect()
                 continue
             finally:
-                if conn:
-                    self.db_pool.putconn(conn)
+                if conn: self.db_pool.putconn(conn)
         
         logger.error(f"Postgres: Не удалось выполнить запрос после {retries} попыток. Последняя ошибка: {last_exception}")
-        raise last_exception
+        if last_exception: raise last_exception
 
     def _initialize_db(self): self._execute("CREATE TABLE IF NOT EXISTS persistence_data (key TEXT PRIMARY KEY, data BYTEA NOT NULL);")
     def _get_pickled(self, key: str) -> object | None:
@@ -157,8 +154,8 @@ class PostgresPersistence(BasePersistence):
         try:
             data = await asyncio.to_thread(self._get_pickled, f"chat_data_{chat_id}") or {}
             chat_data.update(data)
-        except psycopg2.pool.PoolError as e:
-            logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА: Пул соединений исчерпан при обновлении данных для чата {chat_id}. Ошибка: {e}")
+        except psycopg2.Error as e:
+            logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА БД: Не удалось обновить данные для чата {chat_id}. Ошибка: {e}")
     async def refresh_user_data(self, user_id: int, user_data: dict) -> None: pass
     async def flush(self) -> None: pass
     def close(self):
@@ -214,22 +211,29 @@ async def send_reply(target_message: Message, text: str) -> Message | None:
 def part_to_dict(part: types.Part) -> dict:
     if part.text:
         return {'type': 'text', 'content': part.text}
-    if part.file_data:
-        return {'type': 'file', 'uri': part.file_data.file_uri, 'mime': part.file_data.mime_type}
     return {}
 
 def dict_to_part(part_dict: dict) -> types.Part | None:
     if not isinstance(part_dict, dict): return None
     if part_dict.get('type') == 'text':
         return types.Part(text=part_dict.get('content', ''))
-    if part_dict.get('type') == 'file':
-        return types.Part(file_data=types.FileData(file_uri=part_dict['uri'], mime_type=part_dict['mime']))
     return None
 
 async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list[types.Part], **kwargs):
     chat_history = context.chat_data.setdefault("history", [])
-    serializable_parts = [part_to_dict(p) for p in parts if part_to_dict(p)]
+    
+    processed_parts = []
+    for part in parts:
+        if role == 'model' and part.text and len(part.text) > MAX_HISTORY_PART_LEN:
+            truncated_text = part.text[:MAX_HISTORY_PART_LEN] + "\n... [ответ был сокращен для истории]"
+            processed_parts.append(types.Part(text=truncated_text))
+            logger.info(f"Ответ модели для чата {context.chat_data.get('id')} был обрезан для сохранения в историю.")
+        elif part.text: # Сохраняем только текстовые части
+            processed_parts.append(part)
+
+    serializable_parts = [part_to_dict(p) for p in processed_parts if part_to_dict(p)]
     if not serializable_parts: return
+
     entry = {"role": role, "parts": serializable_parts, **kwargs}
     chat_history.append(entry)
     if len(chat_history) > 40:
@@ -317,38 +321,46 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     
     history = build_history_for_request(context.chat_data.get("history", []))
     
-    final_content_parts = list(content_parts)
-    request_contents = history + [types.Content(parts=final_content_parts, role="user")]
+    request_contents = history + [types.Content(parts=content_parts, role="user")]
     
-    has_media_in_context = any(p.file_data for content in request_contents for p in content.parts)
-    tools = MEDIA_TOOLS if has_media_in_context else TEXT_TOOLS
+    has_media_in_current_request = any(p.file_data for p in content_parts)
+    tools = MEDIA_TOOLS if has_media_in_current_request else TEXT_TOOLS
     
-    text_part_index = next((i for i, part in enumerate(final_content_parts) if part.text), -1)
+    text_part_index = next((i for i, part in enumerate(content_parts) if part.text), -1)
     if text_part_index != -1:
-        original_text = final_content_parts[text_part_index].text
+        original_text = content_parts[text_part_index].text
         
-        if get_user_setting(context, 'proactive_search', False) and not any(p.file_data for p in final_content_parts):
+        if get_user_setting(context, 'proactive_search', False) and not has_media_in_current_request:
             search_results = await perform_proactive_search(original_text)
             search_context = f"\n\n--- Контекст из веба для справки ---\n{search_results}\n--------------------------\n" if search_results else ""
         else:
             search_context = ""
 
         date_context = f"(Текущая дата: {get_current_time_str()})\n"
-        final_content_parts[text_part_index].text = f"{date_context}{search_context}{original_text}"
+        content_parts[text_part_index].text = f"{date_context}{search_context}{original_text}"
 
     try:
         reply_text = await generate_response(client, request_contents, context, tools)
         sent_message = await send_reply(message, reply_text)
         
+        # Сохраняем в историю только то, что нужно
         await add_to_history(context, role="user", parts=content_parts, message_id=message.message_id)
         if sent_message:
             await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], bot_message_id=sent_message.message_id)
+        
+        # Сохраняем медиа-контекст для следующего запроса
+        media_part = next((p for p in content_parts if p.file_data), None)
+        if media_part:
+            context.chat_data['last_media_context'] = part_to_dict(media_part)
+            logger.info(f"Сохранен 'липкий' медиа-контекст для чата {message.chat_id}")
+
     except (IOError, asyncio.TimeoutError) as e:
         logger.error(f"Ошибка обработки файла для ChatID {message.chat_id}: {e}")
         await message.reply_text(f"❌ Ошибка обработки файла: {e}")
     except Exception as e:
         logger.error(f"Непредвиденная ошибка в process_request для ChatID {message.chat_id}: {e}", exc_info=True)
         await message.reply_text("❌ Произошла непредвиденная ошибка. Попробуйте еще раз.")
+
 
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -476,13 +488,26 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, text = update.message, update.message.text or ""
     prompt = f"Проанализируй содержимое по этой ссылке и ответь на мой вопрос: {text}"
+    # Очищаем "липкий" контекст, так как URL - это новый объект для анализа
+    context.chat_data.pop('last_media_context', None)
     await process_request(update, context, [types.Part(text=prompt)])
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, text = update.message, (update.message.text or "").strip()
     if not text: return
     context.chat_data['id'] = message.chat_id
-    await process_request(update, context, [types.Part(text=text)])
+    
+    content_parts = [types.Part(text=text)]
+    
+    # Проверяем и добавляем "липкий" контекст
+    last_media_context_dict = context.chat_data.get('last_media_context')
+    if last_media_context_dict:
+        media_part = dict_to_part(last_media_context_dict)
+        if media_part:
+            content_parts.insert(0, media_part)
+            logger.info(f"Применен 'липкий' медиа-контекст для чата {message.chat_id}")
+
+    await process_request(update, context, content_parts)
 
 async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = await update.message.reply_text("🕰️ Уточняю время у модели...")
