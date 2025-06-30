@@ -1,11 +1,6 @@
-# Версия 13.0 'GenAI SDK Compliant'
-# 1. Полностью переписана логика обработки медиафайлов (видео, аудио, документы) в строгом соответствии с документацией genai.txt.
-#    - Файлы > 20 МБ теперь загружаются через File API (client.files.upload).
-#    - Файлы < 20 МБ отправляются как inline_data для экономии ресурсов File API.
-# 2. Переработан механизм вызова функций (Function Calling) на автоматический режим, поддерживаемый Python SDK.
-#    - Удалена ручная двухэтапная обработка. Код стал проще и эффективнее.
-# 3. Добавлена обработка ссылок YouTube с использованием types.FileData.
-# 4. Упрощена логика сохранения/восстановления истории, удалена ненужная ручная сериализация объектов types.Part.
+# Версия 13.2 'Precision Tuning'
+# 1. Установлена строгая версия модели 'gemini-2.5-flash' по требованию пользователя.
+# 2. Обновлено стартовое сообщение.
 
 import logging
 import os
@@ -52,7 +47,7 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     exit(1)
 
 # --- КОНСТАНТЫ И НАСТРОЙКИ МОДЕЛЕЙ ---
-MODEL_NAME = 'gemini-1.5-flash-latest' # ИЗМЕНЕНО: Рекомендуется использовать 'latest' для авто-обновлений
+MODEL_NAME = 'gemini-2.5-flash' # ИЗМЕНЕНО: Установлена строгая версия модели 'gemini-2.5-flash' по вашему требованию.
 EMBEDDING_MODEL_NAME = 'text-embedding-004'
 MAX_OUTPUT_TOKENS = 8192
 MAX_CONTEXT_CHARS = 120000 
@@ -68,7 +63,6 @@ def get_current_time(timezone: str = "Europe/Moscow") -> str:
     except pytz.UnknownTimeZoneError:
         return f"Error: Unknown timezone '{timezone}'."
 
-# ИЗМЕНЕНО: Используем сами функции для автоматического вызова
 TEXT_TOOLS = [
     types.Tool(google_search=types.GoogleSearch()),
     types.Tool(code_execution=types.ToolCodeExecution()) 
@@ -97,7 +91,7 @@ except FileNotFoundError:
 
 # --- КЛАСС PERSISTENCE ---
 class PostgresPersistence(BasePersistence):
-    #... (код класса без изменений, он и так хорош)
+    #... (код класса без изменений)
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
@@ -226,14 +220,12 @@ async def send_reply(target_message: Message, text: str) -> Message | None:
     except Exception as e: logger.error(f"Критическая ошибка отправки ответа: {e}", exc_info=True)
     return None
 
-# ИЗМЕНЕНО: Упрощено сохранение. Pickle может работать с объектами types.Part напрямую.
 async def add_to_history(context: ContextTypes.DEFAULT_TYPE, **kwargs):
     chat_history = context.chat_data.setdefault("history", [])
     chat_history.append(kwargs)
     if context.application.persistence:
         await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
 
-# ИЗМЕНЕНО: Упрощено восстановление. Не нужно пересобирать объекты.
 def build_history_for_request(chat_history: list) -> list:
     clean_history, current_chars = [], 0
     for entry in reversed(chat_history):
@@ -252,7 +244,6 @@ def build_history_for_request(chat_history: list) -> list:
     return clean_history
 
 # --- ЯДРО ЛОГИКИ ---
-# ИЗМЕНЕНО: Логика вызова функций значительно упрощена благодаря автоматическому режиму SDK.
 async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> str:
     chat_id = context.chat_data.get('id', 'Unknown')
     log_prefix = "UnifiedGen"
@@ -266,7 +257,6 @@ async def generate_response(client: genai.Client, request_contents: list, contex
     )
 
     try:
-        # Для автоматического вызова функций SDK сам делает несколько запросов, если нужно.
         response = await client.aio.models.generate_content(
             model=MODEL_NAME, 
             contents=request_contents, 
@@ -281,18 +271,19 @@ async def generate_response(client: genai.Client, request_contents: list, contex
 
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #... (код команды без изменений)
-    start_text = """Я - Женя, лучший ИИ-ассистент на основе <b>Google Gemini 1.5 Flash</b> с авторскими настройками. Навыки:
-🎤💬 <b>Голосовые и текстовые сообщения</b> - понимаю и отвечаю; могу переводить ГС в текст.
-🌐🧠 <b>Использую огромный объем знаний, интеллектуальный поиск Google и логическое мышление.</b>
-📸🖼 <b>Изображения:</b> опишу, найдет инфо об объектах, возьмет текст, отвечу на вопросы.
-🖼<b>Видео (до 50 мб) / YouTube:</b> сделаю пересказ, отвечу по содержанию.
-🔗 <b>Веб-страницы, файлы pdf, txt, json:</b> сделаю изложение, найду информацию.
+    # ИЗМЕНЕНО: Обновлено стартовое сообщение.
+    start_text = """Я - Женя, чат-бот ИИ на основе Google Gemini 2.5 Flash:
+💬 Отвечаю с учётом контекста на любые темы в легком живом стиле (иногда с юмором).
+🎤 Понимаю голосовые. Могу сделать расшифровку.
+🧠 Использую огромный объем всесторонних знаний.
+🌐 Интеллектуально применяю поиск Google и логическое мышление.
+📸 Опишу изображение, соберу текст, найду инфо об объектах, отвечу на вопросы.
+🖼🔗 Сделаю пересказ или отвечу по содержанию видео (до 50 мб), YouTube-видео, веб-страницы или документов PDF, TXT или JSON.
 
-• Команда /recipe [название блюда]: найдет рецепт и вернет его в четком, структурированном виде.
-• Команда /config позволяет вам выбрать 'силу мышления', переключаясь между авто и максимум.
+• Пишите сюда и добавляй в свои группы.
+• Команда /config позволяет выбрать 'силу мышления', переключаясь между авто и максимум.
 
-(!) Пользуясь ботом, Вы автоматически соглашаетесь на отправку своих сообщений и файлов для получения ответов через Google Gemini API."""
+(!) Пользуясь ботом, Вы автоматически соглашаетесь на отправку сообщений и файлов для получения ответов через Google Gemini API."""
     await update.message.reply_html(start_text)
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -317,14 +308,13 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.application.persistence.drop_chat_data(update.effective_chat.id)
     await update.message.reply_text("История чата и связанные данные очищены.")
 
-# ИЗМЕНЕНО: Централизованный обработчик запросов
 async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, tools: list):
     message = update.message
     client = context.bot_data['gemini_client']
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
     history = build_history_for_request(context.chat_data.get("history", []))
-    request_contents = history + [types.Content(parts=content_parts, role="user")] # Оборачиваем в Content
+    request_contents = history + [types.Content(parts=content_parts, role="user")]
     
     reply_text = await generate_response(client, request_contents, context, tools=tools)
     sent_message = await send_reply(message, reply_text)
@@ -338,13 +328,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_file = await message.photo[-1].get_file()
     photo_bytes = await photo_file.download_as_bytearray()
     
-    # Фотографии обычно меньше 20МБ, отправляем inline
     image_part = types.Part(inline_data=types.Blob(mime_type='image/jpeg', data=photo_bytes))
     content_parts = [types.Part(text=user_text), image_part]
     
     await process_request(update, context, content_parts, tools=MEDIA_TOOLS)
 
-# НОВАЯ ФУНКЦИЯ: Создание Part из файла, с использованием File API для больших файлов
 async def create_file_part(file_bytes: bytearray, mime_type: str, file_name: str, client: genai.Client) -> types.Part:
     if len(file_bytes) > FILE_API_THRESHOLD_BYTES:
         logger.info(f"Файл '{file_name}' ({len(file_bytes) / 1024 / 1024:.2f} MB) превышает порог, используем File API.")
@@ -364,7 +352,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc_file = await doc.get_file()
     doc_bytes = await doc_file.download_as_bytearray()
     
-    # ИЗМЕНЕНО: Обработка аудио-документов перенаправляется в process_audio
     if doc.mime_type and doc.mime_type.startswith("audio/"):
         await process_audio(update, context, doc_bytes, doc.mime_type)
         return
@@ -389,7 +376,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_bytes = await video_file.download_as_bytearray()
     user_text = message.caption or "Опиши это видео и сделай краткий пересказ."
     
-    # ИЗМЕНЕНО: Используем новую функцию для создания Part
     client = context.bot_data['gemini_client']
     video_part = await create_file_part(video_bytes, video.mime_type, video.file_name or "video.mp4", client)
     
@@ -407,7 +393,6 @@ async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audi
     client = context.bot_data['gemini_client']
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
-    # ИЗМЕНЕНО: Используем новую функцию для создания Part
     audio_part = await create_file_part(audio_bytes, mime_type, "voice.ogg", client)
     
     transcription_prompt = "Transcribe this audio file and return only the transcribed text."
@@ -425,14 +410,13 @@ async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audi
         
     await process_request(update, context, [types.Part(text=user_prompt)], tools=TEXT_TOOLS)
 
-# НОВЫЙ ОБРАБОТЧИК: для ссылок на YouTube
 YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
 
 async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     text = message.text or ""
     match = re.search(YOUTUBE_REGEX, text)
-    if not match: return # Это не должно случиться из-за фильтра, но для надежности
+    if not match: return
     
     video_id = match.group(1)
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -440,7 +424,6 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await message.reply_text("Анализирую видео с YouTube...", reply_to_message_id=message.message_id)
     
-    # Создаем Part согласно документации
     youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
     
     user_prompt = text.replace(match.group(0), "").strip()
@@ -456,15 +439,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text: return
     context.chat_data['id'], context.user_data['id'] = message.chat_id, message.from_user.id
 
-    # Логика ответа на сообщение бота остается прежней, она хороша
     if message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id:
-        # ... (здесь можно оставить логику re-analyze, но она становится менее актуальной с длинным контекстом)
-        # Для простоты пока используем стандартный путь
         pass
 
     await process_request(update, context, [types.Part(text=text)], tools=TEXT_TOOLS)
 
-# ИЗМЕНЕНО: Команда time теперь использует автоматический вызов функций
 async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = await update.message.reply_text("🕰️ Уточняю время у модели...")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
@@ -491,7 +470,6 @@ async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = f"Найди рецепт для блюда '{dish_name}'."
     message = await update.message.reply_text(f"🍳 Ищу рецепт для '{dish_name}'...")
     
-    # ... остальная логика команды recipe без изменений, она хороша ...
     await update.message.reply_text("Эта команда пока в разработке.")
 
 
@@ -527,7 +505,6 @@ async def main():
     application = builder.build()
     
     await application.initialize()
-    # Инициализация клиента Gemini происходит здесь, один раз для всего приложения
     application.bot_data['gemini_client'] = genai.Client(api_key=GOOGLE_API_KEY)
     
     commands = [
@@ -544,12 +521,10 @@ async def main():
     application.add_handler(CommandHandler("recipe", recipe_command))
     application.add_handler(CallbackQueryHandler(config_callback, pattern="^set_thinking_"))
     
-    # ИЗМЕНЕНО: Порядок обработчиков важен
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    # НОВЫЙ ОБРАБОТЧИК: для YouTube, должен идти перед общим текстовым
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(YOUTUBE_REGEX), handle_youtube_url))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
@@ -569,6 +544,5 @@ async def main():
         logger.info("Приложение полностью остановлено.")
 
 if __name__ == '__main__':
-    # Настройка клиента должна происходить до запуска event loop'а
     genai.configure(api_key=GOOGLE_API_KEY)
     asyncio.run(main())
