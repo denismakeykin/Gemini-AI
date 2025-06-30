@@ -2,10 +2,6 @@ python-telegram-bot[webhooks]
 google-genai
 pytz
 psycopg2-binary
-youtube-transcript-api
-pdfminer.six
 httpx
-beautifulsoup4
 aiohttp
 duckduckgo-search
-numpy
