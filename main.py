@@ -1,10 +1,3 @@
-# Версия 21.0 'Hybrid Grounding'
-# 1. ВОЗВРАЩЕНО: Проактивный поиск (DuckDuckGo) из main_new.txt. Управляется через команду /config. Это решает проблему "ленивого" поиска модели.
-# 2. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Полностью переработан process_request. Теперь он сам динамически определяет, какие инструменты (TEXT_TOOLS или MEDIA_TOOLS) использовать, анализируя ВЕСЬ контекст запроса (включая историю). Это устраняет корень ошибок INVALID_ARGUMENT при повторном анализе файлов.
-# 3. ИСПОЛНЕНО: Из кода убраны любые модификации системной инструкции. Теперь она загружается только из файла system_prompt.md, как и требовалось.
-# 4. ИСПОЛНЕНО: Стартовое сообщение заменено на новое.
-# 5. СОХРАНЕНО: Вся стабильная логика обработки файлов (аудио, видео, фото, документы, URL, YouTube) и сохранения истории из v20.0 сохранена.
-
 import logging
 import os
 import asyncio
@@ -294,7 +287,8 @@ async def generate_response(client: genai.Client, request_contents: list, contex
                      contents=request_contents + [response.candidates[0].content, types.Content(parts=[function_response_part], role="tool")],
                      config=config
                  )
-        logger.info(f"ChatID: {chat_id} | Ответ получен. Используемые инструменты: {[t.to_dict() for t in tools]}")
+        # ИСПРАВЛЕННАЯ СТРОКА ЛОГИРОВАНИЯ
+        logger.info(f"ChatID: {chat_id} | Ответ получен. Инструменты: {[type(t.to_proto()).__name__ for t in tools]}")
         return response.text
     except Exception as e:
         logger.error(f"ChatID: {chat_id} | Ошибка: {e}", exc_info=True)
@@ -317,7 +311,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     if text_part_index != -1:
         original_text = final_content_parts[text_part_index].text
         
-        # Проактивный поиск, если включен и нет медиа в текущем запросе
         if get_user_setting(context, 'proactive_search', False) and not any(p.file_data for p in final_content_parts):
             search_results = await perform_proactive_search(original_text)
             search_context = f"\n\n--- Контекст из веба для справки ---\n{search_results}\n--------------------------\n" if search_results else ""
@@ -344,7 +337,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.setdefault('thinking_mode', 'auto')
-    context.chat_data.setdefault('proactive_search', False) # По умолчанию выключен
+    context.chat_data.setdefault('proactive_search', False)
     start_text = """Я - Женя, лучший ИИ-чат-бот на Google Gemini 2.5 Flash с авторскими настройками.
 
 🌐 Использую интеллектуальный поиск Google в интернете.
