@@ -1,8 +1,6 @@
-# Версия 13.4 'Stability & Intelligence Boost'
-# 1. Обновлен системный промпт для поощрения использования Google Search.
-# 2. Добавлен обработчик для файлов, отправленных как "Музыка" (filters.AUDIO).
-# 3. Видеофайлы теперь всегда принудительно загружаются через File API для стабильности.
-# 4. Вспомогательная функция handle_audio для унификации обработки.
+# Версия 13.6 'Final Fix'
+# 1. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: Удален вызов несуществующей функции genai.configure,
+#    которая приводила к сбою при развертывании.
 
 import logging
 import os
@@ -91,15 +89,13 @@ SAFETY_SETTINGS = [
               types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT)
 ]
 
-# ИЗМЕНЕНО: Добавлено указание для модели активнее использовать инструменты для проверки фактов.
 try:
     with open('system_prompt.md', 'r', encoding='utf-8') as f:
         SYSTEM_INSTRUCTION = f.read()
-    SYSTEM_INSTRUCTION += "\nAlways use your tools, especially Google Search, to verify facts and provide up-to-date information, particularly for questions about current events, people, or specific data."
-    logger.info("Системный промпт успешно загружен и дополнен инструкцией по проверке фактов.")
+    logger.info("Системный промпт успешно загружен из файла system_prompt.md.")
 except FileNotFoundError:
     logger.error("Файл system_prompt.md не найден! Будет использована инструкция по умолчанию.")
-    SYSTEM_INSTRUCTION = "You are a helpful and friendly assistant named Zhenya. Always use your tools, especially Google Search, to verify facts and provide up-to-date information, particularly for questions about current events, people, or specific data."
+    SYSTEM_INSTRUCTION = "You are a helpful and friendly assistant named Zhenya."
 
 
 # --- КЛАСС PERSISTENCE ---
@@ -380,7 +376,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Получен документ: {doc.file_name}, MIME-тип: {doc.mime_type}")
     if doc.file_size > 50 * 1024 * 1024: await message.reply_text("❌ Файл слишком большой (> 50 MB)."); return
     
-    # ИЗМЕНЕНО: Если это аудио-документ, передаем его в общий обработчик аудио
     if doc.mime_type and doc.mime_type.startswith("audio/"):
         await handle_audio(update, context, doc)
         return
@@ -399,7 +394,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_prompt = f"{user_text}\n\n--- СОДЕРЖИМОЕ ФАЙЛА ---\n{text_content[:30000]}\n--- КОНЕЦ ФАЙЛА ---"
     await process_request(update, context, [types.Part(text=file_prompt)], tools=TEXT_TOOLS)
 
-# ИЗМЕНЕНО: Видео теперь всегда загружается через File API для надежности
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, video = update.message, update.message.video
     logger.info(f"Получено видео: {video.file_name}, MIME-тип: {video.mime_type}")
@@ -421,7 +415,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     content_parts = [types.Part(text=user_text), video_part]
     await process_request(update, context, content_parts, tools=MEDIA_TOOLS)
 
-# НОВОЕ: Универсальный обработчик для всех видов аудио
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_source: Audio | None = None):
     message = update.message
     audio = audio_source or message.audio or message.voice
@@ -564,7 +557,6 @@ async def main():
     
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
-    # ИЗМЕНЕНО: Обработчики аудио унифицированы
     application.add_handler(MessageHandler(filters.VOICE, handle_audio))
     application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -587,5 +579,5 @@ async def main():
         logger.info("Приложение полностью остановлено.")
 
 if __name__ == '__main__':
-    genai.configure(api_key=GOOGLE_API_KEY)
+    # ИЗМЕНЕНО: Удалена некорректная и ненужная строка genai.configure()
     asyncio.run(main())
