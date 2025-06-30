@@ -1,6 +1,9 @@
-# Версия 13.7 'Final API Compliance'
-# 1. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: system_instruction возвращен внутрь объекта config,
-#    устраняя TypeError при вызове generate_content.
+# Версия 13.8 'Hotfix & Data Integrity'
+# 1. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: `build_history_for_request` теперь создает чистые
+#    объекты `types.Content` без лишних полей, устраняя `ValidationError`.
+# 2. ИСПРАВЛЕНА ОШИБКА: `handle_audio` теперь корректно работает с `Voice` объектами,
+#    устраняя `AttributeError`.
+# 3. Добавлен импорт `duckduckgo_search` для будущей реализации проактивного поиска.
 
 import logging
 import os
@@ -30,6 +33,8 @@ from telegram.error import BadRequest
 from google import genai
 from google.genai import types
 from youtube_transcript_api import YouTubeTranscriptApi
+from pdfminer.high_level import extract_text
+from duckduckgo_search import DDGS # Добавлен импорт для будущего использования
 
 # --- КОНФИГУРАЦИЯ ЛОГИРОВАНИЯ И ПЕРЕМЕННЫХ ---
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -235,22 +240,26 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, **kwargs):
     if context.application.persistence:
         await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
 
+# ИЗМЕНЕНО: Функция теперь "очищает" историю от наших служебных полей, создавая валидные объекты Content.
 def build_history_for_request(chat_history: list) -> list:
-    clean_history, current_chars = [], 0
+    valid_history, current_chars = [], 0
     for entry in reversed(chat_history):
-        if entry.get("role") in ("user", "model"):
-            parts = entry.get("parts", [])
-            if not parts: continue
+        # Проверяем, что это запись от user или model и у нее есть parts
+        if entry.get("role") in ("user", "model") and isinstance(entry.get("parts"), list):
+            # Считаем символы только в текстовых частях
+            entry_text_len = sum(len(p.text) for p in entry["parts"] if hasattr(p, 'text') and p.text is not None)
             
-            entry_text_len = sum(len(p.text) for p in parts if hasattr(p, 'text') and p.text is not None)
             if current_chars + entry_text_len > MAX_CONTEXT_CHARS:
-                logger.info(f"Достигнут лимит контекста ({MAX_CONTEXT_CHARS} симв). История обрезана до {len(clean_history)} сообщений.")
+                logger.info(f"Достигнут лимит контекста ({MAX_CONTEXT_CHARS} симв). История обрезана до {len(valid_history)} сообщений.")
                 break
-            
-            clean_history.append(entry)
+
+            # Создаем чистый объект types.Content, содержащий только 'role' и 'parts'
+            clean_content = types.Content(role=entry["role"], parts=entry["parts"])
+            valid_history.append(clean_content)
             current_chars += entry_text_len
-    clean_history.reverse()
-    return clean_history
+            
+    valid_history.reverse()
+    return valid_history
 
 # --- ЯДРО ЛОГИКИ ---
 async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> str:
@@ -259,7 +268,6 @@ async def generate_response(client: genai.Client, request_contents: list, contex
     thinking_mode = get_user_setting(context, 'thinking_mode', 'auto')
     thinking_budget = -1 if thinking_mode == 'auto' else 24576
     
-    # ИЗМЕНЕНО: system_instruction перемещен внутрь config, как того требует SDK.
     config = types.GenerateContentConfig(
         safety_settings=SAFETY_SETTINGS, 
         tools=tools,
@@ -268,7 +276,6 @@ async def generate_response(client: genai.Client, request_contents: list, contex
     )
 
     try:
-        # ИЗМЕНЕНО: Удален некорректный keyword argument.
         response = await client.aio.models.generate_content(
             model=MODEL_NAME, 
             contents=request_contents, 
@@ -285,7 +292,6 @@ async def generate_response(client: genai.Client, request_contents: list, contex
                      function_response=types.FunctionResponse(name='get_current_time', response={'result': result})
                  )
                  
-                 # ИЗМЕНЕНО: Удален некорректный keyword argument. Объект config используется повторно.
                  response = await client.aio.models.generate_content(
                      model=MODEL_NAME, 
                      contents=request_contents + [response.candidates[0].content, types.Content(parts=[function_response_part], role="tool")],
@@ -424,10 +430,13 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
         logger.warning("handle_audio вызван, но источник аудио не найден.")
         return
     
-    logger.info(f"Получено аудио: {audio.file_name}, MIME-тип: {audio.mime_type}")
+    # ИСПРАВЛЕНО: Безопасное получение имени файла.
+    file_name = getattr(audio, 'file_name', 'voice_message.ogg')
+    logger.info(f"Получено аудио: {file_name}, MIME-тип: {audio.mime_type}")
+    
     audio_file = await audio.get_file()
     audio_bytes = await audio_file.download_as_bytearray()
-    await process_audio(update, context, audio_bytes, audio.mime_type, audio.file_name or "audio")
+    await process_audio(update, context, audio_bytes, audio.mime_type, file_name)
 
 async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_bytes: bytearray, mime_type: str, file_name: str):
     message = update.message
@@ -439,6 +448,7 @@ async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audi
     transcription_prompt = "Transcribe this audio file and return only the transcribed text."
     
     history = build_history_for_request(context.chat_data.get("history", []))
+    # ВАЖНО: Транскрипция должна идти без предыдущей истории, чтобы не запутать модель
     transcription_request = [types.Content(parts=[types.Part(text=transcription_prompt), audio_part], role="user")]
     
     transcribed_text = await generate_response(client, transcription_request, context, tools=[])
