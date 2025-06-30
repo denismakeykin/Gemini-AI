@@ -1,6 +1,6 @@
-# Версия 13.6 'Final Fix'
-# 1. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: Удален вызов несуществующей функции genai.configure,
-#    которая приводила к сбою при развертывании.
+# Версия 13.7 'Final API Compliance'
+# 1. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: system_instruction возвращен внутрь объекта config,
+#    устраняя TypeError при вызове generate_content.
 
 import logging
 import os
@@ -259,18 +259,20 @@ async def generate_response(client: genai.Client, request_contents: list, contex
     thinking_mode = get_user_setting(context, 'thinking_mode', 'auto')
     thinking_budget = -1 if thinking_mode == 'auto' else 24576
     
+    # ИЗМЕНЕНО: system_instruction перемещен внутрь config, как того требует SDK.
     config = types.GenerateContentConfig(
         safety_settings=SAFETY_SETTINGS, 
         tools=tools,
-        thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget)
+        thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
+        system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
     )
 
     try:
+        # ИЗМЕНЕНО: Удален некорректный keyword argument.
         response = await client.aio.models.generate_content(
             model=MODEL_NAME, 
             contents=request_contents, 
-            config=config,
-            system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
+            config=config
         )
 
         if response.candidates and response.candidates[0].content and response.candidates[0].content.parts and response.candidates[0].content.parts[0].function_call:
@@ -283,11 +285,11 @@ async def generate_response(client: genai.Client, request_contents: list, contex
                      function_response=types.FunctionResponse(name='get_current_time', response={'result': result})
                  )
                  
+                 # ИЗМЕНЕНО: Удален некорректный keyword argument. Объект config используется повторно.
                  response = await client.aio.models.generate_content(
                      model=MODEL_NAME, 
                      contents=request_contents + [response.candidates[0].content, types.Content(parts=[function_response_part], role="tool")],
-                     config=config,
-                     system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
+                     config=config
                  )
 
         logger.info(f"({log_prefix}) ChatID: {chat_id} | Ответ получен. Мышление: {thinking_mode}")
@@ -579,5 +581,4 @@ async def main():
         logger.info("Приложение полностью остановлено.")
 
 if __name__ == '__main__':
-    # ИЗМЕНЕНО: Удалена некорректная и ненужная строка genai.configure()
     asyncio.run(main())
