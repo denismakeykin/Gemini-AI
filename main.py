@@ -1,6 +1,8 @@
-# Версия 13.2 'Precision Tuning'
-# 1. Установлена строгая версия модели 'gemini-2.5-flash' по требованию пользователя.
-# 2. Обновлено стартовое сообщение.
+# Версия 13.4 'Stability & Intelligence Boost'
+# 1. Обновлен системный промпт для поощрения использования Google Search.
+# 2. Добавлен обработчик для файлов, отправленных как "Музыка" (filters.AUDIO).
+# 3. Видеофайлы теперь всегда принудительно загружаются через File API для стабильности.
+# 4. Вспомогательная функция handle_audio для унификации обработки.
 
 import logging
 import os
@@ -22,7 +24,7 @@ import numpy as np
 import httpx
 import aiohttp
 import aiohttp.web
-from telegram import Update, Message, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, Message, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Audio
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, BasePersistence, CallbackQueryHandler
 from telegram.error import BadRequest
@@ -47,11 +49,11 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     exit(1)
 
 # --- КОНСТАНТЫ И НАСТРОЙКИ МОДЕЛЕЙ ---
-MODEL_NAME = 'gemini-2.5-flash' # ИЗМЕНЕНО: Установлена строгая версия модели 'gemini-2.5-flash' по вашему требованию.
+MODEL_NAME = 'gemini-2.5-flash'
 EMBEDDING_MODEL_NAME = 'text-embedding-004'
 MAX_OUTPUT_TOKENS = 8192
 MAX_CONTEXT_CHARS = 120000 
-FILE_API_THRESHOLD_BYTES = 20 * 1024 * 1024 - 512 * 1024 # 19.5 MB, оставляем запас
+FILE_API_THRESHOLD_BYTES = 20 * 1024 * 1024 - 512 * 1024 # 19.5 MB
 
 # --- ОПРЕДЕЛЕНИЕ ИНСТРУМЕНТОВ ДЛЯ МОДЕЛИ ---
 def get_current_time(timezone: str = "Europe/Moscow") -> str:
@@ -63,6 +65,15 @@ def get_current_time(timezone: str = "Europe/Moscow") -> str:
     except pytz.UnknownTimeZoneError:
         return f"Error: Unknown timezone '{timezone}'."
 
+function_declaration = types.FunctionDeclaration(
+    name='get_current_time',
+    description="Gets the current date and time for a specified timezone. Default is Moscow.",
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={'timezone': types.Schema(type=types.Type.STRING, description="Timezone, e.g., 'Europe/Moscow'")}
+    )
+)
+
 TEXT_TOOLS = [
     types.Tool(google_search=types.GoogleSearch()),
     types.Tool(code_execution=types.ToolCodeExecution()) 
@@ -71,7 +82,7 @@ MEDIA_TOOLS = [
     types.Tool(google_search=types.GoogleSearch()),
 ]
 FUNCTION_CALLING_TOOLS = [
-    types.Tool(function_declarations=[get_current_time])
+    types.Tool(function_declarations=[function_declaration])
 ]
 
 SAFETY_SETTINGS = [
@@ -80,13 +91,15 @@ SAFETY_SETTINGS = [
               types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT)
 ]
 
+# ИЗМЕНЕНО: Добавлено указание для модели активнее использовать инструменты для проверки фактов.
 try:
     with open('system_prompt.md', 'r', encoding='utf-8') as f:
         SYSTEM_INSTRUCTION = f.read()
-    logger.info("Системный промпт успешно загружен.")
+    SYSTEM_INSTRUCTION += "\nAlways use your tools, especially Google Search, to verify facts and provide up-to-date information, particularly for questions about current events, people, or specific data."
+    logger.info("Системный промпт успешно загружен и дополнен инструкцией по проверке фактов.")
 except FileNotFoundError:
     logger.error("Файл system_prompt.md не найден! Будет использована инструкция по умолчанию.")
-    SYSTEM_INSTRUCTION = "You are a helpful and friendly assistant named Zhenya."
+    SYSTEM_INSTRUCTION = "You are a helpful and friendly assistant named Zhenya. Always use your tools, especially Google Search, to verify facts and provide up-to-date information, particularly for questions about current events, people, or specific data."
 
 
 # --- КЛАСС PERSISTENCE ---
@@ -263,6 +276,24 @@ async def generate_response(client: genai.Client, request_contents: list, contex
             config=config,
             system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
         )
+
+        if response.candidates and response.candidates[0].content and response.candidates[0].content.parts and response.candidates[0].content.parts[0].function_call:
+             function_call = response.candidates[0].content.parts[0].function_call
+             if function_call.name == 'get_current_time':
+                 args = function_call.args
+                 result = get_current_time(timezone=args.get('timezone', 'Europe/Moscow'))
+                 
+                 function_response_part = types.Part(
+                     function_response=types.FunctionResponse(name='get_current_time', response={'result': result})
+                 )
+                 
+                 response = await client.aio.models.generate_content(
+                     model=MODEL_NAME, 
+                     contents=request_contents + [response.candidates[0].content, types.Content(parts=[function_response_part], role="tool")],
+                     config=config,
+                     system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
+                 )
+
         logger.info(f"({log_prefix}) ChatID: {chat_id} | Ответ получен. Мышление: {thinking_mode}")
         return response.text
     except Exception as e:
@@ -271,7 +302,6 @@ async def generate_response(client: genai.Client, request_contents: list, contex
 
 # --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ИЗМЕНЕНО: Обновлено стартовое сообщение.
     start_text = """Я - Женя, чат-бот ИИ на основе Google Gemini 2.5 Flash:
 💬 Отвечаю с учётом контекста на любые темы в легком живом стиле (иногда с юмором).
 🎤 Понимаю голосовые. Могу сделать расшифровку.
@@ -347,15 +377,16 @@ async def create_file_part(file_bytes: bytearray, mime_type: str, file_name: str
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, doc = update.message, update.message.document
+    logger.info(f"Получен документ: {doc.file_name}, MIME-тип: {doc.mime_type}")
     if doc.file_size > 50 * 1024 * 1024: await message.reply_text("❌ Файл слишком большой (> 50 MB)."); return
     
-    doc_file = await doc.get_file()
-    doc_bytes = await doc_file.download_as_bytearray()
-    
+    # ИЗМЕНЕНО: Если это аудио-документ, передаем его в общий обработчик аудио
     if doc.mime_type and doc.mime_type.startswith("audio/"):
-        await process_audio(update, context, doc_bytes, doc.mime_type)
+        await handle_audio(update, context, doc)
         return
         
+    doc_file = await doc.get_file()
+    doc_bytes = await doc_file.download_as_bytearray()
     text_content = ""
     if doc.mime_type == 'application/pdf':
         try: text_content = await asyncio.to_thread(extract_text, io.BytesIO(doc_bytes))
@@ -368,37 +399,54 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_prompt = f"{user_text}\n\n--- СОДЕРЖИМОЕ ФАЙЛА ---\n{text_content[:30000]}\n--- КОНЕЦ ФАЙЛА ---"
     await process_request(update, context, [types.Part(text=file_prompt)], tools=TEXT_TOOLS)
 
+# ИЗМЕНЕНО: Видео теперь всегда загружается через File API для надежности
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, video = update.message, update.message.video
+    logger.info(f"Получено видео: {video.file_name}, MIME-тип: {video.mime_type}")
     if video.file_size > 50 * 1024 * 1024: await message.reply_text("❌ Видеофайл слишком большой (> 50 MB)."); return
     
+    await message.reply_text("Загружаю видео для анализа...", reply_to_message_id=message.message_id)
     video_file = await video.get_file()
     video_bytes = await video_file.download_as_bytearray()
     user_text = message.caption or "Опиши это видео и сделай краткий пересказ."
     
     client = context.bot_data['gemini_client']
-    video_part = await create_file_part(video_bytes, video.mime_type, video.file_name or "video.mp4", client)
+    logger.info(f"Принудительная загрузка видео '{video.file_name}' через File API.")
+    uploaded_file = await client.aio.files.upload(
+        file=io.BytesIO(video_bytes),
+        config=types.UploadFileConfig(mime_type=video.mime_type, display_name=video.file_name or "video.mp4")
+    )
+    video_part = types.Part(file_data=types.FileData(file_uri=uploaded_file.uri, mime_type=uploaded_file.mime_type))
     
     content_parts = [types.Part(text=user_text), video_part]
     await process_request(update, context, content_parts, tools=MEDIA_TOOLS)
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    voice = update.message.voice
-    voice_file = await voice.get_file()
-    voice_bytes = await voice_file.download_as_bytearray()
-    await process_audio(update, context, voice_bytes, voice.mime_type)
+# НОВОЕ: Универсальный обработчик для всех видов аудио
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_source: Audio | None = None):
+    message = update.message
+    audio = audio_source or message.audio or message.voice
+    if not audio:
+        logger.warning("handle_audio вызван, но источник аудио не найден.")
+        return
+    
+    logger.info(f"Получено аудио: {audio.file_name}, MIME-тип: {audio.mime_type}")
+    audio_file = await audio.get_file()
+    audio_bytes = await audio_file.download_as_bytearray()
+    await process_audio(update, context, audio_bytes, audio.mime_type, audio.file_name or "audio")
 
-async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_bytes: bytearray, mime_type: str):
+async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_bytes: bytearray, mime_type: str, file_name: str):
     message = update.message
     client = context.bot_data['gemini_client']
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
-    audio_part = await create_file_part(audio_bytes, mime_type, "voice.ogg", client)
+    audio_part = await create_file_part(audio_bytes, mime_type, file_name, client)
     
     transcription_prompt = "Transcribe this audio file and return only the transcribed text."
-    transcription_parts = [types.Part(text=transcription_prompt), audio_part]
     
-    transcribed_text = await generate_response(client, [types.Content(parts=transcription_parts)], context, tools=[])
+    history = build_history_for_request(context.chat_data.get("history", []))
+    transcription_request = [types.Content(parts=[types.Part(text=transcription_prompt), audio_part], role="user")]
+    
+    transcribed_text = await generate_response(client, transcription_request, context, tools=[])
     
     if not transcribed_text or transcribed_text.startswith("❌"):
         await message.reply_text("Не удалось распознать речь. Попробуйте снова."); return
@@ -451,15 +499,8 @@ async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = "Сколько сейчас времени?"
     if context.args: prompt += f" в { ' '.join(context.args) }"
     
-    history = build_history_for_request(context.chat_data.get("history", []))
-    request_contents = history + [types.Content(parts=[types.Part(text=prompt)], role="user")]
-    
-    client = context.bot_data['gemini_client']
-    reply_text = await generate_response(client, request_contents, context, tools=FUNCTION_CALLING_TOOLS)
-    
-    await message.edit_text(reply_text)
-    await add_to_history(context, role="user", parts=[types.Part(text=prompt)], message_id=update.message.message_id)
-    await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], bot_message_id=message.message_id)
+    await process_request(update, context, [types.Part(text=prompt)], tools=FUNCTION_CALLING_TOOLS)
+
 
 async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -523,7 +564,9 @@ async def main():
     
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
-    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    # ИЗМЕНЕНО: Обработчики аудио унифицированы
+    application.add_handler(MessageHandler(filters.VOICE, handle_audio))
+    application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(YOUTUBE_REGEX), handle_youtube_url))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
