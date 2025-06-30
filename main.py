@@ -1,10 +1,10 @@
-# Версия 15.0 'Total Recall'
-# 1. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: `build_history_for_request` теперь создает "чистые"
-#    объекты `types.Content` без служебных полей, устраняя `ValidationError`.
-# 2. ИСПРАВЛЕНА ОШИБКА: `handle_audio` корректно работает с `Voice` объектами.
-# 3. НОВАЯ ФУНКЦИЯ: Реализован отключаемый проактивный поиск перед запросом к модели.
-# 4. НОВАЯ ФУНКЦИЯ: В каждый запрос к модели добавляется текущая дата для "заземления".
-# 5. НОВАЯ ФУНКЦИЯ: Реализовано умное переключение моделей для медиа-задач.
+# Версия 16.0 'Phoenix'
+# 1. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: `build_history_for_request` очищает историю, устраняя `ValidationError`.
+# 2. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: `http_client` теперь хранится в `application.bot_data`, устраняя `AttributeError`.
+# 3. ИСПРАВЛЕНА ОШИБКА: `handle_audio` корректно работает с `Voice` объектами.
+# 4. РЕАЛИЗОВАНО: Проактивный поиск (Google -> DDG) с управлением через /config.
+# 5. РЕАЛИЗОВАНО: Внедрение текущей даты в каждый текстовый запрос для "заземления" модели.
+# 6. РЕАЛИЗОВАНО: Умное переключение моделей для медиа-задач.
 
 import logging
 import os
@@ -46,7 +46,7 @@ GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 DATABASE_URL = os.getenv('DATABASE_URL')
 WEBHOOK_HOST = os.getenv('WEBHOOK_HOST')
 GEMINI_WEBHOOK_PATH = os.getenv('GEMINI_WEBHOOK_PATH')
-GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID')
+GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID') 
 
 if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PATH]):
     logger.critical("Критическая ошибка: не заданы все необходимые переменные окружения!")
@@ -56,7 +56,7 @@ if not GOOGLE_CSE_ID:
 
 # --- КОНСТАНТЫ И НАСТРОЙКИ МОДЕЛЕЙ ---
 MODEL_NAME = 'gemini-2.5-flash'
-AVAILABLE_MODELS = {'gemini-2.5-flash': '2.5 Flash'}
+AVAILABLE_MODELS = {'gemini-2.5-flash': '2.5 Flash'} 
 VISION_CAPABLE_MODELS = ['gemini-2.5-flash']
 VIDEO_CAPABLE_MODELS = ['gemini-2.5-flash']
 
@@ -175,11 +175,12 @@ class PostgresPersistence(BasePersistence):
         if self.db_pool: self.db_pool.closeall()
 
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ --- (без изменений, кроме build_history_for_request)
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value): return context.chat_data.get(key, default_value)
 def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value): context.chat_data[key] = value
 
 def sanitize_telegram_html(raw_html: str) -> str:
+    # ... (без изменений)
     if not raw_html: return ""
     sanitized_text = re.sub(r'<br\s*/?>', '\n', raw_html, flags=re.IGNORECASE)
     sanitized_text = re.sub(r'</(li|ul|ol)>\s*<(li|ul|ol)>', '', sanitized_text, flags=re.IGNORECASE)
@@ -190,6 +191,7 @@ def sanitize_telegram_html(raw_html: str) -> str:
     return sanitized_text.strip()
 
 def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
+    # ... (без изменений)
     chunks, tag_stack, remaining_text = [], [], text_to_chunk
     tag_regex = re.compile(r'<(/?)(b|i|u|s|code|pre|a|tg-spoiler)>', re.IGNORECASE)
     while len(remaining_text) > chunk_size:
@@ -210,6 +212,7 @@ def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
     return chunks
 
 async def send_reply(target_message: Message, text: str) -> Message | None:
+    # ... (без изменений)
     sanitized_text = sanitize_telegram_html(text)
     chunks = html_safe_chunker(sanitized_text)
     sent_message = None
@@ -311,7 +314,7 @@ async def perform_proactive_search(query: str, http_client: httpx.AsyncClient) -
                 snippets = [item.get('snippet', '') for item in items]
                 if snippets: 
                     logger.info("Проактивный поиск: Успешно получены сниппеты из Google.")
-                    return "\n".join(f"- {s}" for s in snippets)
+                    return "\n".join(f"- {s}" for s in snippets if s)
         except Exception as e: logger.warning(f"Проактивный Google поиск не удался: {e}")
     
     try:
@@ -330,16 +333,15 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     
     history = build_history_for_request(context.chat_data.get("history", []))
     
-    final_parts = list(content_parts) # Копируем, чтобы не изменять оригинал
+    final_parts = [types.Part(text=p.text) for p in content_parts if hasattr(p, 'text') and p.text is not None] + [p for p in content_parts if not hasattr(p, 'text')]
 
-    # Добавляем проактивный поиск и дату, если это текстовый запрос
     if len(final_parts) > 0 and final_parts[0].text:
         original_text = final_parts[0].text
         date_context = f"(Текущая дата и время: {get_current_time_str()})\n"
         search_context = ""
         
         if get_user_setting(context, 'proactive_search', True):
-            search_results = await perform_proactive_search(original_text, context.application.http_client)
+            search_results = await perform_proactive_search(original_text, context.bot_data['http_client'])
             if search_results:
                 search_context = f"\n--- Контекст из веба ---\n{search_results}\n--------------------------\n"
         
@@ -350,7 +352,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     reply_text = await generate_response(client, request_contents, context, tools, model_id)
     sent_message = await send_reply(message, reply_text)
     
-    # В историю сохраняем оригинальный запрос без добавок
     await add_to_history(context, role="user", parts=content_parts, message_id=message.message_id)
     await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], bot_message_id=sent_message.message_id if sent_message else None)
 
@@ -358,7 +359,18 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.setdefault('proactive_search', True)
     context.chat_data.setdefault('selected_model', MODEL_NAME)
-    start_text = """Я - Женя, чат-бот ИИ на основе Google Gemini 2.5 Flash: ...""" # Текст без изменений
+    start_text = """Я - Женя, чат-бот ИИ на основе Google Gemini 2.5 Flash:
+💬 Отвечаю с учётом контекста на любые темы в легком живом стиле (иногда с юмором).
+🎤 Понимаю голосовые. Могу сделать расшифровку.
+🧠 Использую огромный объем всесторонних знаний.
+🌐 Интеллектуально применяю поиск Google и логическое мышление.
+📸 Опишу изображение, соберу текст, найду инфо об объектах, отвечу на вопросы.
+🖼🔗 Сделаю пересказ или отвечу по содержанию видео (до 50 мб), YouTube-видео, веб-страницы или документов PDF, TXT или JSON.
+
+• Пишите сюда и добавляй в свои группы.
+• Команда /config позволяет выбрать 'силу мышления', переключаясь между авто и максимум.
+
+(!) Пользуясь ботом, Вы автоматически соглашаетесь на отправку сообщений и файлов для получения ответов через Google Gemini API."""
     await update.message.reply_html(start_text)
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -411,7 +423,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if doc.mime_type and doc.mime_type.startswith("audio/"):
         return await handle_audio(update, context, doc)
     
-    # ... остальная логика handle_document без изменений ...
     if doc.file_size > 50 * 1024 * 1024: await message.reply_text("❌ Файл слишком большой (> 50 MB)."); return
     doc_file = await doc.get_file()
     doc_bytes = await doc_file.download_as_bytearray()
@@ -449,6 +460,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_request(update, context, content_parts, tools=MEDIA_TOOLS, model_id=model_id)
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_source: Audio | None = None):
+    message = update.message
     audio = audio_source or message.audio or message.voice
     if not audio: return logger.warning("handle_audio вызван, но источник аудио не найден.")
     
@@ -459,7 +471,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
 
 async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_bytes: bytearray, mime_type: str, file_name: str):
     message, client = update.message, context.bot_data['gemini_client']
-    model_id = get_effective_model(context, "vision") # Используем vision-модели для аудио
+    model_id = get_effective_model(context, "vision")
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
     audio_part = await create_file_part(audio_bytes, mime_type, file_name, client)
@@ -479,8 +491,7 @@ async def process_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audi
 
 async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model_id = get_effective_model(context, "video")
-    message = update.message
-    text = message.text or ""
+    message, text = update.message, update.message.text or ""
     match = re.search(YOUTUBE_REGEX, text)
     if not match: return
     
@@ -508,7 +519,6 @@ async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_request(update, context, [types.Part(text=prompt)], tools=FUNCTION_CALLING_TOOLS, model_id=model_id)
 
 async def recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #... (без изменений)
     if not context.args:
         await update.message.reply_text("Пожалуйста, укажите название блюда. Например: /recipe борщ")
         return
@@ -542,7 +552,7 @@ async def main():
     if persistence: builder.persistence(persistence)
     application = builder.build()
     
-    application.http_client = httpx.AsyncClient()
+    application.bot_data['http_client'] = httpx.AsyncClient()
 
     await application.initialize()
     application.bot_data['gemini_client'] = genai.Client(api_key=GOOGLE_API_KEY)
@@ -581,7 +591,7 @@ async def main():
         await run_web_server(application, stop_event)
     finally:
         logger.info("Начало штатной остановки...")
-        await application.http_client.aclose()
+        await application.bot_data['http_client'].aclose()
         if persistence: persistence.close()
         logger.info("Приложение полностью остановлено.")
 
