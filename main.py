@@ -1,10 +1,7 @@
-# Версия 16.0 'Phoenix'
-# 1. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: `build_history_for_request` очищает историю, устраняя `ValidationError`.
-# 2. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: `http_client` теперь хранится в `application.bot_data`, устраняя `AttributeError`.
-# 3. ИСПРАВЛЕНА ОШИБКА: `handle_audio` корректно работает с `Voice` объектами.
-# 4. РЕАЛИЗОВАНО: Проактивный поиск (Google -> DDG) с управлением через /config.
-# 5. РЕАЛИЗОВАНО: Внедрение текущей даты в каждый текстовый запрос для "заземления" модели.
-# 6. РЕАЛИЗОВАНО: Умное переключение моделей для медиа-задач.
+# Версия 16.0 'Stability Patch'
+# 1. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: `http_client` теперь хранится в `application.bot_data`, устраняя `AttributeError`.
+# 2. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: `YOUTUBE_REGEX` вынесен в глобальную область видимости, устраняя `NameError`.
+# 3. Сохранены все ранее согласованные улучшения: проактивный поиск, "заземление" по дате, умное переключение моделей.
 
 import logging
 import os
@@ -59,6 +56,7 @@ MODEL_NAME = 'gemini-2.5-flash'
 AVAILABLE_MODELS = {'gemini-2.5-flash': '2.5 Flash'} 
 VISION_CAPABLE_MODELS = ['gemini-2.5-flash']
 VIDEO_CAPABLE_MODELS = ['gemini-2.5-flash']
+YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
 
 MAX_OUTPUT_TOKENS = 8192
 MAX_CONTEXT_CHARS = 120000 
@@ -333,7 +331,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     
     history = build_history_for_request(context.chat_data.get("history", []))
     
-    final_parts = [types.Part(text=p.text) for p in content_parts if hasattr(p, 'text') and p.text is not None] + [p for p in content_parts if not hasattr(p, 'text')]
+    final_parts = [types.Part(text=p.text) if hasattr(p, 'text') else p for p in content_parts] 
 
     if len(final_parts) > 0 and final_parts[0].text:
         original_text = final_parts[0].text
