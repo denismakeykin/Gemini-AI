@@ -1,7 +1,9 @@
-# Версия 16.0 'Stability Patch'
-# 1. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: `http_client` теперь хранится в `application.bot_data`, устраняя `AttributeError`.
-# 2. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: `YOUTUBE_REGEX` вынесен в глобальную область видимости, устраняя `NameError`.
-# 3. Сохранены все ранее согласованные улучшения: проактивный поиск, "заземление" по дате, умное переключение моделей.
+# Версия 17.0 'Stability First'
+# 1. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: `http_client` теперь корректно инициализируется и хранится в `application.bot_data`.
+# 2. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: Восстановлена удаленная функция `create_file_part`.
+# 3. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: Логика модификации промпта в `process_request` переписана,
+#    чтобы корректно работать с медиафайлами и избегать ошибок `400 INVALID_ARGUMENT`.
+# 4. Сохранены все ранее согласованные улучшения.
 
 import logging
 import os
@@ -100,6 +102,7 @@ except FileNotFoundError:
 
 # --- КЛАСС PERSISTENCE --- (без изменений)
 class PostgresPersistence(BasePersistence):
+    #... (код класса без изменений)
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
@@ -267,6 +270,19 @@ def get_effective_model(context: ContextTypes.DEFAULT_TYPE, task_type: str) -> s
         
     logger.error(f"Нет доступных моделей для задачи '{task_type}'. Используется модель пользователя '{user_model}'.")
     return user_model
+
+# ИСПРАВЛЕНО: Восстановлена недостающая функция
+async def create_file_part(file_bytes: bytearray, mime_type: str, file_name: str, client: genai.Client) -> types.Part:
+    if len(file_bytes) > FILE_API_THRESHOLD_BYTES:
+        logger.info(f"Файл '{file_name}' ({len(file_bytes) / 1024 / 1024:.2f} MB) превышает порог, используем File API.")
+        uploaded_file = await client.aio.files.upload(
+            file=io.BytesIO(file_bytes),
+            config=types.UploadFileConfig(mime_type=mime_type, display_name=file_name)
+        )
+        return types.Part(file_data=types.FileData(file_uri=uploaded_file.uri, mime_type=uploaded_file.mime_type))
+    else:
+        logger.info(f"Файл '{file_name}' ({len(file_bytes) / 1024 / 1024:.2f} MB) отправляется inline.")
+        return types.Part(inline_data=types.Blob(mime_type=mime_type, data=file_bytes))
     
 # --- ЯДРО ЛОГИКИ ---
 async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list, model_id: str) -> str:
@@ -331,10 +347,17 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     
     history = build_history_for_request(context.chat_data.get("history", []))
     
-    final_parts = [types.Part(text=p.text) if hasattr(p, 'text') else p for p in content_parts] 
+    final_parts = [p for p in content_parts]
 
-    if len(final_parts) > 0 and final_parts[0].text:
-        original_text = final_parts[0].text
+    # ИСПРАВЛЕНО: Корректно находим и модифицируем только текстовую часть
+    text_part_index = -1
+    for i, part in enumerate(final_parts):
+        if hasattr(part, 'text'):
+            text_part_index = i
+            break
+
+    if text_part_index != -1:
+        original_text = final_parts[text_part_index].text
         date_context = f"(Текущая дата и время: {get_current_time_str()})\n"
         search_context = ""
         
@@ -343,7 +366,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             if search_results:
                 search_context = f"\n--- Контекст из веба ---\n{search_results}\n--------------------------\n"
         
-        final_parts[0].text = f"{date_context}{search_context}{original_text}"
+        final_parts[text_part_index].text = f"{date_context}{search_context}{original_text}"
 
     request_contents = history + [types.Content(parts=final_parts, role="user")]
     
@@ -589,7 +612,8 @@ async def main():
         await run_web_server(application, stop_event)
     finally:
         logger.info("Начало штатной остановки...")
-        await application.bot_data['http_client'].aclose()
+        if application.bot_data.get('http_client'):
+            await application.bot_data['http_client'].aclose()
         if persistence: persistence.close()
         logger.info("Приложение полностью остановлено.")
 
