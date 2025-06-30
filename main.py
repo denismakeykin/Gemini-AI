@@ -1,9 +1,8 @@
-# Версия 17.0 'Stability First'
-# 1. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: `http_client` теперь корректно инициализируется и хранится в `application.bot_data`.
-# 2. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: Восстановлена удаленная функция `create_file_part`.
-# 3. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: Логика модификации промпта в `process_request` переписана,
-#    чтобы корректно работать с медиафайлами и избегать ошибок `400 INVALID_ARGUMENT`.
-# 4. Сохранены все ранее согласованные улучшения.
+# Версия 17.1 'Lifecycle Hotfix'
+# 1. ИСПРАВЛЕНА КРИТИЧЕСКАЯ ОШИБКА: Инициализация httpx.AsyncClient перенесена
+#    в правильное место (ПОСЛЕ application.initialize()), чтобы устранить `KeyError`.
+# 2. Все ранее согласованные улучшения (проактивный поиск, "заземление" по дате,
+#    умное переключение моделей) сохранены и теперь должны работать корректно.
 
 import logging
 import os
@@ -102,7 +101,7 @@ except FileNotFoundError:
 
 # --- КЛАСС PERSISTENCE --- (без изменений)
 class PostgresPersistence(BasePersistence):
-    #... (код класса без изменений)
+    #...
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
@@ -174,7 +173,6 @@ class PostgresPersistence(BasePersistence):
     async def flush(self) -> None: pass
     def close(self):
         if self.db_pool: self.db_pool.closeall()
-
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value): return context.chat_data.get(key, default_value)
@@ -271,7 +269,6 @@ def get_effective_model(context: ContextTypes.DEFAULT_TYPE, task_type: str) -> s
     logger.error(f"Нет доступных моделей для задачи '{task_type}'. Используется модель пользователя '{user_model}'.")
     return user_model
 
-# ИСПРАВЛЕНО: Восстановлена недостающая функция
 async def create_file_part(file_bytes: bytearray, mime_type: str, file_name: str, client: genai.Client) -> types.Part:
     if len(file_bytes) > FILE_API_THRESHOLD_BYTES:
         logger.info(f"Файл '{file_name}' ({len(file_bytes) / 1024 / 1024:.2f} MB) превышает порог, используем File API.")
@@ -349,7 +346,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     
     final_parts = [p for p in content_parts]
 
-    # ИСПРАВЛЕНО: Корректно находим и модифицируем только текстовую часть
     text_part_index = -1
     for i, part in enumerate(final_parts):
         if hasattr(part, 'text'):
@@ -573,9 +569,9 @@ async def main():
     if persistence: builder.persistence(persistence)
     application = builder.build()
     
-    application.bot_data['http_client'] = httpx.AsyncClient()
-
     await application.initialize()
+    # ИСПРАВЛЕНО: http_client инициализируется и хранится в bot_data ПОСЛЕ initialize()
+    application.bot_data['http_client'] = httpx.AsyncClient()
     application.bot_data['gemini_client'] = genai.Client(api_key=GOOGLE_API_KEY)
     
     commands = [
