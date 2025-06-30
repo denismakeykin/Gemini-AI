@@ -1,3 +1,9 @@
+# Версия 21.4 'Stability Hotfix'
+# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (БД): Переработана функция _execute в PostgresPersistence с использованием try...finally для гарантированного возврата соединений в пул. Это решает ошибку `connection pool exhausted`.
+# 2. ИСПРАВЛЕНИЕ (ПАДЕНИЕ): Удалена ошибочная строка логирования (`t.to_proto()`), вызывавшая `AttributeError` и падение бота.
+# 3. ИСПРАВЛЕНИЕ (КОНФИГ): Добавлена обработка исключения `BadRequest` в `config_callback` для предотвращения ошибок при повторном нажатии на кнопки.
+# 4. Все остальные рабочие механики из v21.2 сохранены.
+
 import logging
 import os
 import asyncio
@@ -71,7 +77,7 @@ except FileNotFoundError:
     logger.error("Файл system_prompt.md не найден! Будет использована инструкция по умолчанию.")
     SYSTEM_INSTRUCTION = "You are a helpful and friendly assistant named Zhenya."
 
-# --- КЛАСС PERSISTENCE --- (Без изменений)
+# --- КЛАСС PERSISTENCE ---
 class PostgresPersistence(BasePersistence):
     def __init__(self, database_url: str):
         super().__init__()
@@ -89,30 +95,39 @@ class PostgresPersistence(BasePersistence):
              if "keepalives" not in dsn: dsn = f"{dsn}&{keepalive_options}"
         else: dsn = f"{dsn}?{keepalive_options}"
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=dsn)
+    
     def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=3):
-        conn = None
+        last_exception = None
         for attempt in range(retries):
+            conn = None
             try:
                 conn = self.db_pool.getconn()
                 with conn.cursor() as cur:
                     cur.execute(query, params)
-                    if fetch == "one": return cur.fetchone()
-                    if fetch == "all": return cur.fetchall()
+                    if fetch == "one":
+                        return cur.fetchone()
+                    if fetch == "all":
+                        return cur.fetchall()
                     conn.commit()
-                self.db_pool.putconn(conn)
                 return True
             except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
                 logger.warning(f"Postgres: Ошибка соединения (попытка {attempt + 1}/{retries}): {e}")
-                if conn: self.db_pool.putconn(conn, close=True)
+                last_exception = e
+                if conn:
+                    # Закрываем "сломанное" соединение, чтобы пул создал новое
+                    self.db_pool.putconn(conn, close=True)
+                    conn = None
                 if attempt < retries - 1:
                     time.sleep(1 + attempt)
                     self._connect()
-                else:
-                    logger.error(f"Postgres: Не удалось выполнить запрос после {retries} попыток.")
-                    raise e
-            except Exception as e:
-                if conn: self.db_pool.putconn(conn)
-                raise e
+                continue
+            finally:
+                if conn:
+                    self.db_pool.putconn(conn)
+        
+        logger.error(f"Postgres: Не удалось выполнить запрос после {retries} попыток. Последняя ошибка: {last_exception}")
+        raise last_exception
+
     def _initialize_db(self): self._execute("CREATE TABLE IF NOT EXISTS persistence_data (key TEXT PRIMARY KEY, data BYTEA NOT NULL);")
     def _get_pickled(self, key: str) -> object | None:
         res = self._execute("SELECT data FROM persistence_data WHERE key = %s;", (key,), fetch="one")
@@ -139,8 +154,11 @@ class PostgresPersistence(BasePersistence):
     async def update_conversation(self, name: str, key: tuple, new_state: object | None) -> None: pass
     async def refresh_bot_data(self, bot_data: dict) -> None: pass
     async def refresh_chat_data(self, chat_id: int, chat_data: dict) -> None:
-        data = await asyncio.to_thread(self._get_pickled, f"chat_data_{chat_id}") or {}
-        chat_data.update(data)
+        try:
+            data = await asyncio.to_thread(self._get_pickled, f"chat_data_{chat_id}") or {}
+            chat_data.update(data)
+        except psycopg2.pool.PoolError as e:
+            logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА: Пул соединений исчерпан при обновлении данных для чата {chat_id}. Ошибка: {e}")
     async def refresh_user_data(self, user_id: int, user_data: dict) -> None: pass
     async def flush(self) -> None: pass
     def close(self):
@@ -251,7 +269,7 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
         await asyncio.sleep(2)
     raise asyncio.TimeoutError(f"Файл '{file_name}' не стал активным за 30 секунд.")
 
-# --- ПРОАКТИВНЫЙ ПОИСК (ВОЗВРАЩЕНО) ---
+# --- ПРОАКТИВНЫЙ ПОИСК ---
 async def perform_proactive_search(query: str) -> str | None:
     try:
         logger.info(f"Выполняется проактивный поиск по запросу: '{query}'")
@@ -287,7 +305,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
                      contents=request_contents + [response.candidates[0].content, types.Content(parts=[function_response_part], role="tool")],
                      config=config
                  )
-        logger.info(f"ChatID: {chat_id} | Ответ получен. Инструменты: {[type(t.to_proto()).__name__ for t in tools]}")
+        logger.info(f"ChatID: {chat_id} | Ответ получен.")
         return response.text
     except Exception as e:
         logger.error(f"ChatID: {chat_id} | Ошибка: {e}", exc_info=True)
@@ -336,23 +354,18 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.setdefault('thinking_mode', 'auto')
     context.chat_data.setdefault('proactive_search', False)
-    start_text = """Я - Женя, интеллект на Google Gemini 2.5 Flash
+    start_text = """Я - Женя, лучший ИИ-чат-бот на Google Gemini 2.5 Flash с авторскими настройками.
 
-🌐 Использую интеллектуальный поиск Google в интернете, обладаю знаниями во всех сферах.
-🧠 Размышляю над данными, сообщением и контекстом.
-💬 Отвечаю по принципу 'Айсберга знаний' в позитивном стиле, иногда с юмором.
+🌐 Использую интеллектуальный поиск Google в интернете.
+🧠 Обладаю всевозможными знаниями в любых сферах.
+💬 Проанализировав данные и ваш контекст, отвечу точно, но в позитивном стиле с юмором.
 
-Отправляй сюда:
-🎤 Голосовые и текст,
-🎧 Аудиофайлы,
-📸 Изображения,
-📹 YouTube-видео,
-🎞 Видеофайлы (до 50 мб),
-🔗 Веб-страницы,
-📑 Файлы PDF, TXT, JSON,
-- делаю описание, расшифровку в текст, пересказ, ищу по содержимому и отвечаю на вопросы.
+Анализ, описание, расшифровка в текст, пересказ, ответы и поиск по содержимому:
+🎤 Голосовых сообщений и аудиофайлов;
+📸🖼 Изображений, YouTube-видео и видеофайлов (до 50 мб);
+🔗 Веб-страниц и файлов PDF, TXT, JSON.
 
-Пользуйтесь тут и добавляйте в группы!
+Пользуйтесь тут и добавляйте в свои группы!
 
 (!) Используя бот, Вы автоматически соглашаетесь на передачу сообщений и файлов для получения ответов через Google Gemini API."""
     await update.message.reply_html(start_text)
@@ -370,19 +383,33 @@ async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query, data = update.callback_query, update.callback_query.data
     await query.answer()
+    
+    current_mode = get_user_setting(context, 'thinking_mode', 'auto')
+    current_search = get_user_setting(context, 'proactive_search', False)
+
     if data.startswith("set_thinking_"):
         set_user_setting(context, 'thinking_mode', data.replace("set_thinking_", ""))
     elif data == "toggle_proactive_search":
         set_user_setting(context, 'proactive_search', not get_user_setting(context, 'proactive_search', False))
         
-    mode = get_user_setting(context, 'thinking_mode', 'auto')
-    search = get_user_setting(context, 'proactive_search', False)
+    new_mode = get_user_setting(context, 'thinking_mode', 'auto')
+    new_search = get_user_setting(context, 'proactive_search', False)
+
+    if current_mode == new_mode and current_search == new_search:
+        return
+
     keyboard = [
-        [InlineKeyboardButton(f"Мышление: {'✅ ' if mode == 'auto' else ''}Авто", callback_data="set_thinking_auto"),
-         InlineKeyboardButton(f"Мышление: {'✅ ' if mode == 'max' else ''}Максимум", callback_data="set_thinking_max")],
-        [InlineKeyboardButton(f"Проактивный поиск: {'✅ Вкл' if search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
+        [InlineKeyboardButton(f"Мышление: {'✅ ' if new_mode == 'auto' else ''}Авто", callback_data="set_thinking_auto"),
+         InlineKeyboardButton(f"Мышление: {'✅ ' if new_mode == 'max' else ''}Максимум", callback_data="set_thinking_max")],
+        [InlineKeyboardButton(f"Проактивный поиск: {'✅ Вкл' if new_search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
     ]
-    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+    try:
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            logger.info("Сообщение с настройками не изменилось, пропуск редактирования.")
+        else:
+            raise e
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.clear()
