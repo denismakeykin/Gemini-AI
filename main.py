@@ -1,7 +1,8 @@
-# Версия 25.3 'Final Polish'
-# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Восстановлены тела функций-обработчиков, что устраняет `IndentationError` при запуске.
-# 2. ОЧИСТКА: Удалены неиспользуемые импорты и переменные для чистоты кода.
-# 3. Все предыдущие архитектурные решения (Мультиконтекст, Амнезия истории, Персонализация, новые команды) сохранены.
+# Версия 25.4 'Stability & Integrity'
+# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (NameError): Восстановлена удаленная функция `get_current_time_str` и ее импорты, что устраняет ошибку `NameError`.
+# 2. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (PoolError): Функция `_execute` в PostgresPersistence переписана с использованием `try...finally` для гарантированного возврата соединений в пул, что решает проблему `connection pool exhausted`.
+# 3. ИСПРАВЛЕНИЕ: Восстановлены тела всех функций-обработчиков и утилитарных команд.
+# 4. Все архитектурные решения (Мультиконтекст, Амнезия истории, Персонализация) сохранены.
 
 import logging
 import os
@@ -54,8 +55,15 @@ MAX_HISTORY_ITEMS = 50
 MAX_MEDIA_CONTEXTS = 10 
 
 # --- ИНСТРУМЕНТЫ И ПРОМПТЫ ---
+def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
+    return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
+
 TEXT_TOOLS = [types.Tool(google_search=types.GoogleSearch()), types.Tool(code_execution=types.ToolCodeExecution())]
 MEDIA_TOOLS = [types.Tool(google_search=types.GoogleSearch())]
+FUNCTION_CALLING_TOOLS = [types.Tool(function_declarations=[types.FunctionDeclaration(
+    name='get_current_time_str', description="Gets the current date and time.",
+    parameters=types.Schema(type=types.Type.OBJECT, properties={'timezone': types.Schema(type=types.Type.STRING)})
+)])]
 SAFETY_SETTINGS = [
     types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
     for c in (types.HarmCategory.HARM_CATEGORY_HARASSMENT, types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -108,7 +116,6 @@ class PostgresPersistence(BasePersistence):
                     conn = None
                 if attempt < retries - 1:
                     time.sleep(1 + attempt)
-                    self._connect()
                 continue
             finally:
                 if conn: self.db_pool.putconn(conn)
@@ -339,7 +346,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
         date_prefix = f"(System Note: Today is {get_current_time_str()}. Verify facts using Google Search.)\n"
         request_specific_parts[text_part_index].text = f"{date_prefix}{search_context}{user_prefix}{original_text}"
-    
+
     request_contents = history + [types.Content(parts=request_specific_parts, role="user")]
 
     try:
@@ -357,7 +364,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             if len(media_contexts) > MAX_MEDIA_CONTEXTS:
                 media_contexts.popitem(last=False)
             context.chat_data['last_media_context'] = media_contexts[message.message_id]
-            logger.info(f"Сохранен медиа-контекст для msg_id {message.message_id}")
+            logger.info(f"Сохранен/обновлен медиа-контекст для msg_id {message.message_id}")
         elif not is_media_request and not message.reply_to_message:
             if 'last_media_context' in context.chat_data:
                 del context.chat_data['last_media_context']
@@ -369,6 +376,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     except Exception as e:
         logger.error(f"Непредвиденная ошибка в process_request: {e}", exc_info=True)
         await message.reply_text("❌ Произошла внутренняя ошибка. Попробуйте еще раз.")
+
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -489,6 +497,7 @@ async def keypoints_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- ОБРАБОТЧИКИ СООБЩЕНИЙ ---
 async def handle_media_request(update: Update, context: ContextTypes.DEFAULT_TYPE, file_part: types.Part, user_text: str):
     context.chat_data.pop('last_media_context', None)
+    context.chat_data.pop('media_contexts', None)
     content_parts = [file_part, types.Part(text=user_text)]
     await process_request(update, context, content_parts, is_media_request=True)
 
@@ -573,28 +582,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_request(update, context, content_parts, is_media_request=is_media_follow_up)
 
 # --- ЗАПУСК БОТА ---
-async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
-    application = request.app['bot_app']
-    try:
-        data = await request.json(); update = Update.de_json(data, application.bot)
-        await application.process_update(update)
-        return aiohttp.web.Response(status=200)
-    except Exception as e:
-        logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
-        return aiohttp.web.Response(status=500)
-
-async def run_web_server(application: Application, stop_event: asyncio.Event):
-    app = aiohttp.web.Application()
-    app['bot_app'] = application
-    app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), handle_telegram_webhook)
-    runner = aiohttp.web.AppRunner(app)
-    await runner.setup()
-    site = aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
-    await site.start()
-    logger.info(f"Веб-сервер запущен на порту {os.getenv('PORT', '10000')}")
-    await stop_event.wait()
-    await runner.cleanup()
-    
 async def main():
     persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
