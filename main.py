@@ -1,8 +1,7 @@
-# Версия 25.10 'Polishing & Hardening'
-# 1. ИСПРАВЛЕНО (Приветствия): Добавлена явная директива в промпт, запрещающая модели здороваться в середине диалога.
-# 2. ИСПРАВЛЕНО (Транскрипты): Промпт для аудио заменен на более директивный, чтобы по умолчанию всегда выдавался содержательный анализ, а не расшифровка.
-# 3. УЛУЧШЕНО (Лимиты API): Добавлена специальная обработка ошибки 429 (RESOURCE_EXHAUSTED) для информирования пользователя о необходимости подождать.
-# 4. Все остальные рабочие механики, включая "липкий контекст", сохранены.
+# Версия 26.1 'Final Stability & Cleanup'
+# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (Ошибки API): Полностью переписан блок обработки исключений в `generate_response`. Теперь он корректно отлавливает все `GoogleAPIError`, включая 429 (ResourceExhausted) и 403 (PermissionDenied).
+# 2. УЛУЧШЕНО (Контекст): Внедрен механизм "протухания" медиа-контекста. Ссылки на файлы старше 47 часов больше не используются, что предотвращает ошибки PERMISSION_DENIED.
+# 3. Все остальные рабочие механики (Мультиконтекст, Амнезия истории, Персонализация) сохранены и отполированы.
 
 import logging
 import os
@@ -49,10 +48,11 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 MODEL_NAME = 'gemini-2.5-flash'
 YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
-MAX_CONTEXT_CHARS = 200000
-MAX_HISTORY_RESPONSE_LEN = 2000
+MAX_CONTEXT_CHARS = 1000000 
+MAX_HISTORY_RESPONSE_LEN = 10000
 MAX_HISTORY_ITEMS = 50
-MAX_MEDIA_CONTEXTS = 10
+MAX_MEDIA_CONTEXTS = 10 
+MEDIA_CONTEXT_TTL_SECONDS = 47 * 3600 # 47 часов
 
 # --- ИНСТРУМЕНТЫ И ПРОМПТЫ ---
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
@@ -208,13 +208,17 @@ async def send_reply(target_message: Message, text: str) -> Message | None:
 
 def part_to_dict(part: types.Part) -> dict:
     if part.text: return {'type': 'text', 'content': part.text}
-    if part.file_data: return {'type': 'file', 'uri': part.file_data.file_uri, 'mime': part.file_data.mime_type}
+    if part.file_data: return {'type': 'file', 'uri': part.file_data.file_uri, 'mime': part.file_data.mime_type, 'timestamp': time.time()}
     return {}
 
 def dict_to_part(part_dict: dict) -> types.Part | None:
     if not isinstance(part_dict, dict): return None
     if part_dict.get('type') == 'text': return types.Part(text=part_dict.get('content', ''))
-    if part_dict.get('type') == 'file': return types.Part(file_data=types.FileData(file_uri=part_dict['uri'], mime_type=part_dict['mime']))
+    if part_dict.get('type') == 'file':
+        if time.time() - part_dict.get('timestamp', 0) > MEDIA_CONTEXT_TTL_SECONDS:
+            logger.info(f"Медиа-контекст {part_dict.get('uri')} протух и будет проигнорирован.")
+            return None
+        return types.Part(file_data=types.FileData(file_uri=part_dict['uri'], mime_type=part_dict['mime']))
     return None
 
 async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list[types.Part], **kwargs):
@@ -321,12 +325,19 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         response = await client.aio.models.generate_content(model=MODEL_NAME, contents=request_contents, config=config)
         logger.info(f"ChatID: {chat_id} | Ответ получен.")
         return response.text
-    except genai.errors.ResourceExhausted as e:
-        logger.warning(f"ChatID: {chat_id} | Достигнут лимит API. Ошибка: {e}")
-        return "⏳ **Слишком много запросов!**\nПожалуйста, подождите минуту, я немного перегрузилась. Попробую ответить чуть позже."
+    except types.GoogleAPIError as e:
+        if e.code == 429: # ResourceExhausted
+            logger.warning(f"ChatID: {chat_id} | Достигнут лимит API. Ошибка: {e}")
+            return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
+        elif e.code == 403: # PermissionDenied
+            logger.error(f"ChatID: {chat_id} | Ошибка доступа к файлу (возможно, он удален): {e}")
+            return "❌ <b>Ошибка доступа к файлу.</b>\nВозможно, файл был удален с серверов Google (срок хранения 48 часов) или возникла другая проблема. Попробуйте отправить файл заново."
+        else:
+            logger.error(f"ChatID: {chat_id} | Необработанная ошибка Google API: {e}", exc_info=True)
+            return f"❌ <b>Ошибка Google API:</b>\n<code>{str(e)}</code>"
     except Exception as e:
-        logger.error(f"ChatID: {chat_id} | Ошибка генерации: {e}", exc_info=True)
-        return f"❌ **Ошибка модели:**\n<code>{str(e)[:250]}</code>"
+        logger.error(f"ChatID: {chat_id} | Неизвестная ошибка генерации: {e}", exc_info=True)
+        return f"❌ <b>Произошла внутренняя ошибка:</b>\n<code>{str(e)}</code>"
 
 async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, is_media_request: bool = False):
     message, client = update.message, context.bot_data['gemini_client']
@@ -393,21 +404,16 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.setdefault('thinking_mode', 'auto')
     context.chat_data.setdefault('proactive_search', True)
-    start_text = """Я - Женя, интеллект на Google Gemini 2.5 Flash
+    start_text = """Я - Женя, лучший ИИ-чат-бот на Google Gemini 2.5 Flash с авторскими настройками.
 
-🌐 Использую интеллектуальный поиск Google в интернете, обладаю знаниями во всех сферах.
-🧠 Размышляю над данными, сообщением и контекстом.
-💬 Отвечаю по принципу 'Айсберга знаний' в приятном стиле, иногда с юмором.
+🌐 Использую интеллектуальный поиск Google в интернете.
+🧠 Обладаю всевозможными знаниями в любых сферах.
+💬 Проанализировав данные и ваш контекст, отвечу точно, но в позитивном стиле с юмором.
 
-Отправляй сюда:
-🎤 Текст и голосовые,
-🎧 Аудио,
-📸 Изображения,
-📹 YouTube-видео,
-🎞 Видеофайлы (до 50 мб),
-🔗 Веб-страницы,
-📑 Файлы PDF, TXT, JSON,
-- делаю описание, расшифровку, пересказ, ищу по содержимому и отвечаю на вопросы.
+Анализ, описание, расшифровка в текст, пересказ, ответы и поиск по содержимому:
+🎤 Голосовых сообщений и аудиофайлов;
+📸🖼 Изображений, YouTube-видео и видеофайлов (до 50 мб);
+🔗 Веб-страниц и файлов PDF, TXT, JSON.
 
 Пользуйтесь тут и добавляйте в свои группы!
 
@@ -547,7 +553,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
     audio = audio_source or message.audio or message.voice
     if not audio: return
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
-    user_text = message.caption or "Проанализировать и ответить содержательно. Если есть вопросы - ответить на них. Полное цитирование транскрипции - только если попросят словами 'транскрипт', 'расшифруй' или 'дословно'."
+    user_text = message.caption or "Проанализируй суть этого аудио и дай содержательный ответ. Полную транскрипцию предоставляй только по прямой просьбе со словами 'транскрипт' или 'дословно'."
     audio_file = await audio.get_file()
     audio_bytes = await audio_file.download_as_bytearray()
     audio_part = await upload_and_wait_for_file(client, audio_bytes, audio.mime_type, file_name)
