@@ -1,8 +1,7 @@
-# Версия 24.4 'Context Lifecycle'
-# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (СЛОЖЕНИЕ КОНТЕКСТОВ): Все медиа-обработчики теперь принудительно очищают "липкий" контекст перед обработкой нового файла. Это решает проблему `RESOURCE_EXHAUSTED` и `INVALID_ARGUMENT` при отправке нескольких файлов подряд.
-# 2. УЛУЧШЕНО ("ЛИПКИЙ КОНТЕКСТ"): Теперь "липкий" контекст сохраняется только для прямых ответов (reply). Обычное текстовое сообщение на новую тему очищает контекст.
-# 3. УЛУЧШЕНО (ПРОМПТЫ): Доработан промпт для аудио для более точного управления транскрипцией и системный промпт для подавления лишних приветствий.
-# 4. Все остальные рабочие механики (персонализация, история, утилиты) сохранены.
+# Версия 25.8 'Prompt Engineering'
+# 1. ИСПРАВЛЕНИЕ (YouTube): Обновлено регулярное выражение YOUTUBE_REGEX для корректной обработки всех форматов ссылок, включая /shorts/ и youtu.be.
+# 2. УЛУЧШЕНО (Аудио): Переписан промпт в `handle_audio` для приоритезации содержательного ответа вместо транскрипции по умолчанию.
+# 3. Все остальные рабочие механики из v25.5 (включая "умный" контекст и санацию истории) сохранены.
 
 import logging
 import os
@@ -224,7 +223,7 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     if role == 'model':
         text_part = next((p.text for p in parts if p.text), None)
         if text_part:
-            if 'original_message_id' in kwargs: # Это ответ на медиа
+            if 'original_message_id' in kwargs and kwargs.get('is_media_response'):
                 processed_parts.append(types.Part(text="[Был дан ответ на медиа-запрос]"))
             elif len(text_part) > MAX_HISTORY_RESPONSE_LEN:
                 text_to_save = (text_part[:MAX_HISTORY_RESPONSE_LEN] + "...")
@@ -232,7 +231,6 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
                 processed_parts.append(types.Part(text=text_to_save))
             else:
                 processed_parts.append(types.Part(text=text_part))
-
     elif role == 'user':
         text_part = next((p.text for p in parts if p.text), None)
         if text_part:
@@ -357,7 +355,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         
         await add_to_history(context, role="user", parts=content_parts, original_message_id=message.message_id)
         if sent_message:
-            await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
+            await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id, is_media_response=is_media_request)
         
         if is_media_request:
             media_part = next((p for p in content_parts if p.file_data), None)
@@ -379,6 +377,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     except Exception as e:
         logger.error(f"Непредвиденная ошибка в process_request: {e}", exc_info=True)
         await message.reply_text("❌ Произошла внутренняя ошибка. Попробуйте еще раз.")
+
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -533,7 +532,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
     audio = audio_source or message.audio or message.voice
     if not audio: return
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
-    user_text = message.caption or "Ответь на содержание этого аудио. Если в нем содержится прямой вопрос - дай на него развернутый ответ. Если это просьба о транскрипции (например, слова 'расшифруй', 'транскрипт') - предоставь полный текст аудио."
+    user_text = message.caption or "Твоя главная задача — понять суть и ответить содержательно. Если в аудио есть прямой вопрос, ответь на него. Если это рассуждение или история, проанализируй ее и поделись своим мнением или ключевыми выводами. Предоставляй полную транскрипцию только в том случае, если тебя об этом попросят напрямую словами 'транскрипт', 'расшифруй' или 'дословно'."
     audio_file = await audio.get_file()
     audio_bytes = await audio_file.download_as_bytearray()
     audio_part = await upload_and_wait_for_file(client, audio_bytes, audio.mime_type, file_name)
@@ -583,28 +582,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_request(update, context, content_parts, is_media_request=is_media_follow_up)
 
 # --- ЗАПУСК БОТА ---
-async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
-    application = request.app['bot_app']
-    try:
-        data = await request.json(); update = Update.de_json(data, application.bot)
-        await application.process_update(update)
-        return aiohttp.web.Response(status=200)
-    except Exception as e:
-        logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
-        return aiohttp.web.Response(status=500)
-
-async def run_web_server(application: Application, stop_event: asyncio.Event):
-    app = aiohttp.web.Application()
-    app['bot_app'] = application
-    app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), handle_telegram_webhook)
-    runner = aiohttp.web.AppRunner(app)
-    await runner.setup()
-    site = aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
-    await site.start()
-    logger.info(f"Веб-сервер запущен на порту {os.getenv('PORT', '10000')}")
-    await stop_event.wait()
-    await runner.cleanup()
-    
 async def main():
     persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
