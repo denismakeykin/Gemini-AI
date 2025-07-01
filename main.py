@@ -1,7 +1,8 @@
-# Версия 25.9 'Pure Context'
-# 1. КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: Из всех медиа-обработчиков удалены жестко заданные "промпты-надсмотрщики". Теперь модель получает либо текст пользователя (caption), либо минимальный нейтральный промпт.
-# 2. РЕЗУЛЬТАТ: Поведение бота теперь полностью определяется правилами из `system_prompt.md`, а не "костылями" в коде. Это обеспечивает предсказуемость и гибкость.
-# 3. УЛУЧШЕНО: Механизм "липкого контекста" и все остальные рабочие функции адаптированы под новую архитектуру.
+# Версия 25.10 'Polishing & Hardening'
+# 1. ИСПРАВЛЕНО (Приветствия): Добавлена явная директива в промпт, запрещающая модели здороваться в середине диалога.
+# 2. ИСПРАВЛЕНО (Транскрипты): Промпт для аудио заменен на более директивный, чтобы по умолчанию всегда выдавался содержательный анализ, а не расшифровка.
+# 3. УЛУЧШЕНО (Лимиты API): Добавлена специальная обработка ошибки 429 (RESOURCE_EXHAUSTED) для информирования пользователя о необходимости подождать.
+# 4. Все остальные рабочие механики, включая "липкий контекст", сохранены.
 
 import logging
 import os
@@ -48,10 +49,10 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 MODEL_NAME = 'gemini-2.5-flash'
 YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
-MAX_CONTEXT_CHARS = 120000 
+MAX_CONTEXT_CHARS = 200000
 MAX_HISTORY_RESPONSE_LEN = 2000
 MAX_HISTORY_ITEMS = 50
-MAX_MEDIA_CONTEXTS = 10 
+MAX_MEDIA_CONTEXTS = 10
 
 # --- ИНСТРУМЕНТЫ И ПРОМПТЫ ---
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
@@ -320,9 +321,12 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         response = await client.aio.models.generate_content(model=MODEL_NAME, contents=request_contents, config=config)
         logger.info(f"ChatID: {chat_id} | Ответ получен.")
         return response.text
+    except genai.errors.ResourceExhausted as e:
+        logger.warning(f"ChatID: {chat_id} | Достигнут лимит API. Ошибка: {e}")
+        return "⏳ **Слишком много запросов!**\nПожалуйста, подождите минуту, я немного перегрузилась. Попробую ответить чуть позже."
     except Exception as e:
-        logger.error(f"ChatID: {chat_id} | Ошибка: {e}", exc_info=True)
-        return f"❌ Ошибка модели: {str(e)[:250]}"
+        logger.error(f"ChatID: {chat_id} | Ошибка генерации: {e}", exc_info=True)
+        return f"❌ **Ошибка модели:**\n<code>{str(e)[:250]}</code>"
 
 async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, is_media_request: bool = False):
     message, client = update.message, context.bot_data['gemini_client']
@@ -344,7 +348,13 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             search_context = ""
 
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
-        date_prefix = f"(System Note: Today is {get_current_time_str()}. Verify facts using Google Search.)\n"
+        is_first_message = not bool(history)
+        date_prefix = f"(System Note: Today is {get_current_time_str()}. Verify facts. "
+        if not is_first_message:
+            date_prefix += "This is an ongoing conversation, do not greet the user.)\n"
+        else:
+            date_prefix += "This is the first message.)\n"
+            
         request_specific_parts[text_part_index].text = f"{date_prefix}{search_context}{user_prefix}{original_text}"
 
     request_contents = history + [types.Content(parts=request_specific_parts, role="user")]
@@ -377,6 +387,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     except Exception as e:
         logger.error(f"Непредвиденная ошибка в process_request: {e}", exc_info=True)
         await message.reply_text("❌ Произошла внутренняя ошибка. Попробуйте еще раз.")
+
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -531,7 +542,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
     audio = audio_source or message.audio or message.voice
     if not audio: return
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
-    user_text = message.caption or "Твоя главная задача — понять суть и ответить содержательно. Если в аудио есть прямой вопрос, ответь на него. Если это рассуждение или история, проанализируй ее и поделись своим мнением или ключевыми выводами. Предоставляй полную транскрипцию только в том случае, если тебя об этом попросят напрямую словами 'транскрипт', 'расшифруй' или 'дословно'."
+    user_text = message.caption or "Проанализировать и ответить содержательно. Если есть вопросы - ответить на них. Полное цитирование транскрипции - только если попросят словами 'транскрипт', 'расшифруй' или 'дословно'."
     audio_file = await audio.get_file()
     audio_bytes = await audio_file.download_as_bytearray()
     audio_part = await upload_and_wait_for_file(client, audio_bytes, audio.mime_type, file_name)
