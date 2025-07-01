@@ -1,8 +1,7 @@
-# Версия 26.0 'Utility Commands'
-# 1. ДОБАВЛЕНО: Новая команда /summarize для получения краткого пересказа файла/ссылки (использовать ответом).
-# 2. ДОБАВЛЕНО: Новая команда /keypoints для выделения ключевых тезисов из материала (использовать ответом).
-# 3. ДОБАВЛЕНО: Новая команда /newtopic для принудительной очистки "липкого" и "исторического" медиа-контекста.
-# 4. Все предыдущие архитектурные решения (v25.1), включая умные ответы и персонализацию, сохранены.
+# Версия 25.3 'Final Polish'
+# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Восстановлены тела функций-обработчиков, что устраняет `IndentationError` при запуске.
+# 2. ОЧИСТКА: Удалены неиспользуемые импорты и переменные для чистоты кода.
+# 3. Все предыдущие архитектурные решения (Мультиконтекст, Амнезия истории, Персонализация, новые команды) сохранены.
 
 import logging
 import os
@@ -21,7 +20,7 @@ import pytz
 import httpx
 import aiohttp
 import aiohttp.web
-from telegram import Update, Message, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, TelegramObject
+from telegram import Update, Message, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, BasePersistence, CallbackQueryHandler
 from telegram.error import BadRequest
@@ -55,9 +54,6 @@ MAX_HISTORY_ITEMS = 50
 MAX_MEDIA_CONTEXTS = 10 
 
 # --- ИНСТРУМЕНТЫ И ПРОМПТЫ ---
-def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
-    return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
-
 TEXT_TOOLS = [types.Tool(google_search=types.GoogleSearch()), types.Tool(code_execution=types.ToolCodeExecution())]
 MEDIA_TOOLS = [types.Tool(google_search=types.GoogleSearch())]
 SAFETY_SETTINGS = [
@@ -262,7 +258,7 @@ def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_i
     media_contexts = context.chat_data.get("media_contexts", {})
     
     current_reply_id = reply_to_id
-    for _ in range(len(history)):
+    for _ in range(len(history)): 
         bot_message = next((msg for msg in reversed(history) if msg.get("role") == "model" and msg.get("bot_message_id") == current_reply_id), None)
         if bot_message and 'original_message_id' in bot_message:
             user_msg_id = bot_message['original_message_id']
@@ -350,7 +346,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         reply_text = await generate_response(client, request_contents, context, tools)
         sent_message = await send_reply(message, reply_text)
         
-        await add_to_history(context, role="user", parts=content_parts, original_message_id=message.message_id, reply_to_message_id=message.reply_to_message.message_id if message.reply_to_message else None)
+        await add_to_history(context, role="user", parts=content_parts, original_message_id=message.message_id)
         if sent_message:
             await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
         
@@ -437,7 +433,7 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.clear()
     await context.application.persistence.drop_chat_data(update.effective_chat.id)
     await update.message.reply_text("История чата и связанные данные очищены.")
-    
+
 async def newtopic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('last_media_context', None)
     context.chat_data.pop('media_contexts', None)
@@ -455,7 +451,7 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
     client = context.bot_data['gemini_client']
     
     try:
-        if media_obj and isinstance(media_obj, (TelegramObject)):
+        if media_obj:
             media_file = await media_obj.get_file()
             media_bytes = await media_file.download_as_bytearray()
             media_part = await upload_and_wait_for_file(client, media_bytes, media_obj.mime_type, getattr(media_obj, 'file_name', 'media.bin'))
@@ -474,7 +470,6 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("Анализирую...", reply_to_message_id=update.message.message_id)
         
         content_parts = [media_part, types.Part(text=prompt)]
-        # Используем утилитарный вызов без истории, чтобы не засорять контекст
         result_text = await generate_response(client, [types.Content(parts=content_parts, role="user")], context, tools=MEDIA_TOOLS)
         await update.message.reply_text(result_text, parse_mode=ParseMode.HTML)
 
@@ -498,19 +493,51 @@ async def handle_media_request(update: Update, context: ContextTypes.DEFAULT_TYP
     await process_request(update, context, content_parts, is_media_request=True)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений) ...
+    message, client = update.message, context.bot_data['gemini_client']
+    photo_file = await message.photo[-1].get_file()
+    photo_bytes = await photo_file.download_as_bytearray()
+    file_part = await upload_and_wait_for_file(client, photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
+    await handle_media_request(update, context, file_part, message.caption or "Опиши это изображение.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений) ...
+    message, doc, client = update.message, update.message.document, context.bot_data['gemini_client']
+    if doc.file_size > 50 * 1024 * 1024: return await message.reply_text("❌ Файл слишком большой (> 50 MB).")
+    if doc.mime_type and doc.mime_type.startswith("audio/"): return await handle_audio(update, context, doc)
+    await message.reply_text(f"Загружаю документ '{doc.file_name}'...", reply_to_message_id=message.message_id)
+    doc_file = await doc.get_file()
+    doc_bytes = await doc_file.download_as_bytearray()
+    file_part = await upload_and_wait_for_file(client, doc_bytes, doc.mime_type, doc.file_name or "document")
+    await handle_media_request(update, context, file_part, message.caption or "Проанализируй содержимое этого документа.")
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений) ...
+    message, video, client = update.message, update.message.video, context.bot_data['gemini_client']
+    if video.file_size > 50 * 1024 * 1024: return await message.reply_text("❌ Видеофайл слишком большой (> 50 MB).")
+    await message.reply_text("Загружаю видео...", reply_to_message_id=message.message_id)
+    video_file = await video.get_file()
+    video_bytes = await video_file.download_as_bytearray()
+    video_part = await upload_and_wait_for_file(client, video_bytes, video.mime_type, video.file_name or "video.mp4")
+    await handle_media_request(update, context, video_part, message.caption or "Опиши это видео и сделай краткий пересказ.")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_source=None):
-    # ... (код без изменений) ...
+    message, client = update.message, context.bot_data['gemini_client']
+    audio = audio_source or message.audio or message.voice
+    if not audio: return
+    file_name = getattr(audio, 'file_name', 'voice_message.ogg')
+    user_text = message.caption or "Ответь на содержание этого аудио. Если в нем содержится прямой вопрос - дай на него развернутый ответ. Если это просьба о транскрипции (например, слова 'расшифруй', 'транскрипт') - предоставь полный текст аудио."
+    audio_file = await audio.get_file()
+    audio_bytes = await audio_file.download_as_bytearray()
+    audio_part = await upload_and_wait_for_file(client, audio_bytes, audio.mime_type, file_name)
+    await handle_media_request(update, context, audio_part, user_text)
 
 async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений) ...
+    message, text = update.message, update.message.text or ""
+    match = re.search(YOUTUBE_REGEX, text)
+    if not match: return
+    youtube_url = f"https://www.youtube.com/watch?v={match.group(1)}"
+    await message.reply_text("Анализирую видео с YouTube...", reply_to_message_id=message.message_id)
+    youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
+    user_prompt = text.replace(match.group(0), "").strip() or "Сделай краткий пересказ этого видео."
+    await handle_media_request(update, context, youtube_part, user_prompt)
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('last_media_context', None)
@@ -546,6 +573,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_request(update, context, content_parts, is_media_request=is_media_follow_up)
 
 # --- ЗАПУСК БОТА ---
+async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    application = request.app['bot_app']
+    try:
+        data = await request.json(); update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return aiohttp.web.Response(status=200)
+    except Exception as e:
+        logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
+        return aiohttp.web.Response(status=500)
+
+async def run_web_server(application: Application, stop_event: asyncio.Event):
+    app = aiohttp.web.Application()
+    app['bot_app'] = application
+    app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), handle_telegram_webhook)
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
+    await site.start()
+    logger.info(f"Веб-сервер запущен на порту {os.getenv('PORT', '10000')}")
+    await stop_event.wait()
+    await runner.cleanup()
+    
 async def main():
     persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
