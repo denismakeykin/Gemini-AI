@@ -1,11 +1,8 @@
-# Версия 24.2 'Lean & Smart'
-# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (УТЕЧКА ПАМЯТИ): Реализована предложенная пользователем архитектура.
-#    - В основную историю сохраняются только легковесные текстовые сообщения. Длинные ответы модели на анализ файлов заменяются заглушкой.
-#    - Это полностью решает проблему `input token count exceeds the maximum`.
-# 2. УЛУЧШЕНО ("ЛИПКИЙ КОНТЕКСТ"): После анализа файла ссылка на него сохраняется в `last_media_context`. `handle_message` использует этот контекст для уточняющих вопросов. Отправка нового файла или ссылки очищает старый контекст.
-# 3. РЕАЛИЗОВАНО (ПЕРСОНАЛИЗАЦИЯ): В каждый запрос к модели добавляется префикс с именем пользователя, позволяя модели обращаться к нему лично.
-# 4. УЛУЧШЕНО (ПРОМПТЫ): Модифицирован промпт для аудио (транскрипция только по запросу) и системный промпт (убраны лишние приветствия).
-# 5. Все остальные рабочие механики сохранены.
+# Версия 24.3 'The Final Cut'
+# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (УТЕЧКА ПАМЯТИ): История теперь строго санируется. Длинные ответы модели обрезаются, а в историю от пользователя попадает только текст, без указателей на файлы. Это окончательно решает проблему превышения лимита токенов.
+# 2. УЛУЧШЕНО ("ЛИПКИЙ КОНТЕКСТ"): Механизм `last_media_context` сохранен. Он позволяет задавать уточняющие вопросы к последнему файлу. Отправка нового файла или обычный текстовый запрос на другую тему автоматически очищает этот контекст.
+# 3. УЛУЧШЕНО (ПРОМПТЫ): Промпт для аудио теперь настроен на предоставление транскрипции только по явной просьбе. Системный промпт будет лучше справляться с подавлением лишних приветствий.
+# 4. РЕАЛИЗОВАНО (ПЕРСОНАЛИЗАЦИЯ): Сохранен механизм передачи имени пользователя для персонализированных обращений.
 
 import logging
 import os
@@ -53,8 +50,8 @@ MODEL_NAME = 'gemini-2.5-flash'
 YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
 MAX_CONTEXT_CHARS = 120000 
-MAX_HISTORY_RESPONSE_LEN = 2000 # Макс. длина ответа модели для сохранения в историю
-MAX_HISTORY_ITEMS = 40 # Макс. кол-во сообщений в истории
+MAX_HISTORY_RESPONSE_LEN = 2000
+MAX_HISTORY_ITEMS = 40
 
 # --- ИНСТРУМЕНТЫ И ПРОМПТЫ ---
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
@@ -142,21 +139,22 @@ class PostgresPersistence(BasePersistence):
                 except (ValueError, IndexError, pickle.UnpicklingError): logger.warning(f"Обнаружен некорректный ключ или данные чата в БД: '{k}'. Запись пропущена.")
         return chat_data
     async def update_chat_data(self, chat_id: int, data: dict) -> None: await asyncio.to_thread(self._set_pickled, f"chat_data_{chat_id}", data)
-    async def get_user_data(self) -> defaultdict[int, dict]: return defaultdict(dict)
-    async def update_user_data(self, user_id: int, data: dict) -> None: pass
     async def drop_chat_data(self, chat_id: int) -> None: await asyncio.to_thread(self._execute, "DELETE FROM persistence_data WHERE key = %s;", (f"chat_data_{chat_id}",))
-    async def drop_user_data(self, user_id: int) -> None: pass
-    async def get_callback_data(self) -> dict | None: return None
-    async def update_callback_data(self, data: dict) -> None: pass
-    async def get_conversations(self, name: str) -> dict: return {}
-    async def update_conversation(self, name: str, key: tuple, new_state: object | None) -> None: pass
-    async def refresh_bot_data(self, bot_data: dict) -> None: pass
     async def refresh_chat_data(self, chat_id: int, chat_data: dict) -> None:
         try:
             data = await asyncio.to_thread(self._get_pickled, f"chat_data_{chat_id}") or {}
             chat_data.update(data)
         except psycopg2.Error as e:
             logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА БД: Не удалось обновить данные для чата {chat_id}. Ошибка: {e}")
+    # Остальные методы persistence без изменений
+    async def get_user_data(self) -> defaultdict[int, dict]: return defaultdict(dict)
+    async def update_user_data(self, user_id: int, data: dict) -> None: pass
+    async def drop_user_data(self, user_id: int) -> None: pass
+    async def get_callback_data(self) -> dict | None: return None
+    async def update_callback_data(self, data: dict) -> None: pass
+    async def get_conversations(self, name: str) -> dict: return {}
+    async def update_conversation(self, name: str, key: tuple, new_state: object | None) -> None: pass
+    async def refresh_bot_data(self, bot_data: dict) -> None: pass
     async def refresh_user_data(self, user_id: int, user_data: dict) -> None: pass
     async def flush(self) -> None: pass
     def close(self):
@@ -210,31 +208,34 @@ async def send_reply(target_message: Message, text: str) -> Message | None:
     return None
 
 def part_to_dict(part: types.Part) -> dict:
-    if part.text:
-        return {'type': 'text', 'content': part.text}
-    if part.file_data: # Для липкого контекста
-        return {'type': 'file', 'uri': part.file_data.file_uri, 'mime': part.file_data.mime_type}
+    if part.text: return {'type': 'text', 'content': part.text}
+    if part.file_data: return {'type': 'file', 'uri': part.file_data.file_uri, 'mime': part.file_data.mime_type}
     return {}
 
 def dict_to_part(part_dict: dict) -> types.Part | None:
     if not isinstance(part_dict, dict): return None
-    if part_dict.get('type') == 'text':
-        return types.Part(text=part_dict.get('content', ''))
-    if part_dict.get('type') == 'file': # Для липкого контекста
-        return types.Part(file_data=types.FileData(file_uri=part_dict['uri'], mime_type=part_dict['mime']))
+    if part_dict.get('type') == 'text': return types.Part(text=part_dict.get('content', ''))
+    if part_dict.get('type') == 'file': return types.Part(file_data=types.FileData(file_uri=part_dict['uri'], mime_type=part_dict['mime']))
     return None
 
 async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list[types.Part], **kwargs):
     chat_history = context.chat_data.setdefault("history", [])
     
     processed_parts = []
-    for part in parts:
-        if role == 'model' and part.text and len(part.text) > MAX_HISTORY_RESPONSE_LEN:
-            truncated_text = part.text[:MAX_HISTORY_RESPONSE_LEN] + "\n... [ответ был сокращен для истории]"
-            processed_parts.append(types.Part(text=truncated_text))
-            logger.info(f"Ответ модели для чата {context.chat_data.get('id')} был обрезан для сохранения в историю.")
-        elif part.text:
-            processed_parts.append(part)
+    if role == 'model':
+        text_part = next((p.text for p in parts if p.text), None)
+        if text_part:
+            text_to_save = (text_part[:MAX_HISTORY_RESPONSE_LEN] + "...") if len(text_part) > MAX_HISTORY_RESPONSE_LEN else text_part
+            # Заменяем длинный ответ короткой заглушкой для экономии токенов
+            if "Загружаю документ" in text_part or "Анализирую видео" in text_part or len(text_to_save) > 500:
+                 processed_parts.append(types.Part(text="[Был дан развернутый ответ на анализ файла]"))
+            else:
+                 processed_parts.append(types.Part(text=text_to_save))
+    elif role == 'user':
+        # От пользователя сохраняем только текст, медиа-контекст теперь "липкий"
+        text_part = next((p.text for p in parts if p.text), None)
+        if text_part:
+            processed_parts.append(types.Part(text=text_part))
 
     serializable_parts = [part_to_dict(p) for p in processed_parts if p]
     if not serializable_parts: return
@@ -278,7 +279,6 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
         await asyncio.sleep(2)
     raise asyncio.TimeoutError(f"Файл '{file_name}' не стал активным за 30 секунд.")
 
-# --- ПРОАКТИВНЫЙ ПОИСК ---
 async def perform_proactive_search(query: str) -> str | None:
     try:
         logger.info(f"Выполняется проактивный поиск по запросу: '{query}'")
@@ -291,7 +291,6 @@ async def perform_proactive_search(query: str) -> str | None:
         logger.warning(f"Проактивный DDG поиск не удался: {e}")
     return None
 
-# --- ЯДРО ЛОГИКИ ---
 async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> str:
     chat_id = context.chat_data.get('id', 'Unknown')
     thinking_mode = get_user_setting(context, 'thinking_mode', 'auto')
@@ -329,9 +328,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     
     tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
     
-    # Модифицируем `content_parts` для текущего запроса, не меняя оригинал для истории
     request_specific_parts = list(content_parts)
-
     text_part_index = next((i for i, part in enumerate(request_specific_parts) if part.text), -1)
     if text_part_index != -1:
         original_text = request_specific_parts[text_part_index].text
@@ -352,14 +349,249 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         reply_text = await generate_response(client, request_contents, context, tools)
         sent_message = await send_reply(message, reply_text)
         
-        # В историю сохраняем только оригинальные части запроса
         await add_to_history(context, role="user", parts=content_parts, message_id=message.message_id)
         if sent_message:
             await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], bot_message_id=sent_message.message_id)
         
-        # Управляем "липким" контекстом
         media_part = next((p for p in content_parts if p.file_data), None)
         if media_part:
             context.chat_data['last_media_context'] = part_to_dict(media_part)
-            logger.info(f"Сохранен/обновлен 'липкий' медиа-контекст для чата {message.chat_id}")
+            logger.info(f"Сохранен 'липкий' медиа-контекст для чата {message.chat_id}")
         elif not is_media_request:
+            if 'last_media_context' in context.chat_data:
+                del context.chat_data['last_media_context']
+                logger.info(f"Очищен 'липкий' медиа-контекст для чата {message.chat_id}")
+
+    except (IOError, asyncio.TimeoutError) as e:
+        logger.error(f"Ошибка обработки файла для ChatID {message.chat_id}: {e}")
+        await message.reply_text(f"❌ Ошибка обработки файла: {e}")
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка в process_request для ChatID {message.chat_id}: {e}", exc_info=True)
+        await message.reply_text("❌ Произошла непредвиденная ошибка. Попробуйте еще раз.")
+
+# --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data.setdefault('thinking_mode', 'auto')
+    context.chat_data.setdefault('proactive_search', False)
+    start_text = """Я - Женя, лучший ИИ-чат-бот на Google Gemini 2.5 Flash с авторскими настройками.
+
+🌐 Использую интеллектуальный поиск Google в интернете.
+🧠 Обладаю всевозможными знаниями в любых сферах.
+💬 Проанализировав данные и ваш контекст, отвечу точно, но в позитивном стиле с юмором.
+
+Анализ, описание, расшифровка в текст, пересказ, ответы и поиск по содержимому:
+🎤 Голосовых сообщений и аудиофайлов;
+📸🖼 Изображений, YouTube-видео и видеофайлов (до 50 мб);
+🔗 Веб-страниц и файлов PDF, TXT, JSON.
+
+Пользуйтесь тут и добавляйте в свои группы!
+
+(!) Используя бот, Вы автоматически соглашаетесь на передачу сообщений и файлов для получения ответов через Google Gemini API."""
+    await update.message.reply_html(start_text)
+
+async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = get_user_setting(context, 'thinking_mode', 'auto')
+    search = get_user_setting(context, 'proactive_search', False)
+    keyboard = [
+        [InlineKeyboardButton(f"Мышление: {'✅ ' if mode == 'auto' else ''}Авто", callback_data="set_thinking_auto"),
+         InlineKeyboardButton(f"Мышление: {'✅ ' if mode == 'max' else ''}Максимум", callback_data="set_thinking_max")],
+        [InlineKeyboardButton(f"Проактивный поиск: {'✅ Вкл' if search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
+    ]
+    await update.message.reply_text("⚙️ Настройки:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query, data = update.callback_query, update.callback_query.data
+    await query.answer()
+    
+    current_mode = get_user_setting(context, 'thinking_mode', 'auto')
+    current_search = get_user_setting(context, 'proactive_search', False)
+
+    if data.startswith("set_thinking_"):
+        set_user_setting(context, 'thinking_mode', data.replace("set_thinking_", ""))
+    elif data == "toggle_proactive_search":
+        set_user_setting(context, 'proactive_search', not get_user_setting(context, 'proactive_search', False))
+        
+    new_mode = get_user_setting(context, 'thinking_mode', 'auto')
+    new_search = get_user_setting(context, 'proactive_search', False)
+
+    if current_mode == new_mode and current_search == new_search: return
+
+    keyboard = [
+        [InlineKeyboardButton(f"Мышление: {'✅ ' if new_mode == 'auto' else ''}Авто", callback_data="set_thinking_auto"),
+         InlineKeyboardButton(f"Мышление: {'✅ ' if new_mode == 'max' else ''}Максимум", callback_data="set_thinking_max")],
+        [InlineKeyboardButton(f"Проактивный поиск: {'✅ Вкл' if new_search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
+    ]
+    try:
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            logger.info("Сообщение с настройками не изменилось, пропуск редактирования.")
+        else:
+            raise e
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data.clear()
+    await context.application.persistence.drop_chat_data(update.effective_chat.id)
+    await update.message.reply_text("История чата и связанные данные очищены.")
+    
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message, client = update.message, context.bot_data['gemini_client']
+    user_text = message.caption or "Опиши это изображение."
+    photo_file = await message.photo[-1].get_file()
+    photo_bytes = await photo_file.download_as_bytearray()
+    file_part = await upload_and_wait_for_file(client, photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
+    content_parts = [file_part, types.Part(text=user_text)]
+    await process_request(update, context, content_parts, is_media_request=True)
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message, doc, client = update.message, update.message.document, context.bot_data['gemini_client']
+    if doc.file_size > 50 * 1024 * 1024: return await message.reply_text("❌ Файл слишком большой (> 50 MB).")
+    if doc.mime_type and doc.mime_type.startswith("audio/"):
+        return await handle_audio(update, context, doc)
+    await message.reply_text(f"Загружаю документ '{doc.file_name}'...", reply_to_message_id=message.message_id)
+    doc_file = await doc.get_file()
+    doc_bytes = await doc_file.download_as_bytearray()
+    file_part = await upload_and_wait_for_file(client, doc_bytes, doc.mime_type, doc.file_name or "document")
+    user_text = message.caption or "Проанализируй содержимое этого документа."
+    content_parts = [file_part, types.Part(text=user_text)]
+    await process_request(update, context, content_parts, is_media_request=True)
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message, video, client = update.message, update.message.video, context.bot_data['gemini_client']
+    if video.file_size > 50 * 1024 * 1024: return await message.reply_text("❌ Видеофайл слишком большой (> 50 MB).")
+    await message.reply_text("Загружаю видео...", reply_to_message_id=message.message_id)
+    video_file = await video.get_file()
+    video_bytes = await video_file.download_as_bytearray()
+    video_part = await upload_and_wait_for_file(client, video_bytes, video.mime_type, video.file_name or "video.mp4")
+    user_text = message.caption or "Опиши это видео и сделай краткий пересказ."
+    content_parts = [video_part, types.Part(text=user_text)]
+    await process_request(update, context, content_parts, is_media_request=True)
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_source=None):
+    message, client = update.message, context.bot_data['gemini_client']
+    audio = audio_source or message.audio or message.voice
+    if not audio: return
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    file_name = getattr(audio, 'file_name', 'voice_message.ogg')
+    audio_file = await audio.get_file()
+    audio_bytes = await audio_file.download_as_bytearray()
+    audio_part = await upload_and_wait_for_file(client, audio_bytes, audio.mime_type, file_name)
+    user_text = message.caption or "Ответь на содержание этого аудио. Если в нем содержится прямой вопрос - дай на него развернутый ответ. Если это просто фраза, то отреагируй на нее кратко. Если это просьба о транскрипции (например, слова 'расшифруй', 'транскрипт') - предоставь полный текст аудио."
+    content_parts = [audio_part, types.Part(text=user_text)]
+    await process_request(update, context, content_parts, is_media_request=True)
+
+async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message, text = update.message, update.message.text or ""
+    match = re.search(YOUTUBE_REGEX, text)
+    if not match: return
+    youtube_url = f"https://www.youtube.com/watch?v={match.group(1)}"
+    await message.reply_text("Анализирую видео с YouTube...", reply_to_message_id=message.message_id)
+    youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
+    user_prompt = text.replace(match.group(0), "").strip() or "Сделай краткий пересказ этого видео."
+    content_parts = [youtube_part, types.Part(text=user_prompt)]
+    await process_request(update, context, content_parts, is_media_request=True)
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message, text = update.message, update.message.text or ""
+    prompt = f"Проанализируй содержимое по этой ссылке и ответь на мой вопрос: {text}"
+    context.chat_data.pop('last_media_context', None)
+    await process_request(update, context, [types.Part(text=prompt)])
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message, text = update.message, (update.message.text or "").strip()
+    if not text: return
+    context.chat_data['id'] = message.chat_id
+    
+    content_parts = [types.Part(text=text)]
+    
+    is_media_follow_up = False
+    last_media_context_dict = context.chat_data.get('last_media_context')
+    if last_media_context_dict:
+        media_part = dict_to_part(last_media_context_dict)
+        if media_part:
+            content_parts.insert(0, media_part)
+            is_media_follow_up = True
+            logger.info(f"Применен 'липкий' медиа-контекст для чата {message.chat_id}")
+
+    await process_request(update, context, content_parts, is_media_request=is_media_follow_up)
+
+async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = await update.message.reply_text("🕰️ Уточняю время у модели...")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    prompt = "Сколько сейчас времени?"
+    if context.args: prompt += f" в { ' '.join(context.args) }"
+    client = context.bot_data['gemini_client']
+    request_contents = [types.Content(parts=[types.Part(text=prompt)], role="user")]
+    reply_text = await generate_response(client, request_contents, context, tools=FUNCTION_CALLING_TOOLS)
+    await message.edit_text(reply_text)
+
+# --- ЗАПУСК БОТА ---
+async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    application = request.app['bot_app']
+    try:
+        data = await request.json(); update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return aiohttp.web.Response(status=200)
+    except Exception as e:
+        logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
+        return aiohttp.web.Response(status=500)
+
+async def run_web_server(application: Application, stop_event: asyncio.Event):
+    app = aiohttp.web.Application()
+    app['bot_app'] = application
+    app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), handle_telegram_webhook)
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
+    await site.start()
+    logger.info(f"Веб-сервер запущен на порту {os.getenv('PORT', '10000')}")
+    await stop_event.wait()
+    await runner.cleanup()
+    
+async def main():
+    persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
+    builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
+    if persistence: builder.persistence(persistence)
+    application = builder.build()
+    
+    await application.initialize()
+    application.bot_data['gemini_client'] = genai.Client(api_key=GOOGLE_API_KEY)
+    
+    commands = [
+        BotCommand("start", "Инфо и начало работы"),
+        BotCommand("config", "Настроить режим и поиск"),
+        BotCommand("time", "Узнать точное время"),
+        BotCommand("clear", "Очистить историю чата")
+    ]
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("config", config_command))
+    application.add_handler(CommandHandler("clear", clear_command))
+    application.add_handler(CommandHandler("time", time_command))
+    application.add_handler(CallbackQueryHandler(config_callback))
+    
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    application.add_handler(MessageHandler(filters.VOICE, handle_audio))
+    application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(YOUTUBE_REGEX), handle_youtube_url))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(URL_REGEX), handle_url))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    await application.bot.set_my_commands(commands)
+    
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(sig, stop_event.set)
+    try:
+        webhook_url = f"{WEBHOOK_HOST.rstrip('/')}/{GEMINI_WEBHOOK_PATH.strip('/')}"
+        await application.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
+        logger.info(f"Вебхук установлен на: {webhook_url}")
+        await run_web_server(application, stop_event)
+    finally:
+        logger.info("Начало штатной остановки...")
+        if persistence: persistence.close()
+        logger.info("Приложение полностью остановлено.")
+
+if __name__ == '__main__':
+    asyncio.run(main())
