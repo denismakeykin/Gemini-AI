@@ -1,10 +1,8 @@
-# Версия 25.1 'The True Final Cut'
-# 1. КОД ПРЕДОСТАВЛЕН ПОЛНОСТЬЮ, без сокращений.
-# 2. Реализована архитектура 'Smart Context' (v24.0) с персонализацией и "заземлением".
-# 3. Реализована архитектура 'Sticky Context' (v23.0) с мультиконтекстными "карманами".
-# 4. Реализована защита от переполнения истории 'Amnesic History' (v22.0).
-# 5. Команда /time удалена, добавлена команда /transcript.
-# 6. Проактивный поиск включен по умолчанию.
+# Версия 25.2 'Launch Ready'
+# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Восстановлены случайно удаленные функции `handle_telegram_webhook` и `run_web_server`, что устраняет ошибку `NameError` при запуске.
+# 2. Реализована архитектура 'Smart Context' (v25.0) с персонализацией и "липким/явным" контекстом.
+# 3. Реализована защита от переполнения истории 'Amnesic History'.
+# 4. Команда /time удалена, добавлена команда /transcript. Проактивный поиск включен по умолчанию.
 
 import logging
 import os
@@ -345,7 +343,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
         date_prefix = f"(System Note: Today is {get_current_time_str()}. Verify facts using Google Search.)\n"
         request_specific_parts[text_part_index].text = f"{date_prefix}{search_context}{user_prefix}{original_text}"
-
+    
     request_contents = history + [types.Content(parts=request_specific_parts, role="user")]
 
     try:
@@ -368,7 +366,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             if 'last_media_context' in context.chat_data:
                 del context.chat_data['last_media_context']
                 logger.info(f"Очищен 'липкий' медиа-контекст для чата {message.chat_id}")
-
     except (IOError, asyncio.TimeoutError) as e:
         logger.error(f"Ошибка обработки файла: {e}", exc_info=False)
         await message.reply_text(f"❌ Ошибка обработки файла: {e}")
@@ -379,7 +376,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.setdefault('thinking_mode', 'auto')
-    context.chat_data.setdefault('proactive_search', True)
+    context.chat_data.setdefault('proactive_search', True) # Включен по умолчанию
     start_text = """Я - Женя, лучший ИИ-чат-бот на Google Gemini 2.5 Flash с авторскими настройками.
 
 🌐 Использую интеллектуальный поиск Google в интернете.
@@ -554,6 +551,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_request(update, context, content_parts, is_media_request=is_media_follow_up)
 
 # --- ЗАПУСК БОТА ---
+async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    application = request.app['bot_app']
+    try:
+        data = await request.json(); update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return aiohttp.web.Response(status=200)
+    except Exception as e:
+        logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
+        return aiohttp.web.Response(status=500)
+
+async def run_web_server(application: Application, stop_event: asyncio.Event):
+    app = aiohttp.web.Application()
+    app['bot_app'] = application
+    app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), handle_telegram_webhook)
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
+    await site.start()
+    logger.info(f"Веб-сервер запущен на порту {os.getenv('PORT', '10000')}")
+    await stop_event.wait()
+    await runner.cleanup()
+    
 async def main():
     persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
