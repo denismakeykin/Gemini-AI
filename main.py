@@ -1,8 +1,9 @@
-# Версия 24.3 'The Final Cut'
-# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (УТЕЧКА ПАМЯТИ): История теперь строго санируется. Длинные ответы модели обрезаются, а в историю от пользователя попадает только текст, без указателей на файлы. Это окончательно решает проблему превышения лимита токенов.
-# 2. УЛУЧШЕНО ("ЛИПКИЙ КОНТЕКСТ"): Механизм `last_media_context` сохранен. Он позволяет задавать уточняющие вопросы к последнему файлу. Отправка нового файла или обычный текстовый запрос на другую тему автоматически очищает этот контекст.
-# 3. УЛУЧШЕНО (ПРОМПТЫ): Промпт для аудио теперь настроен на предоставление транскрипции только по явной просьбе. Системный промпт будет лучше справляться с подавлением лишних приветствий.
-# 4. РЕАЛИЗОВАНО (ПЕРСОНАЛИЗАЦИЯ): Сохранен механизм передачи имени пользователя для персонализированных обращений.
+# Версия 25.0 'Multi-Context & Smart Replies'
+# 1. КРИТИЧЕСКОЕ АРХИТЕКТУРНОЕ ИЗМЕНЕНИЕ: Вместо одного "липкого" контекста внедрена система мультиконтекстных "карманов" (`media_contexts`).
+#    - Теперь контекст каждого медиафайла сохраняется с привязкой к его message_id.
+# 2. УЛУЧШЕНО (УМНЫЕ ОТВЕТЫ): `handle_message` теперь анализирует `reply_to_message`. Если пользователь отвечает на сообщение из ветки диалога о файле, бот автоматически находит и подтягивает нужный медиа-контекст из "кармана".
+# 3. ИСПОЛНЕНО: Это решает проблему перезаписи контекста и позволяет вести параллельные диалоги о разных файлах.
+# 4. Все остальные рабочие механики (персонализация, заземление, обработка файлов) сохранены и адаптированы под новую архитектуру.
 
 import logging
 import os
@@ -51,7 +52,8 @@ YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
 MAX_CONTEXT_CHARS = 120000 
 MAX_HISTORY_RESPONSE_LEN = 2000
-MAX_HISTORY_ITEMS = 40
+MAX_HISTORY_ITEMS = 50
+MAX_MEDIA_CONTEXTS = 10 # Сколько медиа-контекстов хранить в "картотеке"
 
 # --- ИНСТРУМЕНТЫ И ПРОМПТЫ ---
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
@@ -218,7 +220,7 @@ def dict_to_part(part_dict: dict) -> types.Part | None:
     if part_dict.get('type') == 'file': return types.Part(file_data=types.FileData(file_uri=part_dict['uri'], mime_type=part_dict['mime']))
     return None
 
-async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list[types.Part], **kwargs):
+async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list[types.Part], original_message_id: int, **kwargs):
     chat_history = context.chat_data.setdefault("history", [])
     
     processed_parts = []
@@ -226,25 +228,56 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
         text_part = next((p.text for p in parts if p.text), None)
         if text_part:
             text_to_save = (text_part[:MAX_HISTORY_RESPONSE_LEN] + "...") if len(text_part) > MAX_HISTORY_RESPONSE_LEN else text_part
-            # Заменяем длинный ответ короткой заглушкой для экономии токенов
-            if "Загружаю документ" in text_part or "Анализирую видео" in text_part or len(text_to_save) > 500:
-                 processed_parts.append(types.Part(text="[Был дан развернутый ответ на анализ файла]"))
+            if "Загружаю" in text_part or "Анализирую" in text_part or len(text_to_save) > 500:
+                # Связываем ответ с исходным сообщением пользователя
+                kwargs['user_message_id'] = original_message_id
+                processed_parts.append(types.Part(text="[Ответил на запрос о файле/ссылке]"))
             else:
-                 processed_parts.append(types.Part(text=text_to_save))
+                processed_parts.append(types.Part(text=text_to_save))
     elif role == 'user':
-        # От пользователя сохраняем только текст, медиа-контекст теперь "липкий"
         text_part = next((p.text for p in parts if p.text), None)
         if text_part:
             processed_parts.append(types.Part(text=text_part))
-
+            # Если это ответ, сохраняем ID сообщения, на которое ответили
+            if 'reply_to_message_id' in kwargs:
+                entry = {"role": role, "parts": [part_to_dict(p) for p in processed_parts], **kwargs}
+                chat_history.append(entry)
+                if len(chat_history) > MAX_HISTORY_ITEMS:
+                    context.chat_data["history"] = chat_history[-MAX_HISTORY_ITEMS:]
+                await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
+                return
+    
     serializable_parts = [part_to_dict(p) for p in processed_parts if p]
     if not serializable_parts: return
 
-    entry = {"role": role, "parts": serializable_parts, **kwargs}
+    entry = {"role": role, "parts": serializable_parts, "message_id": original_message_id, **kwargs}
     chat_history.append(entry)
     if len(chat_history) > MAX_HISTORY_ITEMS:
         context.chat_data["history"] = chat_history[-MAX_HISTORY_ITEMS:]
     await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
+
+def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_id: int) -> dict | None:
+    history = context.chat_data.get("history", [])
+    media_contexts = context.chat_data.get("media_contexts", {})
+    
+    # Рекурсивный поиск по цепочке ответов
+    for _ in range(len(history)): # Ограничиваем глубину поиска
+        found_user_msg = next((msg for msg in reversed(history) if msg.get("role") == "user" and msg.get("message_id") == reply_to_id), None)
+        if found_user_msg:
+            # Нашли сообщение пользователя, ищем связанный медиа-контекст
+            if reply_to_id in media_contexts:
+                return media_contexts[reply_to_id]
+
+        found_bot_msg = next((msg for msg in reversed(history) if msg.get("role") == "model" and msg.get("message_id") == reply_to_id), None)
+        if found_bot_msg and 'user_message_id' in found_bot_msg:
+            # Нашли ответ бота, ищем медиа-контекст по исходному сообщению пользователя
+            user_msg_id = found_bot_msg['user_message_id']
+            if user_msg_id in media_contexts:
+                return media_contexts[user_msg_id]
+            reply_to_id = user_msg_id # Продолжаем поиск вверх по цепочке
+        else:
+            break # Цепочка прервалась
+    return None
 
 def build_history_for_request(chat_history: list) -> list[types.Content]:
     valid_history, current_chars = [], 0
@@ -326,16 +359,16 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     
     history = build_history_for_request(context.chat_data.get("history", []))
     
+    request_specific_parts = list(content_parts)
     tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
     
-    request_specific_parts = list(content_parts)
     text_part_index = next((i for i, part in enumerate(request_specific_parts) if part.text), -1)
     if text_part_index != -1:
         original_text = request_specific_parts[text_part_index].text
         
         if get_user_setting(context, 'proactive_search', False) and not is_media_request:
             search_results = await perform_proactive_search(original_text)
-            search_context = f"\n\n--- Контекст из веба для справки ---\n{search_results}\n--------------------------\n" if search_results else ""
+            search_context = f"\n\n--- Контекст из веба ---\n{search_results}\n---\n" if search_results else ""
         else:
             search_context = ""
 
@@ -349,18 +382,24 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         reply_text = await generate_response(client, request_contents, context, tools)
         sent_message = await send_reply(message, reply_text)
         
-        await add_to_history(context, role="user", parts=content_parts, message_id=message.message_id)
-        if sent_message:
-            await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], bot_message_id=sent_message.message_id)
+        # Сохранение в историю и управление "липким" контекстом
+        if is_media_request:
+            media_part = next((p for p in content_parts if p.file_data), None)
+            if media_part:
+                media_contexts = context.chat_data.setdefault('media_contexts', {})
+                # Добавляем новый и удаляем старые, если их слишком много
+                media_contexts[message.message_id] = part_to_dict(media_part)
+                if len(media_contexts) > MAX_MEDIA_CONTEXTS:
+                    oldest_key = next(iter(media_contexts))
+                    del media_contexts[oldest_key]
+                logger.info(f"Сохранен медиа-контекст для msg_id {message.message_id}")
+            # Сохраняем в основную историю только текст
+            await add_to_history(context, role="user", parts=[p for p in content_parts if p.text], original_message_id=message.message_id)
+        else:
+            await add_to_history(context, role="user", parts=content_parts, original_message_id=message.message_id)
         
-        media_part = next((p for p in content_parts if p.file_data), None)
-        if media_part:
-            context.chat_data['last_media_context'] = part_to_dict(media_part)
-            logger.info(f"Сохранен 'липкий' медиа-контекст для чата {message.chat_id}")
-        elif not is_media_request:
-            if 'last_media_context' in context.chat_data:
-                del context.chat_data['last_media_context']
-                logger.info(f"Очищен 'липкий' медиа-контекст для чата {message.chat_id}")
+        if sent_message:
+            await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
 
     except (IOError, asyncio.TimeoutError) as e:
         logger.error(f"Ошибка обработки файла для ChatID {message.chat_id}: {e}")
@@ -494,7 +533,7 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, text = update.message, update.message.text or ""
     prompt = f"Проанализируй содержимое по этой ссылке и ответь на мой вопрос: {text}"
-    context.chat_data.pop('last_media_context', None)
+    context.chat_data.pop('media_contexts', None) # Ссылки не поддерживают "липкий" контекст
     await process_request(update, context, [types.Part(text=prompt)])
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -503,15 +542,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data['id'] = message.chat_id
     
     content_parts = [types.Part(text=text)]
-    
     is_media_follow_up = False
-    last_media_context_dict = context.chat_data.get('last_media_context')
-    if last_media_context_dict:
-        media_part = dict_to_part(last_media_context_dict)
-        if media_part:
-            content_parts.insert(0, media_part)
-            is_media_follow_up = True
-            logger.info(f"Применен 'липкий' медиа-контекст для чата {message.chat_id}")
+    
+    if message.reply_to_message:
+        media_context = find_media_context_in_history(context, message.reply_to_message.message_id)
+        if media_context:
+            media_part = dict_to_part(media_context)
+            if media_part:
+                content_parts.insert(0, media_part)
+                is_media_follow_up = True
+                logger.info(f"Применен 'липкий' медиа-контекст для чата {message.chat_id}")
 
     await process_request(update, context, content_parts, is_media_request=is_media_follow_up)
 
