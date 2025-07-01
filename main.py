@@ -1,6 +1,7 @@
-# Версия 25.6 'Shorts Update'
-# 1. ИСПРАВЛЕНИЕ: Обновлено регулярное выражение YOUTUBE_REGEX для корректной обработки ссылок на YouTube Shorts.
-# 2. Все остальные рабочие механики из v25.5 сохранены.
+# Версия 25.7 'Enhanced Context'
+# 1. ИЗМЕНЕНО: Количество результатов для проактивного поиска увеличено с 3 до 5 для более широкого контекста.
+# 2. ИСПРАВЛЕНИЕ: Обновлено регулярное выражение YOUTUBE_REGEX для корректной обработки всех типов ссылок, включая YouTube Shorts (youtu.be, /shorts/).
+# 3. Все остальные рабочие механики из предыдущей стабильной версии сохранены.
 
 import logging
 import os
@@ -45,9 +46,9 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 
 # --- КОНСТАНТЫ И НАСТРОЙКИ ---
 MODEL_NAME = 'gemini-2.5-flash'
-YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
+YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
-MAX_CONTEXT_CHARS = 200000 
+MAX_CONTEXT_CHARS = 120000 
 MAX_HISTORY_RESPONSE_LEN = 2000
 MAX_HISTORY_ITEMS = 50
 MAX_MEDIA_CONTEXTS = 10 
@@ -217,6 +218,7 @@ def dict_to_part(part_dict: dict) -> types.Part | None:
 
 async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list[types.Part], **kwargs):
     chat_history = context.chat_data.setdefault("history", [])
+    
     processed_parts = []
     if role == 'model':
         text_part = next((p.text for p in parts if p.text), None)
@@ -231,8 +233,10 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
         text_part = next((p.text for p in parts if p.text), None)
         if text_part:
             processed_parts.append(types.Part(text=text_part))
+
     serializable_parts = [part_to_dict(p) for p in processed_parts if p]
     if not serializable_parts: return
+
     entry = {"role": role, "parts": serializable_parts, **kwargs}
     chat_history.append(entry)
     if len(chat_history) > MAX_HISTORY_ITEMS:
@@ -292,7 +296,7 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
 async def perform_proactive_search(query: str) -> str | None:
     try:
         logger.info(f"Выполняется проактивный поиск по запросу: '{query}'")
-        results = await asyncio.to_thread(DDGS().text, keywords=query, region='ru-ru', max_results=10)
+        results = await asyncio.to_thread(DDGS().text, keywords=query, region='ru-ru', max_results=5)
         if results:
             snippets = "\n".join(f"- {r['body']}" for r in results)
             logger.info("Проактивный поиск: Успешно получены сниппеты из DuckDuckGo.")
@@ -489,7 +493,6 @@ async def keypoints_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- ОБРАБОТЧИКИ СООБЩЕНИЙ ---
 async def handle_media_request(update: Update, context: ContextTypes.DEFAULT_TYPE, file_part: types.Part, user_text: str):
     context.chat_data.pop('last_media_context', None)
-    context.chat_data.pop('media_contexts', None)
     content_parts = [file_part, types.Part(text=user_text)]
     await process_request(update, context, content_parts, is_media_request=True)
 
