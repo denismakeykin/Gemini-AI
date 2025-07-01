@@ -1,6 +1,6 @@
-# Версия 25.5 'Final Integrity'
-# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Восстановлены функции run_web_server и handle_telegram_webhook, удаленные по ошибке в предыдущей версии. Это решает ошибку `NameError` при запуске.
-# 2. Все остальные рабочие механики (Мультиконтекст, Амнезия истории, Персонализация, новые команды) из предыдущих версий сохранены.
+# Версия 25.6 'Shorts Update'
+# 1. ИСПРАВЛЕНИЕ: Обновлено регулярное выражение YOUTUBE_REGEX для корректной обработки ссылок на YouTube Shorts.
+# 2. Все остальные рабочие механики из v25.5 сохранены.
 
 import logging
 import os
@@ -45,9 +45,9 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 
 # --- КОНСТАНТЫ И НАСТРОЙКИ ---
 MODEL_NAME = 'gemini-2.5-flash'
-YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
+YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
-MAX_CONTEXT_CHARS = 120000 
+MAX_CONTEXT_CHARS = 200000 
 MAX_HISTORY_RESPONSE_LEN = 2000
 MAX_HISTORY_ITEMS = 50
 MAX_MEDIA_CONTEXTS = 10 
@@ -217,7 +217,6 @@ def dict_to_part(part_dict: dict) -> types.Part | None:
 
 async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list[types.Part], **kwargs):
     chat_history = context.chat_data.setdefault("history", [])
-    
     processed_parts = []
     if role == 'model':
         text_part = next((p.text for p in parts if p.text), None)
@@ -232,10 +231,8 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
         text_part = next((p.text for p in parts if p.text), None)
         if text_part:
             processed_parts.append(types.Part(text=text_part))
-
     serializable_parts = [part_to_dict(p) for p in processed_parts if p]
     if not serializable_parts: return
-
     entry = {"role": role, "parts": serializable_parts, **kwargs}
     chat_history.append(entry)
     if len(chat_history) > MAX_HISTORY_ITEMS:
@@ -261,7 +258,6 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
 def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_id: int) -> dict | None:
     history = context.chat_data.get("history", [])
     media_contexts = context.chat_data.get("media_contexts", {})
-    
     current_reply_id = reply_to_id
     for _ in range(len(history)): 
         bot_message = next((msg for msg in reversed(history) if msg.get("role") == "model" and msg.get("bot_message_id") == current_reply_id), None)
@@ -296,7 +292,7 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
 async def perform_proactive_search(query: str) -> str | None:
     try:
         logger.info(f"Выполняется проактивный поиск по запросу: '{query}'")
-        results = await asyncio.to_thread(DDGS().text, keywords=query, region='ru-ru', max_results=3)
+        results = await asyncio.to_thread(DDGS().text, keywords=query, region='ru-ru', max_results=10)
         if results:
             snippets = "\n".join(f"- {r['body']}" for r in results)
             logger.info("Проактивный поиск: Успешно получены сниппеты из DuckDuckGo.")
@@ -328,20 +324,17 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
     history = build_history_for_request(context.chat_data.get("history", []))
-    
     tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
     
     request_specific_parts = list(content_parts)
     text_part_index = next((i for i, part in enumerate(request_specific_parts) if part.text), -1)
     if text_part_index != -1:
         original_text = request_specific_parts[text_part_index].text
-        
         if get_user_setting(context, 'proactive_search', True) and not is_media_request:
             search_results = await perform_proactive_search(original_text)
             search_context = f"\n\n--- Контекст из веба для справки ---\n{search_results}\n--------------------------\n" if search_results else ""
         else:
             search_context = ""
-
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
         date_prefix = f"(System Note: Today is {get_current_time_str()}. Verify facts using Google Search.)\n"
         request_specific_parts[text_part_index].text = f"{date_prefix}{search_context}{user_prefix}{original_text}"
