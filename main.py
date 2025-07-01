@@ -1,7 +1,7 @@
-# Версия 25.8 'Prompt Engineering'
-# 1. ИСПРАВЛЕНИЕ (YouTube): Обновлено регулярное выражение YOUTUBE_REGEX для корректной обработки всех форматов ссылок, включая /shorts/ и youtu.be.
-# 2. УЛУЧШЕНО (Аудио): Переписан промпт в `handle_audio` для приоритезации содержательного ответа вместо транскрипции по умолчанию.
-# 3. Все остальные рабочие механики из v25.5 (включая "умный" контекст и санацию истории) сохранены.
+# Версия 25.9 'Pure Context'
+# 1. КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: Из всех медиа-обработчиков удалены жестко заданные "промпты-надсмотрщики". Теперь модель получает либо текст пользователя (caption), либо минимальный нейтральный промпт.
+# 2. РЕЗУЛЬТАТ: Поведение бота теперь полностью определяется правилами из `system_prompt.md`, а не "костылями" в коде. Это обеспечивает предсказуемость и гибкость.
+# 3. УЛУЧШЕНО: Механизм "липкого контекста" и все остальные рабочие функции адаптированы под новую архитектуру.
 
 import logging
 import os
@@ -223,7 +223,7 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     if role == 'model':
         text_part = next((p.text for p in parts if p.text), None)
         if text_part:
-            if 'original_message_id' in kwargs and kwargs.get('is_media_response'):
+            if kwargs.get('is_media_response'):
                 processed_parts.append(types.Part(text="[Был дан ответ на медиа-запрос]"))
             elif len(text_part) > MAX_HISTORY_RESPONSE_LEN:
                 text_to_save = (text_part[:MAX_HISTORY_RESPONSE_LEN] + "...")
@@ -378,7 +378,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         logger.error(f"Непредвиденная ошибка в process_request: {e}", exc_info=True)
         await message.reply_text("❌ Произошла внутренняя ошибка. Попробуйте еще раз.")
 
-
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.setdefault('thinking_mode', 'auto')
@@ -506,7 +505,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_file = await message.photo[-1].get_file()
     photo_bytes = await photo_file.download_as_bytearray()
     file_part = await upload_and_wait_for_file(client, photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
-    await handle_media_request(update, context, file_part, message.caption or "Опиши это изображение.")
+    await handle_media_request(update, context, file_part, message.caption or "Проанализируй этот файл.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, doc, client = update.message, update.message.document, context.bot_data['gemini_client']
@@ -516,7 +515,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc_file = await doc.get_file()
     doc_bytes = await doc_file.download_as_bytearray()
     file_part = await upload_and_wait_for_file(client, doc_bytes, doc.mime_type, doc.file_name or "document")
-    await handle_media_request(update, context, file_part, message.caption or "Проанализируй содержимое этого документа.")
+    await handle_media_request(update, context, file_part, message.caption or "Проанализируй этот файл.")
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, video, client = update.message, update.message.video, context.bot_data['gemini_client']
@@ -525,7 +524,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_file = await video.get_file()
     video_bytes = await video_file.download_as_bytearray()
     video_part = await upload_and_wait_for_file(client, video_bytes, video.mime_type, video.file_name or "video.mp4")
-    await handle_media_request(update, context, video_part, message.caption or "Опиши это видео и сделай краткий пересказ.")
+    await handle_media_request(update, context, video_part, message.caption or "Проанализируй этот файл.")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_source=None):
     message, client = update.message, context.bot_data['gemini_client']
@@ -545,7 +544,7 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     youtube_url = f"https://www.youtube.com/watch?v={match.group(1)}"
     await message.reply_text("Анализирую видео с YouTube...", reply_to_message_id=message.message_id)
     youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
-    user_prompt = text.replace(match.group(0), "").strip() or "Сделай краткий пересказ этого видео."
+    user_prompt = text.replace(match.group(0), "").strip() or "Проанализируй это видео."
     await handle_media_request(update, context, youtube_part, user_prompt)
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -582,6 +581,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_request(update, context, content_parts, is_media_request=is_media_follow_up)
 
 # --- ЗАПУСК БОТА ---
+async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    application = request.app['bot_app']
+    try:
+        data = await request.json(); update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return aiohttp.web.Response(status=200)
+    except Exception as e:
+        logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
+        return aiohttp.web.Response(status=500)
+
+async def run_web_server(application: Application, stop_event: asyncio.Event):
+    app = aiohttp.web.Application()
+    app['bot_app'] = application
+    app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), handle_telegram_webhook)
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
+    await site.start()
+    logger.info(f"Веб-сервер запущен на порту {os.getenv('PORT', '10000')}")
+    await stop_event.wait()
+    await runner.cleanup()
+    
 async def main():
     persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
