@@ -1,7 +1,8 @@
-# Версия 25.7 'Enhanced Context'
-# 1. ИЗМЕНЕНО: Количество результатов для проактивного поиска увеличено с 3 до 5 для более широкого контекста.
-# 2. ИСПРАВЛЕНИЕ: Обновлено регулярное выражение YOUTUBE_REGEX для корректной обработки всех типов ссылок, включая YouTube Shorts (youtu.be, /shorts/).
-# 3. Все остальные рабочие механики из предыдущей стабильной версии сохранены.
+# Версия 24.4 'Context Lifecycle'
+# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (СЛОЖЕНИЕ КОНТЕКСТОВ): Все медиа-обработчики теперь принудительно очищают "липкий" контекст перед обработкой нового файла. Это решает проблему `RESOURCE_EXHAUSTED` и `INVALID_ARGUMENT` при отправке нескольких файлов подряд.
+# 2. УЛУЧШЕНО ("ЛИПКИЙ КОНТЕКСТ"): Теперь "липкий" контекст сохраняется только для прямых ответов (reply). Обычное текстовое сообщение на новую тему очищает контекст.
+# 3. УЛУЧШЕНО (ПРОМПТЫ): Доработан промпт для аудио для более точного управления транскрипцией и системный промпт для подавления лишних приветствий.
+# 4. Все остальные рабочие механики (персонализация, история, утилиты) сохранены.
 
 import logging
 import os
@@ -223,12 +224,15 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     if role == 'model':
         text_part = next((p.text for p in parts if p.text), None)
         if text_part:
-            if len(text_part) > MAX_HISTORY_RESPONSE_LEN:
+            if 'original_message_id' in kwargs: # Это ответ на медиа
+                processed_parts.append(types.Part(text="[Был дан ответ на медиа-запрос]"))
+            elif len(text_part) > MAX_HISTORY_RESPONSE_LEN:
                 text_to_save = (text_part[:MAX_HISTORY_RESPONSE_LEN] + "...")
                 logger.info(f"Ответ модели для чата {context.chat_data.get('id')} был обрезан для сохранения в историю.")
+                processed_parts.append(types.Part(text=text_to_save))
             else:
-                text_to_save = text_part
-            processed_parts.append(types.Part(text=text_to_save))
+                processed_parts.append(types.Part(text=text_part))
+
     elif role == 'user':
         text_part = next((p.text for p in parts if p.text), None)
         if text_part:
@@ -334,11 +338,13 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     text_part_index = next((i for i, part in enumerate(request_specific_parts) if part.text), -1)
     if text_part_index != -1:
         original_text = request_specific_parts[text_part_index].text
+        
         if get_user_setting(context, 'proactive_search', True) and not is_media_request:
             search_results = await perform_proactive_search(original_text)
             search_context = f"\n\n--- Контекст из веба для справки ---\n{search_results}\n--------------------------\n" if search_results else ""
         else:
             search_context = ""
+
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
         date_prefix = f"(System Note: Today is {get_current_time_str()}. Verify facts using Google Search.)\n"
         request_specific_parts[text_part_index].text = f"{date_prefix}{search_context}{user_prefix}{original_text}"
@@ -353,18 +359,19 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         if sent_message:
             await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
         
-        media_part = next((p for p in content_parts if p.file_data), None)
-        if media_part:
-            media_contexts = context.chat_data.setdefault('media_contexts', OrderedDict())
-            media_contexts[message.message_id] = part_to_dict(media_part)
-            if len(media_contexts) > MAX_MEDIA_CONTEXTS:
-                media_contexts.popitem(last=False)
-            context.chat_data['last_media_context'] = media_contexts[message.message_id]
-            logger.info(f"Сохранен/обновлен медиа-контекст для msg_id {message.message_id}")
-        elif not is_media_request and not message.reply_to_message:
-            if 'last_media_context' in context.chat_data:
+        if is_media_request:
+            media_part = next((p for p in content_parts if p.file_data), None)
+            if media_part:
+                media_contexts = context.chat_data.setdefault('media_contexts', OrderedDict())
+                media_contexts[message.message_id] = part_to_dict(media_part)
+                if len(media_contexts) > MAX_MEDIA_CONTEXTS:
+                    media_contexts.popitem(last=False)
+                context.chat_data['last_media_context'] = media_contexts[message.message_id]
+                logger.info(f"Сохранен/обновлен медиа-контекст для msg_id {message.message_id}")
+        elif not message.reply_to_message:
+             if 'last_media_context' in context.chat_data:
                 del context.chat_data['last_media_context']
-                logger.info(f"Очищен 'липкий' медиа-контекст для чата {message.chat_id}")
+                logger.info(f"Очищен 'липкий' медиа-контекст для чата {message.chat_id} (новая тема).")
 
     except (IOError, asyncio.TimeoutError) as e:
         logger.error(f"Ошибка обработки файла: {e}", exc_info=False)
@@ -372,7 +379,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     except Exception as e:
         logger.error(f"Непредвиденная ошибка в process_request: {e}", exc_info=True)
         await message.reply_text("❌ Произошла внутренняя ошибка. Попробуйте еще раз.")
-
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
