@@ -1,8 +1,6 @@
-# Версия 25.4 'Stability & Integrity'
-# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (NameError): Восстановлена удаленная функция `get_current_time_str` и ее импорты, что устраняет ошибку `NameError`.
-# 2. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (PoolError): Функция `_execute` в PostgresPersistence переписана с использованием `try...finally` для гарантированного возврата соединений в пул, что решает проблему `connection pool exhausted`.
-# 3. ИСПРАВЛЕНИЕ: Восстановлены тела всех функций-обработчиков и утилитарных команд.
-# 4. Все архитектурные решения (Мультиконтекст, Амнезия истории, Персонализация) сохранены.
+# Версия 25.5 'Final Integrity'
+# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Восстановлены функции run_web_server и handle_telegram_webhook, удаленные по ошибке в предыдущей версии. Это решает ошибку `NameError` при запуске.
+# 2. Все остальные рабочие механики (Мультиконтекст, Амнезия истории, Персонализация, новые команды) из предыдущих версий сохранены.
 
 import logging
 import os
@@ -330,6 +328,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
     history = build_history_for_request(context.chat_data.get("history", []))
+    
     tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
     
     request_specific_parts = list(content_parts)
@@ -582,6 +581,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_request(update, context, content_parts, is_media_request=is_media_follow_up)
 
 # --- ЗАПУСК БОТА ---
+async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    application = request.app['bot_app']
+    try:
+        data = await request.json(); update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return aiohttp.web.Response(status=200)
+    except Exception as e:
+        logger.error(f"Ошибка обработки вебхука: {e}", exc_info=True)
+        return aiohttp.web.Response(status=500)
+
+async def run_web_server(application: Application, stop_event: asyncio.Event):
+    app = aiohttp.web.Application()
+    app['bot_app'] = application
+    app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), handle_telegram_webhook)
+    runner = aiohttp.web.AppRunner(app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
+    await site.start()
+    logger.info(f"Веб-сервер запущен на порту {os.getenv('PORT', '10000')}")
+    await stop_event.wait()
+    await runner.cleanup()
+    
 async def main():
     persistence = PostgresPersistence(DATABASE_URL) if DATABASE_URL else None
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN)
