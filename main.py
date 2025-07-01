@@ -48,8 +48,8 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 MODEL_NAME = 'gemini-2.5-flash'
 YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
-MAX_CONTEXT_CHARS = 1000000 
-MAX_HISTORY_RESPONSE_LEN = 10000
+MAX_CONTEXT_CHARS = 200000 
+MAX_HISTORY_RESPONSE_LEN = 2000
 MAX_HISTORY_ITEMS = 50
 MAX_MEDIA_CONTEXTS = 10 
 MEDIA_CONTEXT_TTL_SECONDS = 47 * 3600 # 47 часов
