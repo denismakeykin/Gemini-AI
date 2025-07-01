@@ -1,10 +1,10 @@
-# Версия 25.1 'Smart Context'
-# 1. КРИТИЧЕСКОЕ АРХИТЕКТУРНОЕ ИЗМЕНЕНИЕ: Реализован двухуровневый "умный" контекст.
-#    - Явный контекст: Ответ на сообщение в ветке диалога заставляет бота найти и применить исходный медиафайл этой ветки.
-#    - Неявный контекст: Сообщение без ответа использует "липкий" контекст последнего проанализированного файла.
-# 2. НОВАЯ ФУНКЦИЯ: Добавлена `find_media_context_in_history` для рекурсивного поиска контекста по цепочке ответов.
-# 3. УЛУЧШЕНО: `handle_message` полностью переработан для поддержки новой логики.
-# 4. СОХРАНЕНО: Все работающие механики (персонализация, "заземление", обработка файлов, легковесная история) сохранены и улучшены.
+# Версия 25.1 'The True Final Cut'
+# 1. КОД ПРЕДОСТАВЛЕН ПОЛНОСТЬЮ, без сокращений.
+# 2. Реализована архитектура 'Smart Context' (v24.0) с персонализацией и "заземлением".
+# 3. Реализована архитектура 'Sticky Context' (v23.0) с мультиконтекстными "карманами".
+# 4. Реализована защита от переполнения истории 'Amnesic History' (v22.0).
+# 5. Команда /time удалена, добавлена команда /transcript.
+# 6. Проактивный поиск включен по умолчанию.
 
 import logging
 import os
@@ -62,10 +62,6 @@ def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
 
 TEXT_TOOLS = [types.Tool(google_search=types.GoogleSearch()), types.Tool(code_execution=types.ToolCodeExecution())]
 MEDIA_TOOLS = [types.Tool(google_search=types.GoogleSearch())]
-FUNCTION_CALLING_TOOLS = [types.Tool(function_declarations=[types.FunctionDeclaration(
-    name='get_current_time_str', description="Gets the current date and time.",
-    parameters=types.Schema(type=types.Type.OBJECT, properties={'timezone': types.Schema(type=types.Type.STRING)})
-)])]
 SAFETY_SETTINGS = [
     types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
     for c in (types.HarmCategory.HARM_CATEGORY_HARASSMENT, types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -227,11 +223,12 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     if role == 'model':
         text_part = next((p.text for p in parts if p.text), None)
         if text_part:
-            text_to_save = (text_part[:MAX_HISTORY_RESPONSE_LEN] + "...") if len(text_part) > MAX_HISTORY_RESPONSE_LEN else text_part
-            if "Загружаю" in text_part or "Анализирую" in text_part or len(text_to_save) > 500:
-                 processed_parts.append(types.Part(text="[Был дан развернутый ответ на анализ файла]"))
+            if len(text_part) > MAX_HISTORY_RESPONSE_LEN:
+                text_to_save = (text_part[:MAX_HISTORY_RESPONSE_LEN] + "...")
+                logger.info(f"Ответ модели для чата {context.chat_data.get('id')} был обрезан для сохранения в историю.")
             else:
-                 processed_parts.append(types.Part(text=text_to_save))
+                text_to_save = text_part
+            processed_parts.append(types.Part(text=text_to_save))
     elif role == 'user':
         text_part = next((p.text for p in parts if p.text), None)
         if text_part:
@@ -267,16 +264,14 @@ def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_i
     media_contexts = context.chat_data.get("media_contexts", {})
     
     current_reply_id = reply_to_id
-    for _ in range(len(history)): # Ограничиваем глубину поиска
-        # Сначала ищем ответ бота, на который ответили
+    for _ in range(len(history)):
         bot_message = next((msg for msg in reversed(history) if msg.get("role") == "model" and msg.get("bot_message_id") == current_reply_id), None)
         if bot_message and 'original_user_message_id' in bot_message:
             user_msg_id = bot_message['original_user_message_id']
             if user_msg_id in media_contexts:
                 return media_contexts[user_msg_id]
-            current_reply_id = user_msg_id # Продолжаем поиск вверх по цепочке
+            current_reply_id = user_msg_id
         else:
-            # Если это ответ на сообщение пользователя напрямую
             if current_reply_id in media_contexts:
                 return media_contexts[current_reply_id]
             break
@@ -312,7 +307,21 @@ async def perform_proactive_search(query: str) -> str | None:
     return None
 
 async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> str:
-    # ... (код без изменений) ...
+    chat_id = context.chat_data.get('id', 'Unknown')
+    thinking_mode = get_user_setting(context, 'thinking_mode', 'auto')
+    config = types.GenerateContentConfig(
+        safety_settings=SAFETY_SETTINGS, 
+        tools=tools,
+        thinking_config=types.ThinkingConfig(thinking_budget=-1 if thinking_mode == 'auto' else 24576),
+        system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
+    )
+    try:
+        response = await client.aio.models.generate_content(model=MODEL_NAME, contents=request_contents, config=config)
+        logger.info(f"ChatID: {chat_id} | Ответ получен.")
+        return response.text
+    except Exception as e:
+        logger.error(f"ChatID: {chat_id} | Ошибка: {e}", exc_info=True)
+        return f"❌ Ошибка модели: {str(e)[:250]}"
 
 async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, is_media_request: bool = False):
     message, client = update.message, context.bot_data['gemini_client']
@@ -336,14 +345,13 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
         date_prefix = f"(System Note: Today is {get_current_time_str()}. Verify facts using Google Search.)\n"
         request_specific_parts[text_part_index].text = f"{date_prefix}{search_context}{user_prefix}{original_text}"
-    
+
     request_contents = history + [types.Content(parts=request_specific_parts, role="user")]
 
     try:
         reply_text = await generate_response(client, request_contents, context, tools)
         sent_message = await send_reply(message, reply_text)
         
-        # Сохранение в историю и управление "липким" контекстом
         await add_to_history(context, role="user", parts=content_parts, original_message_id=message.message_id, reply_to_message_id=message.reply_to_message.message_id if message.reply_to_message else None)
         if sent_message:
             await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
@@ -353,7 +361,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             media_contexts = context.chat_data.setdefault('media_contexts', OrderedDict())
             media_contexts[message.message_id] = part_to_dict(media_part)
             if len(media_contexts) > MAX_MEDIA_CONTEXTS:
-                media_contexts.popitem(last=False) # Удаляем самый старый
+                media_contexts.popitem(last=False)
             context.chat_data['last_media_context'] = media_contexts[message.message_id]
             logger.info(f"Сохранен медиа-контекст для msg_id {message.message_id}")
         elif not is_media_request and not message.reply_to_message:
@@ -368,16 +376,64 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         logger.error(f"Непредвиденная ошибка в process_request: {e}", exc_info=True)
         await message.reply_text("❌ Произошла внутренняя ошибка. Попробуйте еще раз.")
 
-
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений) ...
+    context.chat_data.setdefault('thinking_mode', 'auto')
+    context.chat_data.setdefault('proactive_search', True)
+    start_text = """Я - Женя, лучший ИИ-чат-бот на Google Gemini 2.5 Flash с авторскими настройками.
+
+🌐 Использую интеллектуальный поиск Google в интернете.
+🧠 Обладаю всевозможными знаниями в любых сферах.
+💬 Проанализировав данные и ваш контекст, отвечу точно, но в позитивном стиле с юмором.
+
+Анализ, описание, расшифровка в текст, пересказ, ответы и поиск по содержимому:
+🎤 Голосовых сообщений и аудиофайлов;
+📸🖼 Изображений, YouTube-видео и видеофайлов (до 50 мб);
+🔗 Веб-страниц и файлов PDF, TXT, JSON.
+
+Пользуйтесь тут и добавляйте в свои группы!
+
+(!) Используя бот, Вы автоматически соглашаетесь на передачу сообщений и файлов для получения ответов через Google Gemini API."""
+    await update.message.reply_html(start_text)
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений) ...
+    mode = get_user_setting(context, 'thinking_mode', 'auto')
+    search = get_user_setting(context, 'proactive_search', True)
+    keyboard = [
+        [InlineKeyboardButton(f"Мышление: {'✅ ' if mode == 'auto' else ''}Авто", callback_data="set_thinking_auto"),
+         InlineKeyboardButton(f"Мышление: {'✅ ' if mode == 'max' else ''}Максимум", callback_data="set_thinking_max")],
+        [InlineKeyboardButton(f"Проактивный поиск: {'✅ Вкл' if search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
+    ]
+    await update.message.reply_text("⚙️ Настройки:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений) ...
+    query, data = update.callback_query, update.callback_query.data
+    await query.answer()
+    
+    current_mode = get_user_setting(context, 'thinking_mode', 'auto')
+    current_search = get_user_setting(context, 'proactive_search', True)
+
+    if data.startswith("set_thinking_"):
+        set_user_setting(context, 'thinking_mode', data.replace("set_thinking_", ""))
+    elif data == "toggle_proactive_search":
+        set_user_setting(context, 'proactive_search', not get_user_setting(context, 'proactive_search', True))
+        
+    new_mode = get_user_setting(context, 'thinking_mode', 'auto')
+    new_search = get_user_setting(context, 'proactive_search', True)
+
+    if current_mode == new_mode and current_search == new_search: return
+
+    keyboard = [
+        [InlineKeyboardButton(f"Мышление: {'✅ ' if new_mode == 'auto' else ''}Авто", callback_data="set_thinking_auto"),
+         InlineKeyboardButton(f"Мышление: {'✅ ' if new_mode == 'max' else ''}Максимум", callback_data="set_thinking_max")],
+        [InlineKeyboardButton(f"Проактивный поиск: {'✅ Вкл' if new_search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
+    ]
+    try:
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            logger.info("Сообщение с настройками не изменилось, пропуск редактирования.")
+        else: raise e
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.clear()
@@ -418,23 +474,55 @@ async def handle_media_request(update: Update, context: ContextTypes.DEFAULT_TYP
     await process_request(update, context, content_parts, is_media_request=True)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений) ...
+    message, client = update.message, context.bot_data['gemini_client']
+    photo_file = await message.photo[-1].get_file()
+    photo_bytes = await photo_file.download_as_bytearray()
+    file_part = await upload_and_wait_for_file(client, photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
+    await handle_media_request(update, context, file_part, message.caption or "Опиши это изображение.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений) ...
+    message, doc, client = update.message, update.message.document, context.bot_data['gemini_client']
+    if doc.file_size > 50 * 1024 * 1024: return await message.reply_text("❌ Файл слишком большой (> 50 MB).")
+    if doc.mime_type and doc.mime_type.startswith("audio/"): return await handle_audio(update, context, doc)
+    await message.reply_text(f"Загружаю документ '{doc.file_name}'...", reply_to_message_id=message.message_id)
+    doc_file = await doc.get_file()
+    doc_bytes = await doc_file.download_as_bytearray()
+    file_part = await upload_and_wait_for_file(client, doc_bytes, doc.mime_type, doc.file_name or "document")
+    await handle_media_request(update, context, file_part, message.caption or "Проанализируй содержимое этого документа.")
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений) ...
+    message, video, client = update.message, update.message.video, context.bot_data['gemini_client']
+    if video.file_size > 50 * 1024 * 1024: return await message.reply_text("❌ Видеофайл слишком большой (> 50 MB).")
+    await message.reply_text("Загружаю видео...", reply_to_message_id=message.message_id)
+    video_file = await video.get_file()
+    video_bytes = await video_file.download_as_bytearray()
+    video_part = await upload_and_wait_for_file(client, video_bytes, video.mime_type, video.file_name or "video.mp4")
+    await handle_media_request(update, context, video_part, message.caption or "Опиши это видео и сделай краткий пересказ.")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_source=None):
-    # ... (код без изменений) ...
+    message, client = update.message, context.bot_data['gemini_client']
+    audio = audio_source or message.audio or message.voice
+    if not audio: return
+    file_name = getattr(audio, 'file_name', 'voice_message.ogg')
+    user_text = message.caption or "Ответь на содержание этого аудио. Если в нем содержится прямой вопрос - дай на него развернутый ответ. Если это просьба о транскрипции (например, слова 'расшифруй', 'транскрипт') - предоставь полный текст аудио."
+    audio_file = await audio.get_file()
+    audio_bytes = await audio_file.download_as_bytearray()
+    audio_part = await upload_and_wait_for_file(client, audio_bytes, audio.mime_type, file_name)
+    await handle_media_request(update, context, audio_part, user_text)
 
 async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ... (код без изменений) ...
+    message, text = update.message, update.message.text or ""
+    match = re.search(YOUTUBE_REGEX, text)
+    if not match: return
+    youtube_url = f"https://www.youtube.com/watch?v={match.group(1)}"
+    await message.reply_text("Анализирую видео с YouTube...", reply_to_message_id=message.message_id)
+    youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
+    user_prompt = text.replace(match.group(0), "").strip() or "Сделай краткий пересказ этого видео."
+    await handle_media_request(update, context, youtube_part, user_prompt)
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data.pop('media_contexts', None)
     context.chat_data.pop('last_media_context', None)
+    context.chat_data.pop('media_contexts', None)
     await process_request(update, context, [types.Part(text=update.message.text)])
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
