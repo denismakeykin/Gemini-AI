@@ -232,6 +232,7 @@ def dict_to_part(part_dict: dict) -> types.Part | None:
     return None
 
 async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list[types.Part], **kwargs):
+    chat_id = context.chat_data.get('id', 'Unknown')
     chat_history = context.chat_data.setdefault("history", [])
     
     processed_parts = []
@@ -242,7 +243,7 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
                 processed_parts.append(types.Part(text="[Был дан ответ на медиа-запрос]"))
             elif len(text_part) > MAX_HISTORY_RESPONSE_LEN:
                 text_to_save = (text_part[:MAX_HISTORY_RESPONSE_LEN] + "...")
-                logger.info(f"Ответ модели для чата {context.chat_data.get('id')} был обрезан для сохранения в историю.")
+                logger.info(f"Ответ модели для чата {chat_id} был обрезан для сохранения в историю.")
                 processed_parts.append(types.Part(text=text_to_save))
             else:
                 processed_parts.append(types.Part(text=text_part))
@@ -258,7 +259,7 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     chat_history.append(entry)
     if len(chat_history) > MAX_HISTORY_ITEMS:
         context.chat_data["history"] = chat_history[-MAX_HISTORY_ITEMS:]
-    await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
+    await context.application.persistence.update_chat_data(chat_id, context.chat_data)
 
 def build_history_for_request(chat_history: list) -> list[types.Content]:
     valid_history, current_chars = [], 0
@@ -401,7 +402,7 @@ def format_gemini_response(response: types.GenerateContentResponse) -> str:
     if not response or not response.candidates:
         return "Ответа не последовало."
     
-    if response.prompt_feedback.block_reason.name != 'BLOCK_REASON_UNSPECIFIED':
+    if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason.name != 'BLOCK_REASON_UNSPECIFIED':
         return f"🤖 Запрос был заблокирован по причине: <b>{response.prompt_feedback.block_reason.name}</b>"
 
     result_parts = []
@@ -438,7 +439,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
                 search_nudge = (
                     f"\n\n<b>Справочная информация из веба (для проверки):</b>\n"
                     f"<pre>{html.escape(search_results)}</pre>\n"
-                    f"<i>Используй эту информацию как сигнал, что твои знания могут быть неактуальны, и проведи собственную проверку с помощью своих инструментов.</i>"
                 )
 
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
