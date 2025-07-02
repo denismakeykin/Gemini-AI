@@ -1,7 +1,8 @@
-# Версия 26.6 'SDK Hotfix & Unification'
-# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Устранена ошибка AttributeError: module 'google.genai' has no attribute 'FileClient'.
-# 2. РЕФАКТОРИНГ: Логика работы с Google API унифицирована. Теперь используется один экземпляр genai.Client для всех операций (генерация контента, работа с файлами), что соответствует официальному SDK.
-# 3. Все предыдущие улучшения (автолечение контекста, резервный поиск, логика промптов) сохранены и адаптированы под унифицированный клиент.
+# Версия 26.7 'Hotfix & Async Correction'
+# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Устранены все AttributeError, связанные с неправильными вызовами асинхронных методов и импортами ошибок google-genai SDK.
+# 2. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Исправлена ошибка TypeError в функции поиска DDG путем использования корректного асинхронного класса AsyncDDGS.
+# 3. РЕФАКТОРИНГ: Все асинхронные вызовы к Google API (генерация, работа с файлами) теперь используют правильный синтаксис `client.aio.*`.
+# 4. Все предыдущие улучшения (автолечение, резервный поиск, логика промптов) сохранены.
 
 import logging
 import os
@@ -27,8 +28,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from telegram.error import BadRequest
 
 from google import genai
-from google.genai import types
-from duckduckgo_search import DDGS
+from google.generativeai import types
+from google.generativeai import errors as google_errors
+from duckduckgo_search import AsyncDDGS
 
 # --- КОНФИГУРАЦИЯ ---
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -315,12 +317,12 @@ def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_i
 async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime_type: str, file_name: str) -> types.Part:
     logger.info(f"Загрузка файла '{file_name}' ({len(file_bytes) / 1024:.2f} KB) через File API...")
     try:
-        uploaded_file_response = await client.files.upload_async(
+        uploaded_file_response = await client.aio.files.upload(
             file=io.BytesIO(file_bytes), mime_type=mime_type, display_name=file_name
         )
         logger.info(f"Файл '{file_name}' загружен. URI: {uploaded_file_response.uri}. Ожидание статуса ACTIVE...")
         
-        file_state_response = await client.files.get_async(name=uploaded_file_response.name)
+        file_state_response = await client.aio.files.get(name=uploaded_file_response.name)
         if file_state_response.state.name == 'ACTIVE':
             logger.info(f"Файл '{file_name}' активен.")
             return types.Part(file_data=types.FileData(file_uri=uploaded_file_response.uri, mime_type=mime_type))
@@ -363,12 +365,14 @@ async def perform_google_custom_search(query: str) -> str | None:
 async def get_proactive_web_context(query: str) -> str | None:
     try:
         logger.info(f"Выполняется проактивный DDG поиск по запросу: '{query}'")
-        async with DDGS() as ddgs:
-            results = [r async for r in ddgs.text(keywords=query, region='ru-ru', max_results=3)]
-        if results:
-            snippets = "\n".join(f"- {r['body']}" for r in results)
-            logger.info("Проактивный DDG поиск: Успешно получены сниппеты.")
-            return snippets
+        async with AsyncDDGS() as ddgs:
+            results = []
+            async for r in ddgs.text(keywords=query, region='ru-ru', max_results=3):
+                results.append(r)
+            if results:
+                snippets = "\n".join(f"- {r['body']}" for r in results)
+                logger.info("Проактивный DDG поиск: Успешно получены сниппеты.")
+                return snippets
     except Exception as e:
         logger.warning(f"Проактивный DDG поиск не удался: {e}. Переключаюсь на резервный поиск.")
     
@@ -380,7 +384,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
     system_instruction_part = types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
     
     try:
-        response = await client.models.generate_content_async(
+        response = await client.aio.models.generate_content(
             model=MODEL_NAME,
             contents=request_contents,
             generation_config=generation_config,
@@ -390,7 +394,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         )
         logger.info(f"ChatID: {chat_id} | Ответ получен.")
         return response
-    except types.GoogleAPIError as e:
+    except google_errors.GoogleAPIError as e:
         error_str = str(e).lower()
         logger.error(f"ChatID: {chat_id} | Ошибка Google API: {e}", exc_info=True)
         
