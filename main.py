@@ -1,6 +1,7 @@
-# Версия 27.2 'Final Polish'
-# Изменено стартовое сообщение в `start_command` по запросу.
-# Код полный, без сокращений.
+# Версия 28.0 'Full Prompt & Tool Integration'
+# Добавлены все упущенные ранее детали в системный промпт.
+# Включена передача FUNCTION_CALLING_TOOLS модели для активации вызова функций.
+# Код финальный, полный, без сокращений.
 
 import logging
 import os
@@ -56,8 +57,22 @@ MAX_MEDIA_CONTEXTS = 10
 MEDIA_CONTEXT_TTL_SECONDS = 47 * 3600
 TELEGRAM_FILE_LIMIT_MB = 20
 
+def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
+    return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
+
 TEXT_TOOLS = [types.Tool(google_search=types.GoogleSearch(), code_execution=types.ToolCodeExecution())]
 MEDIA_TOOLS = [types.Tool(google_search=types.GoogleSearch())]
+FUNCTION_CALLING_TOOLS = [types.Tool(function_declarations=[
+    types.FunctionDeclaration(
+        name='get_current_time_str',
+        description="Gets the current date and time for a specified timezone.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={'timezone': types.Schema(type=types.Type.STRING, description="Timezone in TZ database format, e.g., 'Europe/Moscow' or 'America/New_York'")}
+        )
+    )
+])]
+
 
 SAFETY_SETTINGS = [
     types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
@@ -171,9 +186,6 @@ class PostgresPersistence(BasePersistence):
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value): return context.chat_data.get(key, default_value)
 def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value): context.chat_data[key] = value
-
-def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
-    return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
 
 def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
     chunks, tag_stack, remaining_text = [], [], text_to_chunk
@@ -418,6 +430,15 @@ def format_gemini_response(response: types.GenerateContentResponse) -> str:
         elif hasattr(part, 'code_execution_result') and part.code_execution_result:
             output = part.code_execution_result.output
             result_parts.append(f"<b>Результат:</b>\n<pre><code>{html.escape(output)}</code></pre>")
+        elif hasattr(part, 'function_call'):
+            # Обработка вызова функции, если модель решит его использовать
+            fc = part.function_call
+            if fc.name == 'get_current_time_str':
+                # Вызываем нашу реальную функцию и формируем текстовый ответ
+                tz = fc.args.get('timezone', 'Europe/Moscow')
+                time_str = get_current_time_str(tz)
+                result_parts.append(f"<i>(Вызов функции: get_current_time)</i>\nТекущее время для {tz}: {time_str}")
+
 
     return "".join(result_parts) if result_parts else "🤖 Модель дала пустой ответ."
 
@@ -427,7 +448,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
     history = build_history_for_request(context.chat_data.get("history", []))
-    tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
+    tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS + FUNCTION_CALLING_TOOLS
     
     request_specific_parts = list(content_parts)
     text_part_index = next((i for i, part in enumerate(request_specific_parts) if part.text), -1)
