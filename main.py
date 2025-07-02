@@ -1,8 +1,7 @@
-# Версия 26.5 'Final Prompt Integration & Review'
-# 1. КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ (Стабильность): Реализована автоматическая очистка "липкого" медиа-контекста. При ошибках доступа к файлу бот сам сбрасывает контекст и информирует пользователя.
-# 2. ИЗМЕНЕНО (Надежность поиска): Добавлена резервная система проактивного поиска. Если DDG недоступен, бот автоматически использует Google Custom Search API.
-# 3. ИЗМЕНЕНО (Логика промпта): Логика формирования запроса к модели полностью синхронизирована с предоставленным системным промптом.
-# 4. СОХРАНЕНО: Используется модель gemini-2.5-flash. Все исправления из предыдущих версий сохранены.
+# Версия 26.6 'SDK Hotfix & Unification'
+# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Устранена ошибка AttributeError: module 'google.genai' has no attribute 'FileClient'.
+# 2. РЕФАКТОРИНГ: Логика работы с Google API унифицирована. Теперь используется один экземпляр genai.Client для всех операций (генерация контента, работа с файлами), что соответствует официальному SDK.
+# 3. Все предыдущие улучшения (автолечение контекста, резервный поиск, логика промптов) сохранены и адаптированы под унифицированный клиент.
 
 import logging
 import os
@@ -42,7 +41,6 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 WEBHOOK_HOST = os.getenv('WEBHOOK_HOST')
 GEMINI_WEBHOOK_PATH = os.getenv('GEMINI_WEBHOOK_PATH')
 
-# Переменные для резервного поиска Google
 GOOGLE_CSE_API_KEY = os.getenv('GOOGLE_CSE_API_KEY')
 GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID')
  
@@ -314,15 +312,15 @@ def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_i
             break
     return None
 
-async def upload_and_wait_for_file(client: genai.FileClient, file_bytes: bytes, mime_type: str, file_name: str) -> types.Part:
+async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime_type: str, file_name: str) -> types.Part:
     logger.info(f"Загрузка файла '{file_name}' ({len(file_bytes) / 1024:.2f} KB) через File API...")
     try:
-        uploaded_file_response = client.upload_file(
+        uploaded_file_response = await client.files.upload_async(
             file=io.BytesIO(file_bytes), mime_type=mime_type, display_name=file_name
         )
         logger.info(f"Файл '{file_name}' загружен. URI: {uploaded_file_response.uri}. Ожидание статуса ACTIVE...")
         
-        file_state_response = client.get_file(name=uploaded_file_response.name)
+        file_state_response = await client.files.get_async(name=uploaded_file_response.name)
         if file_state_response.state.name == 'ACTIVE':
             logger.info(f"Файл '{file_name}' активен.")
             return types.Part(file_data=types.FileData(file_uri=uploaded_file_response.uri, mime_type=mime_type))
@@ -376,13 +374,14 @@ async def get_proactive_web_context(query: str) -> str | None:
     
     return await perform_google_custom_search(query)
 
-async def generate_response(model: genai.GenerativeModel, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> types.GenerateContentResponse | str:
+async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> types.GenerateContentResponse | str:
     chat_id = context.chat_data.get('id', 'Unknown')
     generation_config = types.GenerationConfig(temperature=0.7)
     system_instruction_part = types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
     
     try:
-        response = await model.generate_content_async(
+        response = await client.models.generate_content_async(
+            model=MODEL_NAME,
             contents=request_contents,
             generation_config=generation_config,
             safety_settings=SAFETY_SETTINGS,
@@ -427,7 +426,7 @@ def format_gemini_response(response: types.GenerateContentResponse) -> str:
     return "".join(result_parts)
 
 async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, is_media_request: bool = False):
-    message, gemini_model = update.message, context.bot_data['gemini_model']
+    message, client = update.message, context.bot_data['gemini_client']
     user = message.from_user
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
@@ -463,7 +462,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     request_contents = history + [types.Content(parts=request_specific_parts, role="user")]
 
     try:
-        response_obj = await generate_response(gemini_model, request_contents, context, tools)
+        response_obj = await generate_response(client, request_contents, context, tools)
         
         if isinstance(response_obj, str):
             reply_text = response_obj
@@ -568,7 +567,6 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
     
     media_part = None
     client = context.bot_data['gemini_client']
-    gemini_model = context.bot_data['gemini_model']
     
     try:
         if media_obj:
@@ -593,7 +591,7 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
         
         content_parts = [media_part, types.Part(text=prompt)]
         
-        response_obj = await generate_response(gemini_model, [types.Content(parts=content_parts, role="user")], context, MEDIA_TOOLS)
+        response_obj = await generate_response(client, [types.Content(parts=content_parts, role="user")], context, MEDIA_TOOLS)
         if isinstance(response_obj, str):
              result_text = response_obj
         else:
@@ -804,9 +802,8 @@ async def main():
     application = builder.build()
     
     await application.initialize()
-    genai.configure(api_key=GOOGLE_API_KEY)
-    application.bot_data['gemini_model'] = genai.GenerativeModel(MODEL_NAME)
-    application.bot_data['gemini_client'] = genai.FileClient()
+    
+    application.bot_data['gemini_client'] = genai.Client(api_key=GOOGLE_API_KEY)
     
     commands = [
         BotCommand("start", "Инфо и начало работы"),
