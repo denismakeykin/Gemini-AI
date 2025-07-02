@@ -1,6 +1,5 @@
-# Версия 27.1 'History Resilience' (финальная сборка)
-# Включает все исправления: двойной проактивный поиск (DDG -> Google CSE), "умный" промптинг для стимуляции Grounding,
-# устойчивость истории чата к "отравленным" записям и усиленную команду /newtopic.
+# Версия 27.2 'Final Polish'
+# Изменено стартовое сообщение в `start_command` по запросу.
 # Код полный, без сокращений.
 
 import logging
@@ -173,6 +172,9 @@ class PostgresPersistence(BasePersistence):
 def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value): return context.chat_data.get(key, default_value)
 def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value): context.chat_data[key] = value
 
+def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
+    return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
+
 def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
     chunks, tag_stack, remaining_text = [], [], text_to_chunk
     tag_regex = re.compile(r'<(/?)(b|i|code|pre|a|tg-spoiler|br)>', re.IGNORECASE)
@@ -259,7 +261,8 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     chat_history.append(entry)
     if len(chat_history) > MAX_HISTORY_ITEMS:
         context.chat_data["history"] = chat_history[-MAX_HISTORY_ITEMS:]
-    await context.application.persistence.update_chat_data(chat_id, context.chat_data)
+    if context.application.persistence:
+        await context.application.persistence.update_chat_data(chat_id, context.chat_data)
 
 def build_history_for_request(chat_history: list) -> list[types.Content]:
     valid_history, current_chars = [], 0
@@ -457,7 +460,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             full_response_for_history = reply_text
         else:
             reply_text = format_gemini_response(response_obj)
-            full_response_for_history = response_obj.text
+            full_response_for_history = getattr(response_obj, 'text', '')
 
         sent_message = await send_reply(message, reply_text)
         
@@ -487,18 +490,18 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.setdefault('proactive_search', True)
-    start_text = """Я - Женя, лучший ИИ-чат-бот на Google Gemini 2.5 Flash с авторскими настройками.
+    start_text = """Я - Женя, интеллект новой Google Gemini 2.5 Flash с лучшим поиском:
 
-🌐 Использую интеллектуальный поиск Google в интернете.
-🧠 Обладаю всевозможными знаниями в любых сферах.
-💬 Проанализировав данные и ваш контекст, отвечу точно, но в позитивном стиле с юмором.
+🌐 Обладаю глубокими знаниями во всех сферах и умно использую Google.
+🧠 Анализирую и размышляю над сообщением, контекстом и всеми знаниями.
+💬 Отвечу на любые вопросы в понятном и приятном стиле, иногда с юмором. Могу сделать описание/конспект, расшифровку, искать по содержимому.
 
-Анализ, описание, расшифровка в текст, пересказ, ответы и поиск по содержимому:
-🎤 Голосовых сообщений и аудиофайлов;
-📸🖼 Изображений, YouTube-видео и видеофайлов (до 20 мб);
-🔗 Веб-страниц и файлов PDF, TXT, JSON.
+Принимаю и понимаю:
+✉️ Текстовые, 🎤 Голосовые и 🎧 Аудиофайлы,
+📸 Изображения, 🎞 Видео (до 50 мб), 📹 ссылки на YouTube, 
+🔗 Веб-страницы,📑 Файлы PDF, TXT, JSON.
 
-Пользуйтесь тут и добавляйте в свои группы!
+Пользуйтесь и добавляйте в свои группы!
 
 (!) Используя бот, Вы автоматически соглашаетесь на передачу сообщений и файлов для получения ответов через Google Gemini API."""
     await update.message.reply_html(start_text)
@@ -529,7 +532,8 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.clear()
-    await context.application.persistence.drop_chat_data(update.effective_chat.id)
+    if context.application.persistence:
+        await context.application.persistence.drop_chat_data(update.effective_chat.id)
     await update.message.reply_text("История чата и все связанные с ним данные (настройки, медиа) полностью очищены.")
 
 async def newtopic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
