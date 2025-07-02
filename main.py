@@ -1,8 +1,7 @@
-# Версия 26.7 'Hotfix & Async Correction'
-# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Устранены все AttributeError, связанные с неправильными вызовами асинхронных методов и импортами ошибок google-genai SDK.
-# 2. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Исправлена ошибка TypeError в функции поиска DDG путем использования корректного асинхронного класса AsyncDDGS.
-# 3. РЕФАКТОРИНГ: Все асинхронные вызовы к Google API (генерация, работа с файлами) теперь используют правильный синтаксис `client.aio.*`.
-# 4. Все предыдущие улучшения (автолечение, резервный поиск, логика промптов) сохранены.
+# Версия 26.7 'Final SDK Hotfix'
+# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Устранена ошибка AttributeError: 'Models' object has no attribute 'generate_content_async'. Вызовы асинхронных методов теперь корректно используют атрибут `client.aio`.
+# 2. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Устранена ошибка AttributeError: module 'google.genai.types' has no attribute 'GoogleAPIError'. Обработка исключений теперь использует правильный класс из `google.api_core.exceptions`.
+# 3. Все предыдущие улучшения сохранены. Код приведен в полное соответствие с официальным SDK.
 
 import logging
 import os
@@ -28,9 +27,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from telegram.error import BadRequest
 
 from google import genai
-from google.generativeai import types
-from google.generativeai import errors as google_errors
-from duckduckgo_search import AsyncDDGS
+from google.genai import types
+from google.api_core import exceptions as google_exceptions
+from duckduckgo_search import DDGS
 
 # --- КОНФИГУРАЦИЯ ---
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -365,14 +364,12 @@ async def perform_google_custom_search(query: str) -> str | None:
 async def get_proactive_web_context(query: str) -> str | None:
     try:
         logger.info(f"Выполняется проактивный DDG поиск по запросу: '{query}'")
-        async with AsyncDDGS() as ddgs:
-            results = []
-            async for r in ddgs.text(keywords=query, region='ru-ru', max_results=3):
-                results.append(r)
-            if results:
-                snippets = "\n".join(f"- {r['body']}" for r in results)
-                logger.info("Проактивный DDG поиск: Успешно получены сниппеты.")
-                return snippets
+        async with DDGS() as ddgs:
+            results = [r async for r in ddgs.text(keywords=query, region='ru-ru', max_results=3)]
+        if results:
+            snippets = "\n".join(f"- {r['body']}" for r in results)
+            logger.info("Проактивный DDG поиск: Успешно получены сниппеты.")
+            return snippets
     except Exception as e:
         logger.warning(f"Проактивный DDG поиск не удался: {e}. Переключаюсь на резервный поиск.")
     
@@ -394,7 +391,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         )
         logger.info(f"ChatID: {chat_id} | Ответ получен.")
         return response
-    except google_errors.GoogleAPIError as e:
+    except google_exceptions.GoogleAPIError as e:
         error_str = str(e).lower()
         logger.error(f"ChatID: {chat_id} | Ошибка Google API: {e}", exc_info=True)
         
