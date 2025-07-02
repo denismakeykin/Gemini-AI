@@ -1,7 +1,7 @@
-# Версия 26.1 'Final Stability & Cleanup'
-# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (Ошибки API): Полностью переписан блок обработки исключений в `generate_response`. Теперь он корректно отлавливает все `GoogleAPIError`, включая 429 (ResourceExhausted) и 403 (PermissionDenied).
-# 2. УЛУЧШЕНО (Контекст): Внедрен механизм "протухания" медиа-контекста. Ссылки на файлы старше 47 часов больше не используются, что предотвращает ошибки PERMISSION_DENIED.
-# 3. Все остальные рабочие механики (Мультиконтекст, Амнезия истории, Персонализация) сохранены и отполированы.
+# Версия 27.1 'History Resilience' (финальная сборка)
+# Включает все исправления: двойной проактивный поиск (DDG -> Google CSE), "умный" промптинг для стимуляции Grounding,
+# устойчивость истории чата к "отравленным" записям и усиленную команду /newtopic.
+# Код полный, без сокращений.
 
 import logging
 import os
@@ -16,6 +16,7 @@ import io
 import time
 import datetime
 import pytz
+import html
 
 import httpx
 import aiohttp
@@ -26,7 +27,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from telegram.error import BadRequest
 
 from google import genai
-from google.genai import types
+from google.generativeai import types
 from duckduckgo_search import DDGS
 
 # --- КОНФИГУРАЦИЯ ---
@@ -36,34 +37,29 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID')
 DATABASE_URL = os.getenv('DATABASE_URL')
 WEBHOOK_HOST = os.getenv('WEBHOOK_HOST')
 GEMINI_WEBHOOK_PATH = os.getenv('GEMINI_WEBHOOK_PATH')
- 
-if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PATH]):
-    logger.critical("Критическая ошибка: не заданы все необходимые переменные окружения!")
+
+if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, GOOGLE_CSE_ID, WEBHOOK_HOST, GEMINI_WEBHOOK_PATH]):
+    logger.critical("Критическая ошибка: не заданы все необходимые переменные окружения (включая GOOGLE_CSE_ID)!")
     exit(1)
 
 # --- КОНСТАНТЫ И НАСТРОЙКИ ---
 MODEL_NAME = 'gemini-2.5-flash'
-YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})'
+YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/|youtube-nocookie\.com\/embed\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
-MAX_CONTEXT_CHARS = 200000 
+MAX_CONTEXT_CHARS = 200000
 MAX_HISTORY_RESPONSE_LEN = 2000
 MAX_HISTORY_ITEMS = 50
-MAX_MEDIA_CONTEXTS = 10 
-MEDIA_CONTEXT_TTL_SECONDS = 47 * 3600 # 47 часов
+MAX_MEDIA_CONTEXTS = 10
+MEDIA_CONTEXT_TTL_SECONDS = 47 * 3600
+TELEGRAM_FILE_LIMIT_MB = 20
 
-# --- ИНСТРУМЕНТЫ И ПРОМПТЫ ---
-def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
-    return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
-
-TEXT_TOOLS = [types.Tool(google_search=types.GoogleSearch()), types.Tool(code_execution=types.ToolCodeExecution())]
+TEXT_TOOLS = [types.Tool(google_search=types.GoogleSearch(), code_execution=types.ToolCodeExecution())]
 MEDIA_TOOLS = [types.Tool(google_search=types.GoogleSearch())]
-FUNCTION_CALLING_TOOLS = [types.Tool(function_declarations=[types.FunctionDeclaration(
-    name='get_current_time_str', description="Gets the current date and time.",
-    parameters=types.Schema(type=types.Type.OBJECT, properties={'timezone': types.Schema(type=types.Type.STRING)})
-)])]
+
 SAFETY_SETTINGS = [
     types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
     for c in (types.HarmCategory.HARM_CATEGORY_HARASSMENT, types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -83,19 +79,33 @@ class PostgresPersistence(BasePersistence):
         super().__init__()
         self.db_pool = None
         self.dsn = database_url
-        try: self._connect(); self._initialize_db()
-        except psycopg2.Error as e: logger.critical(f"PostgresPersistence: Не удалось подключиться к БД: {e}"); raise
+        self._connect_with_retry()
+
+    def _connect_with_retry(self, retries=5, delay=5):
+        for attempt in range(retries):
+            try:
+                self._connect()
+                self._initialize_db()
+                logger.info("PostgresPersistence: Успешное подключение к БД.")
+                return
+            except psycopg2.Error as e:
+                logger.error(f"PostgresPersistence: Не удалось подключиться к БД (попытка {attempt + 1}/{retries}): {e}")
+                if attempt < retries - 1:
+                    time.sleep(delay)
+                else:
+                    raise
+
     def _connect(self):
-        if self.db_pool:
-            try: self.db_pool.closeall()
-            except Exception as e: logger.warning(f"Ошибка при закрытии старого пула: {e}")
+        if self.db_pool and not self.db_pool.closed:
+            self.db_pool.closeall()
         dsn = self.dsn
         keepalive_options = "keepalives=1&keepalives_idle=60&keepalives_interval=10&keepalives_count=5"
         if "?" in dsn:
-             if "keepalives" not in dsn: dsn = f"{dsn}&{keepalive_options}"
-        else: dsn = f"{dsn}?{keepalive_options}"
+            if "keepalives" not in dsn: dsn = f"{dsn}&{keepalive_options}"
+        else:
+            dsn = f"{dsn}?{keepalive_options}"
         self.db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=dsn)
-    
+
     def _execute(self, query: str, params: tuple = None, fetch: str = None, retries=3):
         last_exception = None
         for attempt in range(retries):
@@ -113,7 +123,7 @@ class PostgresPersistence(BasePersistence):
                 last_exception = e
                 if conn:
                     self.db_pool.putconn(conn, close=True)
-                    conn = None
+                    conn = None 
                 if attempt < retries - 1:
                     time.sleep(1 + attempt)
                 continue
@@ -165,7 +175,7 @@ def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value): conte
 
 def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
     chunks, tag_stack, remaining_text = [], [], text_to_chunk
-    tag_regex = re.compile(r'<(/?)(b|i|u|s|code|pre|a|tg-spoiler|br)>', re.IGNORECASE)
+    tag_regex = re.compile(r'<(/?)(b|i|code|pre|a|tg-spoiler|br)>', re.IGNORECASE)
     while len(remaining_text) > chunk_size:
         split_pos = remaining_text.rfind('\n', 0, chunk_size)
         if split_pos == -1: split_pos = chunk_size
@@ -184,8 +194,8 @@ def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
     chunks.append(remaining_text)
     return chunks
 
-async def send_reply(target_message: Message, text: str) -> Message | None:
-    sanitized_text = re.sub(r'<br\s*/?>', '\n', text)
+async def send_reply(target_message: Message, response_text: str) -> Message | None:
+    sanitized_text = re.sub(r'<br\s*/?>', '\n', response_text)
     chunks = html_safe_chunker(sanitized_text)
     sent_message = None
     try:
@@ -198,8 +208,8 @@ async def send_reply(target_message: Message, text: str) -> Message | None:
         if "Can't parse entities" in str(e) or "unsupported start tag" in str(e):
             logger.warning(f"Ошибка парсинга HTML: {e}. Отправляю как обычный текст.")
             plain_text = re.sub(r'<[^>]*>', '', sanitized_text)
-            chunks = html_safe_chunker(plain_text)
-            for i, chunk in enumerate(chunks):
+            plain_chunks = [plain_text[i:i+4096] for i in range(0, len(plain_text), 4096)]
+            for i, chunk in enumerate(plain_chunks):
                 if i == 0: sent_message = await target_message.reply_text(chunk)
                 else: sent_message = await target_message.get_bot().send_message(chat_id=target_message.chat_id, text=chunk)
             return sent_message
@@ -252,17 +262,25 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
 
 def build_history_for_request(chat_history: list) -> list[types.Content]:
     valid_history, current_chars = [], 0
-    for entry in reversed(chat_history):
-        if entry.get("role") in ("user", "model") and isinstance(entry.get("parts"), list):
-            api_parts = [p for p in (dict_to_part(part_dict) for part_dict in entry["parts"]) if p is not None]
-            if not api_parts: continue
-            entry_text_len = sum(len(p.text) for p in api_parts if p.text)
-            if current_chars + entry_text_len > MAX_CONTEXT_CHARS:
-                logger.info(f"Достигнут лимит контекста ({MAX_CONTEXT_CHARS} симв). История обрезана до {len(valid_history)} сообщений.")
-                break
-            clean_content = types.Content(role=entry["role"], parts=api_parts)
-            valid_history.append(clean_content)
-            current_chars += entry_text_len
+    for i, entry in enumerate(reversed(chat_history)):
+        try:
+            if entry.get("role") in ("user", "model") and isinstance(entry.get("parts"), list):
+                api_parts = [p for p in (dict_to_part(part_dict) for part_dict in entry["parts"]) if p is not None]
+                if not api_parts:
+                    logger.warning(f"Пропуск пустой или невалидной записи в истории (индекс {len(chat_history) - 1 - i}).")
+                    continue
+                
+                entry_text_len = sum(len(p.text) for p in api_parts if p.text)
+                if current_chars + entry_text_len > MAX_CONTEXT_CHARS:
+                    logger.info(f"Достигнут лимит контекста. История обрезана.")
+                    break
+                    
+                clean_content = types.Content(role=entry["role"], parts=api_parts)
+                valid_history.append(clean_content)
+                current_chars += entry_text_len
+        except Exception as e:
+            logger.error(f"Ошибка при обработке записи истории (индекс {len(chat_history) - 1 - i}): {e}. Запись будет пропущена. Содержимое: {entry}")
+            continue
     valid_history.reverse()
     return valid_history
 
@@ -275,72 +293,132 @@ def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_i
         if bot_message and 'original_message_id' in bot_message:
             user_msg_id = bot_message['original_message_id']
             if user_msg_id in media_contexts:
-                return media_contexts[user_msg_id]
+                media_context = media_contexts[user_msg_id]
+                if time.time() - media_context.get('timestamp', 0) < MEDIA_CONTEXT_TTL_SECONDS:
+                    return media_context
+                else:
+                    logger.info(f"Найденный медиа-контекст для msg_id {user_msg_id} протух.")
+                    return None
             current_reply_id = user_msg_id
         else:
             if current_reply_id in media_contexts:
-                return media_contexts[current_reply_id]
+                media_context = media_contexts[current_reply_id]
+                if time.time() - media_context.get('timestamp', 0) < MEDIA_CONTEXT_TTL_SECONDS:
+                    return media_context
+                else:
+                    logger.info(f"Найденный медиа-контекст для msg_id {current_reply_id} протух.")
+                    return None
             break
     return None
 
-async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime_type: str, file_name: str) -> types.Part:
+async def upload_and_wait_for_file(client: genai.FileClient, file_bytes: bytes, mime_type: str, file_name: str) -> types.Part:
     logger.info(f"Загрузка файла '{file_name}' ({len(file_bytes) / 1024:.2f} KB) через File API...")
-    uploaded_file_response = await client.aio.files.upload(
-        file=io.BytesIO(file_bytes), config=types.UploadFileConfig(mime_type=mime_type, display_name=file_name)
-    )
-    logger.info(f"Файл '{file_name}' загружен. Имя: {uploaded_file_response.name}. Ожидание статуса ACTIVE...")
-    for _ in range(15):
-        file_state_response = await client.aio.files.get(name=uploaded_file_response.name)
-        state = file_state_response.state.name
-        if state == 'ACTIVE':
+    try:
+        uploaded_file_response = client.upload_file(
+            file=io.BytesIO(file_bytes), mime_type=mime_type, display_name=file_name
+        )
+        logger.info(f"Файл '{file_name}' загружен. URI: {uploaded_file_response.uri}. Ожидание статуса ACTIVE...")
+        
+        file_state_response = client.get_file(name=uploaded_file_response.name)
+        if file_state_response.state.name == 'ACTIVE':
             logger.info(f"Файл '{file_name}' активен.")
             return types.Part(file_data=types.FileData(file_uri=uploaded_file_response.uri, mime_type=mime_type))
-        if state == 'FAILED':
-            raise IOError(f"Ошибка обработки файла '{file_name}' на сервере Google.")
-        await asyncio.sleep(2)
-    raise asyncio.TimeoutError(f"Файл '{file_name}' не стал активным за 30 секунд.")
-
-async def perform_proactive_search(query: str) -> str | None:
-    try:
-        logger.info(f"Выполняется проактивный поиск по запросу: '{query}'")
-        results = await asyncio.to_thread(DDGS().text, keywords=query, region='ru-ru', max_results=5)
-        if results:
-            snippets = "\n".join(f"- {r['body']}" for r in results)
-            logger.info("Проактивный поиск: Успешно получены сниппеты из DuckDuckGo.")
-            return snippets
+        else:
+             raise IOError(f"Файл '{file_name}' не стал активным. Статус: {file_state_response.state.name}")
     except Exception as e:
-        logger.warning(f"Проактивный DDG поиск не удался: {e}")
+        logger.error(f"Ошибка при загрузке файла через File API: {e}", exc_info=True)
+        raise IOError(f"Не удалось загрузить или обработать файл '{file_name}' на сервере Google.")
+
+async def _perform_ddg_search(query: str) -> list[str] | None:
+    try:
+        async with DDGS() as ddgs:
+            results = [r async for r in ddgs.text(keywords=query, region='ru-ru', max_results=5)]
+        if results:
+            return [r['body'] for r in results]
+    except Exception as e:
+        logger.warning(f"Поиск DDG не удался: {e}")
     return None
 
-async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> str:
-    chat_id = context.chat_data.get('id', 'Unknown')
-    thinking_mode = get_user_setting(context, 'thinking_mode', 'auto')
-    config = types.GenerateContentConfig(
-        safety_settings=SAFETY_SETTINGS, 
-        tools=tools,
-        thinking_config=types.ThinkingConfig(thinking_budget=-1 if thinking_mode == 'auto' else 24576),
-        system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
-    )
+async def _perform_google_cse_search(query: str, http_client: httpx.AsyncClient) -> list[str] | None:
+    if not GOOGLE_CSE_ID:
+        return None
+    search_url = "https://www.googleapis.com/customsearch/v1"
+    params = {'key': GOOGLE_API_KEY, 'cx': GOOGLE_CSE_ID, 'q': query, 'num': 5, 'lr': 'lang_ru'}
     try:
-        response = await client.aio.models.generate_content(model=MODEL_NAME, contents=request_contents, config=config)
-        logger.info(f"ChatID: {chat_id} | Ответ получен.")
-        return response.text
+        response = await http_client.get(search_url, params=params, timeout=10.0)
+        response.raise_for_status()
+        data = response.json()
+        items = data.get('items', [])
+        return [item.get('snippet', item.get('title', '')) for item in items if item.get('snippet') or item.get('title')]
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Google CSE: Ошибка HTTP {e.response.status_code}. Ответ: {e.response.text[:200]}")
+    except Exception as e:
+        logger.error(f"Google CSE: Непредвиденная ошибка - {e}")
+    return None
+
+async def perform_proactive_search(query: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    logger.info(f"Выполняется проактивный поиск по запросу: '{query[:80]}'")
+    
+    ddg_results = await _perform_ddg_search(query)
+    if ddg_results:
+        logger.info("Проактивный поиск: Успешно получены сниппеты из DuckDuckGo.")
+        return "\n".join(f"- {s}" for s in ddg_results)
+        
+    logger.warning("Поиск DDG не дал результатов, переключаюсь на Google CSE.")
+    http_client = context.application.bot_data.get('http_client')
+    if http_client:
+        google_results = await _perform_google_cse_search(query, http_client)
+        if google_results:
+            logger.info("Проактивный поиск: Успешно получены сниппеты из Google CSE.")
+            return "\n".join(f"- {s}" for s in google_results)
+            
+    logger.error("Проактивный поиск не дал результатов ни через DDG, ни через Google CSE.")
+    return None
+
+async def generate_response(model: genai.GenerativeModel, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> types.GenerateContentResponse | str:
+    chat_id = context.chat_data.get('id', 'Unknown')
+    generation_config = types.GenerationConfig(temperature=0.7)
+    system_instruction = types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
+    
+    try:
+        response = await model.generate_content_async(
+            contents=request_contents,
+            generation_config=generation_config,
+            safety_settings=SAFETY_SETTINGS,
+            tools=tools,
+            system_instruction=system_instruction
+        )
+        logger.info(f"ChatID: {chat_id} | Ответ от Gemini API получен.")
+        return response
     except types.GoogleAPIError as e:
-        if e.code == 429: # ResourceExhausted
-            logger.warning(f"ChatID: {chat_id} | Достигнут лимит API. Ошибка: {e}")
-            return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
-        elif e.code == 403: # PermissionDenied
-            logger.error(f"ChatID: {chat_id} | Ошибка доступа к файлу (возможно, он удален): {e}")
-            return "❌ <b>Ошибка доступа к файлу.</b>\nВозможно, файл был удален с серверов Google (срок хранения 48 часов) или возникла другая проблема. Попробуйте отправить файл заново."
-        else:
-            logger.error(f"ChatID: {chat_id} | Необработанная ошибка Google API: {e}", exc_info=True)
-            return f"❌ <b>Ошибка Google API:</b>\n<code>{str(e)}</code>"
+        logger.error(f"ChatID: {chat_id} | Ошибка Google API: {e}", exc_info=True)
+        return f"❌ <b>Ошибка Google API:</b>\n<code>{str(e)}</code>"
     except Exception as e:
         logger.error(f"ChatID: {chat_id} | Неизвестная ошибка генерации: {e}", exc_info=True)
         return f"❌ <b>Произошла внутренняя ошибка:</b>\n<code>{str(e)}</code>"
 
+def format_gemini_response(response: types.GenerateContentResponse) -> str:
+    if not response or not response.candidates:
+        return "Ответа не последовало."
+    
+    if response.prompt_feedback.block_reason.name != 'BLOCK_REASON_UNSPECIFIED':
+        return f"🤖 Запрос был заблокирован по причине: <b>{response.prompt_feedback.block_reason.name}</b>"
+
+    result_parts = []
+    for part in response.candidates[0].content.parts:
+        if part.text:
+            result_parts.append(part.text)
+        elif hasattr(part, 'executable_code') and part.executable_code:
+            code = part.executable_code.code
+            result_parts.append(f"<b>Выполняю код:</b>\n<pre><code>{html.escape(code)}</code></pre>")
+        elif hasattr(part, 'code_execution_result') and part.code_execution_result:
+            output = part.code_execution_result.output
+            result_parts.append(f"<b>Результат:</b>\n<pre><code>{html.escape(output)}</code></pre>")
+
+    return "".join(result_parts) if result_parts else "🤖 Модель дала пустой ответ."
+
 async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, is_media_request: bool = False):
-    message, client = update.message, context.bot_data['gemini_client']
+    message, gemini_model = update.message, context.bot_data['gemini_model']
     user = message.from_user
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
@@ -349,34 +427,43 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     
     request_specific_parts = list(content_parts)
     text_part_index = next((i for i, part in enumerate(request_specific_parts) if part.text), -1)
+
     if text_part_index != -1:
         original_text = request_specific_parts[text_part_index].text
+        search_nudge = ""
         
-        if get_user_setting(context, 'proactive_search', True) and not is_media_request:
-            search_results = await perform_proactive_search(original_text)
-            search_context = f"\n\n--- Контекст из веба для справки ---\n{search_results}\n--------------------------\n" if search_results else ""
-        else:
-            search_context = ""
+        if not is_media_request:
+            search_results = await perform_proactive_search(original_text, context)
+            if search_results:
+                search_nudge = (
+                    f"\n\n<b>Справочная информация из веба (для проверки):</b>\n"
+                    f"<pre>{html.escape(search_results)}</pre>\n"
+                    f"<i>Используй эту информацию как сигнал, что твои знания могут быть неактуальны, и проведи собственную проверку с помощью своих инструментов.</i>"
+                )
 
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
-        is_first_message = not bool(history)
-        date_prefix = f"(System Note: Today is {get_current_time_str()}. Verify facts. "
-        if not is_first_message:
-            date_prefix += "This is an ongoing conversation, do not greet the user.)\n"
-        else:
-            date_prefix += "This is the first message.)\n"
+        date_prefix = f"(System Note: Today is {get_current_time_str()})\n"
             
-        request_specific_parts[text_part_index].text = f"{date_prefix}{search_context}{user_prefix}{original_text}"
+        final_prompt = f"{date_prefix}{user_prefix}{original_text}{search_nudge}"
+        request_specific_parts[text_part_index].text = final_prompt
 
     request_contents = history + [types.Content(parts=request_specific_parts, role="user")]
 
     try:
-        reply_text = await generate_response(client, request_contents, context, tools)
+        response_obj = await generate_response(gemini_model, request_contents, context, tools)
+        
+        if isinstance(response_obj, str):
+            reply_text = response_obj
+            full_response_for_history = reply_text
+        else:
+            reply_text = format_gemini_response(response_obj)
+            full_response_for_history = response_obj.text
+
         sent_message = await send_reply(message, reply_text)
         
         await add_to_history(context, role="user", parts=content_parts, original_message_id=message.message_id)
         if sent_message:
-            await add_to_history(context, role="model", parts=[types.Part(text=reply_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id, is_media_response=is_media_request)
+            await add_to_history(context, role="model", parts=[types.Part(text=full_response_for_history)], original_message_id=message.message_id, bot_message_id=sent_message.message_id, is_media_response=is_media_request)
         
         if is_media_request:
             media_part = next((p for p in content_parts if p.file_data), None)
@@ -386,11 +473,9 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
                 if len(media_contexts) > MAX_MEDIA_CONTEXTS:
                     media_contexts.popitem(last=False)
                 context.chat_data['last_media_context'] = media_contexts[message.message_id]
-                logger.info(f"Сохранен/обновлен медиа-контекст для msg_id {message.message_id}")
         elif not message.reply_to_message:
              if 'last_media_context' in context.chat_data:
                 del context.chat_data['last_media_context']
-                logger.info(f"Очищен 'липкий' медиа-контекст для чата {message.chat_id} (новая тема).")
 
     except (IOError, asyncio.TimeoutError) as e:
         logger.error(f"Ошибка обработки файла: {e}", exc_info=False)
@@ -399,10 +484,8 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         logger.error(f"Непредвиденная ошибка в process_request: {e}", exc_info=True)
         await message.reply_text("❌ Произошла внутренняя ошибка. Попробуйте еще раз.")
 
-
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data.setdefault('thinking_mode', 'auto')
     context.chat_data.setdefault('proactive_search', True)
     start_text = """Я - Женя, лучший ИИ-чат-бот на Google Gemini 2.5 Flash с авторскими настройками.
 
@@ -412,7 +495,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Анализ, описание, расшифровка в текст, пересказ, ответы и поиск по содержимому:
 🎤 Голосовых сообщений и аудиофайлов;
-📸🖼 Изображений, YouTube-видео и видеофайлов (до 50 мб);
+📸🖼 Изображений, YouTube-видео и видеофайлов (до 20 мб);
 🔗 Веб-страниц и файлов PDF, TXT, JSON.
 
 Пользуйтесь тут и добавляйте в свои группы!
@@ -421,11 +504,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(start_text)
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mode = get_user_setting(context, 'thinking_mode', 'auto')
     search = get_user_setting(context, 'proactive_search', True)
     keyboard = [
-        [InlineKeyboardButton(f"Мышление: {'✅ ' if mode == 'auto' else ''}Авто", callback_data="set_thinking_auto"),
-         InlineKeyboardButton(f"Мышление: {'✅ ' if mode == 'max' else ''}Максимум", callback_data="set_thinking_max")],
         [InlineKeyboardButton(f"Проактивный поиск: {'✅ Вкл' if search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
     ]
     await update.message.reply_text("⚙️ Настройки:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -434,40 +514,30 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query, data = update.callback_query, update.callback_query.data
     await query.answer()
     
-    current_mode = get_user_setting(context, 'thinking_mode', 'auto')
     current_search = get_user_setting(context, 'proactive_search', True)
-
-    if data.startswith("set_thinking_"):
-        set_user_setting(context, 'thinking_mode', data.replace("set_thinking_", ""))
-    elif data == "toggle_proactive_search":
-        set_user_setting(context, 'proactive_search', not get_user_setting(context, 'proactive_search', True))
-        
-    new_mode = get_user_setting(context, 'thinking_mode', 'auto')
+    if data == "toggle_proactive_search":
+        set_user_setting(context, 'proactive_search', not current_search)
     new_search = get_user_setting(context, 'proactive_search', True)
 
-    if current_mode == new_mode and current_search == new_search: return
-
-    keyboard = [
-        [InlineKeyboardButton(f"Мышление: {'✅ ' if new_mode == 'auto' else ''}Авто", callback_data="set_thinking_auto"),
-         InlineKeyboardButton(f"Мышление: {'✅ ' if new_mode == 'max' else ''}Максимум", callback_data="set_thinking_max")],
-        [InlineKeyboardButton(f"Проактивный поиск: {'✅ Вкл' if new_search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
-    ]
+    if current_search == new_search: return
+    keyboard = [[InlineKeyboardButton(f"Проактивный поиск: {'✅ Вкл' if new_search else '❌ Выкл'}", callback_data="toggle_proactive_search")]]
     try:
         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
     except BadRequest as e:
-        if "Message is not modified" in str(e):
-            logger.info("Сообщение с настройками не изменилось, пропуск редактирования.")
+        if "Message is not modified" in str(e): pass
         else: raise e
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.clear()
     await context.application.persistence.drop_chat_data(update.effective_chat.id)
-    await update.message.reply_text("История чата и связанные данные очищены.")
+    await update.message.reply_text("История чата и все связанные с ним данные (настройки, медиа) полностью очищены.")
 
 async def newtopic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('last_media_context', None)
     context.chat_data.pop('media_contexts', None)
-    await update.message.reply_text("Контекст предыдущих файлов очищен. Начинаем новую тему.")
+    context.chat_data.pop('history', None)
+    logger.info(f"Контекст (медиа и история) для чата {update.effective_chat.id} очищен по команде /newtopic.")
+    await update.message.reply_text("Начинаем новую тему. Контекст предыдущих файлов и сообщений очищен.")
 
 async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
     if not update.message.reply_to_message:
@@ -476,12 +546,13 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     replied_message = update.message.reply_to_message
     media_obj = replied_message.audio or replied_message.voice or replied_message.video or replied_message.photo or replied_message.document
-    
-    media_part = None
-    client = context.bot_data['gemini_client']
+    media_part, result_text = None, None
+    client, gemini_model = context.bot_data['gemini_client'], context.bot_data['gemini_model']
     
     try:
         if media_obj:
+            if hasattr(media_obj, 'file_size') and media_obj.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
+                return await update.message.reply_text(f"❌ Файл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB).")
             media_file = await media_obj.get_file()
             media_bytes = await media_file.download_as_bytearray()
             media_part = await upload_and_wait_for_file(client, media_bytes, media_obj.mime_type, getattr(media_obj, 'file_name', 'media.bin'))
@@ -491,18 +562,22 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
                 youtube_url = f"https://www.youtube.com/watch?v={yt_match.group(1)}"
                 media_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
             else:
-                await update.message.reply_text("В цитируемом сообщении нет поддерживаемого медиафайла или YouTube-ссылки.")
-                return
+                return await update.message.reply_text("В цитируемом сообщении нет поддерживаемого медиафайла или YouTube-ссылки.")
         else:
-            await update.message.reply_text("Не удалось найти медиафайл в цитируемом сообщении.")
-            return
+            return await update.message.reply_text("Не удалось найти медиафайл в цитируемом сообщении.")
 
         await update.message.reply_text("Анализирую...", reply_to_message_id=update.message.message_id)
         
-        content_parts = [media_part, types.Part(text=prompt)]
-        result_text = await generate_response(client, [types.Content(parts=content_parts, role="user")], context, tools=MEDIA_TOOLS)
-        await update.message.reply_text(result_text, parse_mode=ParseMode.HTML)
+        response_obj = await generate_response(gemini_model, [types.Content(parts=[media_part, types.Part(text=prompt)], role="user")], context, tools=MEDIA_TOOLS)
+        if isinstance(response_obj, str): result_text = response_obj
+        else: result_text = format_gemini_response(response_obj)
 
+        await send_reply(update.message, result_text)
+    except BadRequest as e:
+        if "File is too big" in str(e): await update.message.reply_text(f"❌ Файл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB).")
+        else:
+            logger.error(f"Ошибка BadRequest в утилитарной команде: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Произошла ошибка Telegram: {e}")
     except Exception as e:
         logger.error(f"Ошибка в утилитарной команде: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Не удалось выполнить команду: {e}")
@@ -524,50 +599,93 @@ async def handle_media_request(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, client = update.message, context.bot_data['gemini_client']
-    photo_file = await message.photo[-1].get_file()
-    photo_bytes = await photo_file.download_as_bytearray()
-    file_part = await upload_and_wait_for_file(client, photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
-    await handle_media_request(update, context, file_part, message.caption or "Проанализируй этот файл.")
+    try:
+        photo_file = await message.photo[-1].get_file()
+        photo_bytes = await photo_file.download_as_bytearray()
+        file_part = await upload_and_wait_for_file(client, photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
+        await handle_media_request(update, context, file_part, message.caption or "Проанализируй этот файл.")
+    except BadRequest as e:
+        if "File is too big" in str(e): await message.reply_text(f"❌ Изображение слишком большое (> {TELEGRAM_FILE_LIMIT_MB} MB).")
+        else: await message.reply_text(f"❌ Произошла ошибка Telegram при обработке фото: {e}")
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при обработке фото: {e}", exc_info=True)
+        await message.reply_text("❌ Произошла внутренняя ошибка при обработке фото.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, doc, client = update.message, update.message.document, context.bot_data['gemini_client']
     if doc.file_size > 50 * 1024 * 1024: return await message.reply_text("❌ Файл слишком большой (> 50 MB).")
+    if doc.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
+        return await message.reply_text(f"❌ Файл больше {TELEGRAM_FILE_LIMIT_MB} МБ. Я не могу скачать его для анализа.")
     if doc.mime_type and doc.mime_type.startswith("audio/"): return await handle_audio(update, context, doc)
+    
     await message.reply_text(f"Загружаю документ '{doc.file_name}'...", reply_to_message_id=message.message_id)
-    doc_file = await doc.get_file()
-    doc_bytes = await doc_file.download_as_bytearray()
-    file_part = await upload_and_wait_for_file(client, doc_bytes, doc.mime_type, doc.file_name or "document")
-    await handle_media_request(update, context, file_part, message.caption or "Проанализируй этот файл.")
+    try:
+        doc_file = await doc.get_file()
+        doc_bytes = await doc_file.download_as_bytearray()
+        file_part = await upload_and_wait_for_file(client, doc_bytes, doc.mime_type, doc.file_name or "document")
+        await handle_media_request(update, context, file_part, message.caption or "Проанализируй этот файл.")
+    except BadRequest as e:
+        if "File is too big" in str(e): await message.reply_text(f"❌ Файл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB).")
+        else: await message.reply_text(f"❌ Произошла ошибка Telegram: {e}")
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при обработке документа: {e}", exc_info=True)
+        await message.reply_text("❌ Произошла внутренняя ошибка при обработке документа.")
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, video, client = update.message, update.message.video, context.bot_data['gemini_client']
     if video.file_size > 50 * 1024 * 1024: return await message.reply_text("❌ Видеофайл слишком большой (> 50 MB).")
+    if video.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
+        return await message.reply_text(f"❌ Видеофайл больше {TELEGRAM_FILE_LIMIT_MB} МБ.")
+    
     await message.reply_text("Загружаю видео...", reply_to_message_id=message.message_id)
-    video_file = await video.get_file()
-    video_bytes = await video_file.download_as_bytearray()
-    video_part = await upload_and_wait_for_file(client, video_bytes, video.mime_type, video.file_name or "video.mp4")
-    await handle_media_request(update, context, video_part, message.caption or "Проанализируй этот файл.")
+    try:
+        video_file = await video.get_file()
+        video_bytes = await video_file.download_as_bytearray()
+        video_part = await upload_and_wait_for_file(client, video_bytes, video.mime_type, video.file_name or "video.mp4")
+        await handle_media_request(update, context, video_part, message.caption or "Проанализируй этот файл.")
+    except BadRequest as e:
+        if "File is too big" in str(e): await message.reply_text(f"❌ Видеофайл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB).")
+        else: await message.reply_text(f"❌ Произошла ошибка Telegram: {e}")
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при обработке видео: {e}", exc_info=True)
+        await message.reply_text("❌ Произошла внутренняя ошибка при обработке видео.")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_source=None):
     message, client = update.message, context.bot_data['gemini_client']
     audio = audio_source or message.audio or message.voice
     if not audio: return
+    if audio.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
+         return await message.reply_text(f"❌ Аудиофайл больше {TELEGRAM_FILE_LIMIT_MB} МБ.")
+
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
     user_text = message.caption or "Проанализируй суть этого аудио и дай содержательный ответ. Полную транскрипцию предоставляй только по прямой просьбе со словами 'транскрипт' или 'дословно'."
-    audio_file = await audio.get_file()
-    audio_bytes = await audio_file.download_as_bytearray()
-    audio_part = await upload_and_wait_for_file(client, audio_bytes, audio.mime_type, file_name)
-    await handle_media_request(update, context, audio_part, user_text)
+    
+    try:
+        audio_file = await audio.get_file()
+        audio_bytes = await audio_file.download_as_bytearray()
+        audio_part = await upload_and_wait_for_file(client, audio_bytes, audio.mime_type, file_name)
+        await handle_media_request(update, context, audio_part, user_text)
+    except BadRequest as e:
+        if "File is too big" in str(e): await message.reply_text(f"❌ Аудиофайл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB).")
+        else: await message.reply_text(f"❌ Произошла ошибка Telegram: {e}")
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка при обработке аудио: {e}", exc_info=True)
+        await message.reply_text("❌ Произошла внутренняя ошибка при обработке аудио.")
 
 async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, text = update.message, update.message.text or ""
     match = re.search(YOUTUBE_REGEX, text)
     if not match: return
+    
     youtube_url = f"https://www.youtube.com/watch?v={match.group(1)}"
     await message.reply_text("Анализирую видео с YouTube...", reply_to_message_id=message.message_id)
-    youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
-    user_prompt = text.replace(match.group(0), "").strip() or "Проанализируй это видео."
-    await handle_media_request(update, context, youtube_part, user_prompt)
+    try:
+        youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
+        user_prompt = text.replace(match.group(0), "").strip() or "Проанализируй это видео."
+        await handle_media_request(update, context, youtube_part, user_prompt)
+    except Exception as e:
+        logger.error(f"Ошибка при обработке YouTube URL {youtube_url}: {e}", exc_info=True)
+        await message.reply_text("❌ Не удалось обработать ссылку на YouTube. Возможно, видео недоступно или имеет ограничения.")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('last_media_context', None)
@@ -603,10 +721,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_request(update, context, content_parts, is_media_request=is_media_follow_up)
 
 # --- ЗАПУСК БОТА ---
+async def handle_health_check(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    logger.info("Health check OK")
+    return aiohttp.web.Response(text="OK", status=200)
+    
 async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
     application = request.app['bot_app']
     try:
-        data = await request.json(); update = Update.de_json(data, application.bot)
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
         await application.process_update(update)
         return aiohttp.web.Response(status=200)
     except Exception as e:
@@ -617,11 +740,14 @@ async def run_web_server(application: Application, stop_event: asyncio.Event):
     app = aiohttp.web.Application()
     app['bot_app'] = application
     app.router.add_post('/' + GEMINI_WEBHOOK_PATH.strip('/'), handle_telegram_webhook)
+    app.router.add_get('/', handle_health_check) 
+    
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
-    site = aiohttp.web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", "10000")))
+    port = int(os.getenv("PORT", "10000"))
+    site = aiohttp.web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"Веб-сервер запущен на порту {os.getenv('PORT', '10000')}")
+    logger.info(f"Веб-сервер запущен на порту {port}")
     await stop_event.wait()
     await runner.cleanup()
     
@@ -632,16 +758,22 @@ async def main():
     application = builder.build()
     
     await application.initialize()
-    application.bot_data['gemini_client'] = genai.Client(api_key=GOOGLE_API_KEY)
+
+    http_client = httpx.AsyncClient()
+    application.bot_data['http_client'] = http_client
+
+    genai.configure(api_key=GOOGLE_API_KEY)
+    application.bot_data['gemini_client'] = genai.FileClient()
+    application.bot_data['gemini_model'] = genai.GenerativeModel(MODEL_NAME)
     
     commands = [
         BotCommand("start", "Инфо и начало работы"),
-        BotCommand("config", "Настроить режим и поиск"),
+        BotCommand("config", "Настроить поиск"),
         BotCommand("transcript", "Транскрипция медиа (ответом)"),
         BotCommand("summarize", "Краткий пересказ (ответом)"),
         BotCommand("keypoints", "Ключевые тезисы (ответом)"),
-        BotCommand("newtopic", "Сбросить контекст файлов"),
-        BotCommand("clear", "Очистить всю историю чата")
+        BotCommand("newtopic", "Сбросить контекст и историю"),
+        BotCommand("clear", "Полностью очистить чат")
     ]
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("config", config_command))
@@ -658,7 +790,7 @@ async def main():
     application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(YOUTUBE_REGEX), handle_youtube_url))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(URL_REGEX), handle_url))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Entity("url"), handle_url))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     await application.bot.set_my_commands(commands)
@@ -673,6 +805,7 @@ async def main():
         await run_web_server(application, stop_event)
     finally:
         logger.info("Начало штатной остановки...")
+        await http_client.aclose()
         if persistence: persistence.close()
         logger.info("Приложение полностью остановлено.")
 
