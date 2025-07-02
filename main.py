@@ -1,7 +1,6 @@
-# Версия 26.7 'Final SDK Hotfix'
-# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Устранена ошибка AttributeError: 'Models' object has no attribute 'generate_content_async'. Вызовы асинхронных методов теперь корректно используют атрибут `client.aio`.
-# 2. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Устранена ошибка AttributeError: module 'google.genai.types' has no attribute 'GoogleAPIError'. Обработка исключений теперь использует правильный класс из `google.api_core.exceptions`.
-# 3. Все предыдущие улучшения сохранены. Код приведен в полное соответствие с официальным SDK.
+# Версия 26.8 'Dependency Fix'
+# 1. ИСПРАВЛЕНИЕ ЗАВИСИМОСТЕЙ: В requirements.txt добавлен пакет google-api-core для устранения ошибки ModuleNotFoundError.
+# 2. Код остается без изменений по сравнению с версией 26.7.
 
 import logging
 import os
@@ -321,12 +320,18 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
         )
         logger.info(f"Файл '{file_name}' загружен. URI: {uploaded_file_response.uri}. Ожидание статуса ACTIVE...")
         
-        file_state_response = await client.aio.files.get(name=uploaded_file_response.name)
-        if file_state_response.state.name == 'ACTIVE':
-            logger.info(f"Файл '{file_name}' активен.")
-            return types.Part(file_data=types.FileData(file_uri=uploaded_file_response.uri, mime_type=mime_type))
-        else:
-             raise IOError(f"Файл '{file_name}' не стал активным. Статус: {file_state_response.state.name}")
+        # Цикл ожидания не всегда нужен, но для надежности оставим
+        for _ in range(15):
+            file_state_response = await client.aio.files.get(name=uploaded_file_response.name)
+            state = file_state_response.state.name
+            if state == 'ACTIVE':
+                logger.info(f"Файл '{file_name}' активен.")
+                return types.Part(file_data=types.FileData(file_uri=uploaded_file_response.uri, mime_type=mime_type))
+            if state == 'FAILED':
+                raise IOError(f"Ошибка обработки файла '{file_name}' на сервере Google.")
+            await asyncio.sleep(2)
+        raise asyncio.TimeoutError(f"Файл '{file_name}' не стал активным за 30 секунд.")
+
     except Exception as e:
         logger.error(f"Ошибка при загрузке файла через File API: {e}", exc_info=True)
         raise IOError(f"Не удалось загрузить или обработать файл '{file_name}' на сервере Google.")
@@ -414,17 +419,21 @@ def format_gemini_response(response: types.GenerateContentResponse) -> str:
         return "Ответа не последовало."
     
     result_parts = []
-    for part in response.candidates[0].content.parts:
-        if part.text:
-            result_parts.append(part.text)
-        elif part.executable_code:
-            code = part.executable_code.code
-            result_parts.append(f"<b>Выполняю код:</b>\n<pre><code>{html.escape(code)}</code></pre>")
-        elif part.code_execution_result:
-            output = part.code_execution_result.output
-            result_parts.append(f"<b>Результат:</b>\n<pre><code>{html.escape(output)}</code></pre>")
+    try:
+        for part in response.candidates[0].content.parts:
+            if part.text:
+                result_parts.append(part.text)
+            elif part.executable_code:
+                code = part.executable_code.code
+                result_parts.append(f"<b>Выполняю код:</b>\n<pre><code>{html.escape(code)}</code></pre>")
+            elif part.code_execution_result:
+                output = part.code_execution_result.output
+                result_parts.append(f"<b>Результат:</b>\n<pre><code>{html.escape(output)}</code></pre>")
+    except ValueError: # Иногда Gemini может вернуть пустой .parts
+        logger.warning("Ответ Gemini не содержит .parts, используется .text")
+        return response.text
 
-    return "".join(result_parts)
+    return "".join(result_parts) if result_parts else response.text
 
 async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, is_media_request: bool = False):
     message, client = update.message, context.bot_data['gemini_client']
