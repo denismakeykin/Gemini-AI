@@ -1,6 +1,7 @@
-# Версия 27.1 'Prompt Tuning'
-# 1. ИЗМЕНЕНО: Обновлены промпты по умолчанию для всех обработчиков медиа согласно требованиям.
-# 2. Все предыдущие улучшения (двухступенчатый поиск, исправление зависаний, переменные GOOGLE_CSE_ID) сохранены и интегрированы.
+# Версия 27.3 'Prompt Signal Tuning'
+# 1. ИЗМЕНЕНО: Обновлена логика формирования промпта. Теперь результаты проактивного поиска не передаются модели,
+#    а используется только как сигнал для активации встроенного инструмента Grounding with Google Search.
+# 2. Все предыдущие исправления (единый клиент, обработка ошибок и т.д.) сохранены.
 
 import logging
 import os
@@ -257,17 +258,17 @@ def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_i
             break
     return None
 
-async def upload_and_wait_for_file(client: genai.FileClient, file_bytes: bytes, mime_type: str, file_name: str) -> types.Part:
+async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime_type: str, file_name: str) -> types.Part:
     logger.info(f"Загрузка файла '{file_name}' ({len(file_bytes) / 1024:.2f} KB) через File API...")
     try:
-        upload_response = await client.upload_file_async(
-            path=io.BytesIO(file_bytes),
+        upload_response = await client.aio.files.upload(
+            file=io.BytesIO(file_bytes),
             mime_type=mime_type,
             display_name=file_name
         )
-        logger.info(f"Файл '{file_name}' загружен. URI: {upload_response.uri}. Ожидание статуса ACTIVE...")
+        logger.info(f"Файл '{file_name}' загружен. Имя: {upload_response.name}. Ожидание статуса ACTIVE...")
         
-        file_response = await client.get_file_async(name=upload_response.name)
+        file_response = await client.aio.files.get(name=upload_response.name)
         
         for _ in range(15):
             if file_response.state.name == 'ACTIVE':
@@ -276,7 +277,7 @@ async def upload_and_wait_for_file(client: genai.FileClient, file_bytes: bytes, 
             if file_response.state.name == 'FAILED':
                 raise IOError(f"Ошибка обработки файла '{file_name}' на сервере Google.")
             await asyncio.sleep(2)
-            file_response = await client.get_file_async(name=upload_response.name)
+            file_response = await client.aio.files.get(name=upload_response.name)
 
         raise asyncio.TimeoutError(f"Файл '{file_name}' не стал активным за 30 секунд.")
 
@@ -285,7 +286,6 @@ async def upload_and_wait_for_file(client: genai.FileClient, file_bytes: bytes, 
         raise IOError(f"Не удалось загрузить или обработать файл '{file_name}' на сервере Google.")
 
 async def perform_proactive_search(query: str) -> str | None:
-    # Этап 1: Попытка поиска через DuckDuckGo
     try:
         logger.info(f"Проактивный поиск (Этап 1: DDG) по запросу: '{query}'")
         async with DDGS() as ddgs:
@@ -297,7 +297,6 @@ async def perform_proactive_search(query: str) -> str | None:
     except Exception as e:
         logger.warning(f"Проактивный поиск DDG не удался: {e}. Перехожу к Google Custom Search.")
 
-    # Этап 2: Попытка поиска через Google Custom Search (если DDG не удался)
     if GOOGLE_API_KEY and GOOGLE_CSE_ID:
         try:
             logger.info(f"Проактивный поиск (Этап 2: Google) по запросу: '{query}'")
@@ -317,19 +316,21 @@ async def perform_proactive_search(query: str) -> str | None:
 
     return None
 
-async def generate_response(model: genai.GenerativeModel, request_contents: list, context: ContextTypes.DEFAULT_TYPE) -> types.GenerateContentResponse | str:
+async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE) -> types.GenerateContentResponse | str:
     chat_id = context.chat_data.get('id', 'Unknown')
     
-    generation_config = types.GenerationConfig(temperature=0.7)
-    system_instruction = types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)])
+    config = types.GenerateContentConfig(
+        safety_settings=SAFETY_SETTINGS, 
+        tools=CORE_TOOLS,
+        system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)]),
+        temperature=0.7
+    )
     
     try:
-        response = await model.generate_content_async(
+        response = await client.aio.models.generate_content(
+            model=MODEL_NAME,
             contents=request_contents,
-            generation_config=generation_config,
-            safety_settings=SAFETY_SETTINGS,
-            tools=CORE_TOOLS,
-            system_instruction=system_instruction
+            config=config
         )
         logger.info(f"ChatID: {chat_id} | Ответ от Gemini API получен.")
         return response
@@ -412,7 +413,7 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
         context.chat_data["history"] = chat_history[-MAX_HISTORY_ITEMS:]
 
 async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, is_media_request: bool = False):
-    message, gemini_model = update.message, context.bot_data['gemini_model']
+    message, client = update.message, context.bot_data['gemini_client']
     user = message.from_user
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
@@ -424,22 +425,23 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         if text_part_index != -1:
             original_text = request_specific_parts[text_part_index].text
             
-            search_context = ""
+            # ИЗМЕНЕНО: Этот блок заменен согласно твоему запросу
+            search_context_str = ""
             if get_user_setting(context, 'proactive_search', True) and not is_media_request:
                 search_results = await perform_proactive_search(original_text)
                 if search_results:
-                    search_context = f"\n\n-Результаты интернет-поиска.-\n"
+                    search_context_str = f"\n\n---Результаты интернет-поиска---\n"
 
             user_prefix = f"[{user.id}; Name: {user.first_name}]: "
             final_prompt_text = f"{user_prefix}{original_text}"
-            if search_context:
-                final_prompt_text += f"\n\n<b>ВАЖНО:</b>Твои знания могли устареть. Учитывая текущую дату и время, АКТИВНО используй Grounding with Google Search, чтобы перепроверить предоставленные и найти актуальные ВСЕВОЗМОЖНЫЕ и ВСЕСТОРОННИЕ ДАННЫЕ, СОХРАНЯЯ все источники. Используй как ЧАСТЬ СВОИХ ЗНАНИЙ.\n{search_context}"
+            if search_context_str:
+                final_prompt_text += f"\n\n<b>ВАЖНО:</b>Твои знания могли устареть. Учитывая текущую дату и время, АКТИВНО используй Grounding with Google Search, чтобы перепроверить предоставленные и найти актуальные ВСЕВОЗМОЖНЫЕ и ВСЕСТОРОННИЕ ДАННЫЕ, СОХРАНЯЯ все источники. Используй как ЧАСТЬ СВОИХ ЗНАНИЙ.\n{search_context_str}"
             
             request_specific_parts[text_part_index].text = final_prompt_text
 
         request_contents = history + [types.Content(parts=request_specific_parts, role="user")]
         
-        response_obj = await generate_response(gemini_model, request_contents, context)
+        response_obj = await generate_response(client, request_contents, context)
         
         if isinstance(response_obj, str):
             reply_text = response_obj
@@ -545,8 +547,7 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
     media_obj = replied_message.audio or replied_message.voice or replied_message.video or replied_message.photo or replied_message.document
     
     media_part = None
-    file_client = context.bot_data['gemini_file_client']
-    gemini_model = context.bot_data['gemini_model']
+    client = context.bot_data['gemini_client']
     
     try:
         if media_obj:
@@ -554,7 +555,7 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
                 return await update.message.reply_text(f"❌ Файл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB) для обработки этой командой.")
             media_file = await media_obj.get_file()
             media_bytes = await media_file.download_as_bytearray()
-            media_part = await upload_and_wait_for_file(file_client, media_bytes, media_obj.mime_type, getattr(media_obj, 'file_name', 'media.bin'))
+            media_part = await upload_and_wait_for_file(client, media_bytes, media_obj.mime_type, getattr(media_obj, 'file_name', 'media.bin'))
         elif replied_message.text:
             yt_match = re.search(YOUTUBE_REGEX, replied_message.text)
             if yt_match:
@@ -569,7 +570,7 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
         
         content_parts = [media_part, types.Part(text=prompt)]
         
-        response_obj = await generate_response(gemini_model, [types.Content(parts=content_parts, role="user")], context)
+        response_obj = await generate_response(client, [types.Content(parts=content_parts, role="user")], context)
         result_text = format_gemini_response(response_obj) if isinstance(response_obj, types.GenerateContentResponse) else response_obj
         await send_reply(update.message, result_text)
     
@@ -599,14 +600,14 @@ async def handle_media_request(update: Update, context: ContextTypes.DEFAULT_TYP
     await process_request(update, context, content_parts, is_media_request=True)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, file_client = update.message, context.bot_data['gemini_file_client']
+    message, client = update.message, context.bot_data['gemini_client']
     try:
         photo = message.photo[-1]
         if photo.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
             return await message.reply_text(f"❌ Изображение слишком большое (> {TELEGRAM_FILE_LIMIT_MB} MB).")
         photo_file = await photo.get_file()
         photo_bytes = await photo_file.download_as_bytearray()
-        file_part = await upload_and_wait_for_file(file_client, photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
+        file_part = await upload_and_wait_for_file(client, photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
         await handle_media_request(update, context, file_part, message.caption or "Проанализируй изображение и выскажи свое мнение.")
     except BadRequest as e:
         if "File is too big" in str(e):
@@ -619,7 +620,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Произошла внутренняя ошибка при обработке изображения.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, doc, file_client = update.message, update.message.document, context.bot_data['gemini_file_client']
+    message, doc, client = update.message, update.message.document, context.bot_data['gemini_client']
     if doc.file_size > 50 * 1024 * 1024: return await message.reply_text("❌ Файл слишком большой (> 50 MB).")
     if doc.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
         return await message.reply_text(f"❌ Файл больше {TELEGRAM_FILE_LIMIT_MB} МБ. Я не могу скачать его для анализа.")
@@ -630,7 +631,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         doc_file = await doc.get_file()
         doc_bytes = await doc_file.download_as_bytearray()
-        file_part = await upload_and_wait_for_file(file_client, doc_bytes, doc.mime_type, doc.file_name or "document")
+        file_part = await upload_and_wait_for_file(client, doc_bytes, doc.mime_type, doc.file_name or "document")
         await handle_media_request(update, context, file_part, message.caption or "Проанализируй документ и выскажи свое мнение.")
     except BadRequest as e:
         if "File is too big" in str(e): await message.reply_text(f"❌ Файл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB).")
@@ -642,7 +643,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Внутренняя ошибка при обработке документа.")
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, video, file_client = update.message, update.message.video, context.bot_data['gemini_file_client']
+    message, video, client = update.message, update.message.video, context.bot_data['gemini_client']
     if video.file_size > 50 * 1024 * 1024: return await message.reply_text("❌ Видеофайл слишком большой (> 50 MB).")
     if video.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
         return await message.reply_text(f"❌ Видеофайл больше {TELEGRAM_FILE_LIMIT_MB} МБ.")
@@ -651,7 +652,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         video_file = await video.get_file()
         video_bytes = await video_file.download_as_bytearray()
-        video_part = await upload_and_wait_for_file(file_client, video_bytes, video.mime_type, video.file_name or "video.mp4")
+        video_part = await upload_and_wait_for_file(client, video_bytes, video.mime_type, video.file_name or "video.mp4")
         await handle_media_request(update, context, video_part, message.caption or "Проанализируй видео и выскажи свое мнение.")
     except BadRequest as e:
         if "File is too big" in str(e): await message.reply_text(f"❌ Видеофайл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB).")
@@ -663,19 +664,19 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Внутренняя ошибка при обработке видео.")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_source=None):
-    message, file_client = update.message, context.bot_data['gemini_file_client']
+    message, client = update.message, context.bot_data['gemini_client']
     audio = audio_source or message.audio or message.voice
     if not audio: return
     if audio.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
          return await message.reply_text(f"❌ Аудиофайл больше {TELEGRAM_FILE_LIMIT_MB} МБ.")
 
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
-    user_text = message.caption or "Проанализируй аудио и выскажи свое мнение. Предоставляй транскрипт только при запросах со словами 'транскрипт' или 'дословно'."
+    user_text = message.caption or "Проанализируй аудио и выскажи свое мнение. Предоставь транскрипт только по запросу со словами 'транскрипт' или 'дословно'."
     
     try:
         audio_file = await audio.get_file()
         audio_bytes = await audio_file.download_as_bytearray()
-        audio_part = await upload_and_wait_for_file(file_client, audio_bytes, audio.mime_type, file_name)
+        audio_part = await upload_and_wait_for_file(client, audio_bytes, audio.mime_type, file_name)
         await handle_media_request(update, context, audio_part, user_text)
     except BadRequest as e:
         if "File is too big" in str(e): await message.reply_text(f"❌ Аудиофайл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB).")
@@ -773,9 +774,7 @@ async def main():
     
     await application.initialize()
     
-    genai.configure(api_key=GOOGLE_API_KEY)
-    application.bot_data['gemini_file_client'] = genai.FileClient()
-    application.bot_data['gemini_model'] = genai.GenerativeModel(MODEL_NAME)
+    application.bot_data['gemini_client'] = genai.Client(api_key=GOOGLE_API_KEY)
     
     commands = [
         BotCommand("start", "Инфо и начало работы"),
