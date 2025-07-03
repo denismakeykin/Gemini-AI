@@ -435,7 +435,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             user_prefix = f"[{user.id}; Name: {user.first_name}]: "
             final_prompt_text = f"{user_prefix}{original_text}"
             if search_context_str:
-                final_prompt_text += f"\n\n<b>ВАЖНО:</b>Твои знания могли устареть. Учитывая текущую дату и время, АКТИВНО используй Grounding with Google Search, чтобы перепроверить предоставленные и найти актуальные ВСЕВОЗМОЖНЫЕ и ВСЕСТОРОННИЕ ДАННЫЕ, СОХРАНЯЯ все источники. Используй как ЧАСТЬ СВОИХ ЗНАНИЙ.\n{search_context_str}"
+                final_prompt_text += f"\n\n<b>ВАЖНО:</b>Учитывая текущую дату и время, АКТИВНО используй Grounding with Google Search.\n{search_context_str}"
             
             request_specific_parts[text_part_index].text = final_prompt_text
 
