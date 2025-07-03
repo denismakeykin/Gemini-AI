@@ -1,4 +1,4 @@
-# Версия 2 'Custom vrs'
+# Версия 2.4 (основана на 'Custom vrs' с учетом пожеланий и правок автора)
 
 import logging
 import os
@@ -15,7 +15,6 @@ import datetime
 import pytz
 import html
 
-import httpx
 import aiohttp
 import aiohttp.web
 from telegram import Update, Message, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,8 +24,6 @@ from telegram.error import BadRequest
 
 from google import genai
 from google.genai import types
-from googleapiclient.discovery import build
-from duckduckgo_search import DDGS
 
 # --- КОНФИГУРАЦИЯ ---
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -38,14 +35,10 @@ GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 DATABASE_URL = os.getenv('DATABASE_URL')
 WEBHOOK_HOST = os.getenv('WEBHOOK_HOST')
 GEMINI_WEBHOOK_PATH = os.getenv('GEMINI_WEBHOOK_PATH')
-GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID')
 
 if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PATH]):
     logger.critical("Критическая ошибка: не заданы все необходимые переменные окружения для базовой работы!")
     exit(1)
-
-if not GOOGLE_CSE_ID:
-    logger.warning("Переменная GOOGLE_CSE_ID для Google Custom Search не задана. Проактивный поиск будет работать только через DDG.")
 
 # --- КОНСТАНТЫ И НАСТРОЙКИ ---
 MODEL_NAME = 'gemini-2.5-flash'
@@ -72,7 +65,7 @@ try:
     logger.info("Системный промпт успешно загружен из файла.")
 except FileNotFoundError:
     logger.error("Файл system_prompt.md не найден! Будет использована инструкция по умолчанию.")
-    SYSTEM_INSTRUCTION = """КРИТИЧЕСКОЕ ПРАВИЛО: Если в промпте присутствует блок '--- Контекст из веба ---', ты ОБЯЗАН основывать свой ответ ИСКЛЮЧИТЕЛЬНО на информации из этого блока. Информация в этом блоке всегда имеет наивысший приоритет и переопределяет любые твои внутренние знания. Если эта информация противоречит твоим данным, доверься ей, а не себе."""
+    SYSTEM_INSTRUCTION = """Ты - Женя, дружелюбный и полезный ассистент. Всегда используй поиск Google для проверки фактов и получения актуальной информации."""
 
 # --- КЛАСС PERSISTENCE ---
 class PostgresPersistence(BasePersistence):
@@ -173,6 +166,9 @@ class PostgresPersistence(BasePersistence):
         if self.db_pool: self.db_pool.closeall()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
+    return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
+
 def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value): return context.chat_data.get(key, default_value)
 def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value): context.chat_data[key] = value
 
@@ -282,45 +278,17 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
         logger.error(f"Ошибка при загрузке файла через File API: {e}", exc_info=True)
         raise IOError(f"Не удалось загрузить или обработать файл '{file_name}' на сервере Google.")
 
-async def perform_proactive_search(query: str) -> str | None:
-    try:
-        logger.info(f"Проактивный поиск (Этап 1: DDG) по запросу: '{query}'")
-        async with DDGS() as ddgs:
-            results = [r async for r in ddgs.text(keywords=query, region='ru-ru', max_results=3)]
-        if results:
-            snippets = "\n".join(f"- {r['body']}" for r in results)
-            logger.info("Проактивный поиск: Успешно получены сниппеты из DuckDuckGo.")
-            return snippets
-    except Exception as e:
-        logger.warning(f"Проактивный поиск DDG не удался: {e}. Перехожу к Google Custom Search.")
-
-    if GOOGLE_API_KEY and GOOGLE_CSE_ID:
-        try:
-            logger.info(f"Проактивный поиск (Этап 2: Google) по запросу: '{query}'")
-            def search():
-                service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
-                res = service.cse().list(q=query, cx=GOOGLE_CSE_ID, num=3, lr='lang_ru').execute()
-                return res.get('items', [])
-            
-            search_results = await asyncio.to_thread(search)
-            
-            if search_results:
-                snippets = "\n".join(f"- {item.get('snippet', '')}" for item in search_results)
-                logger.info("Проактивный поиск: Успешно получены сниппеты из Google Custom Search.")
-                return snippets
-        except Exception as e:
-            logger.error(f"Проактивный поиск Google Custom Search также не удался: {e}")
-
-    return None
-
 async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE) -> types.GenerateContentResponse | str:
     chat_id = context.chat_data.get('id', 'Unknown')
+    thinking_mode = get_user_setting(context, 'thinking_mode', 'auto')
+    thinking_budget = -1 if thinking_mode == 'auto' else 24576
     
     config = types.GenerateContentConfig(
         safety_settings=SAFETY_SETTINGS, 
         tools=CORE_TOOLS,
         system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)]),
-        temperature=0.7
+        temperature=0.7,
+        thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget)
     )
     
     try:
@@ -331,8 +299,14 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         )
         logger.info(f"ChatID: {chat_id} | Ответ от Gemini API получен.")
         return response
+    # ## ИЗМЕНЕНО: Возвращена детальная обработка ошибок API из V1
     except types.GoogleAPIError as e:
         logger.error(f"ChatID: {chat_id} | Ошибка Google API: {e}", exc_info=True)
+        if hasattr(e, 'code'):
+             if e.code == 429: # ResourceExhausted
+                 return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
+             if e.code == 403: # PermissionDenied
+                 return "❌ <b>Ошибка доступа к файлу.</b>\nВозможно, файл был удален с серверов Google (срок хранения 48 часов) или возникла другая проблема. Попробуйте отправить файл заново."
         return f"❌ <b>Ошибка Google API:</b>\n<code>{html.escape(str(e))}</code>"
     except Exception as e:
         logger.error(f"ChatID: {chat_id} | Неизвестная ошибка генерации: {e}", exc_info=True)
@@ -347,15 +321,9 @@ def format_gemini_response(response: types.GenerateContentResponse) -> str:
         for part in response.candidates[0].content.parts:
             if part.text:
                 result_parts.append(part.text)
-            elif hasattr(part, 'executable_code') and part.executable_code:
-                code = part.executable_code.code
-                result_parts.append(f"<b>Выполняю код:</b>\n<pre><code>{html.escape(code)}</code></pre>")
-            elif hasattr(part, 'code_execution_result') and part.code_execution_result:
-                output = part.code_execution_result.output
-                result_parts.append(f"<b>Результат:</b>\n<pre><code>{html.escape(output)}</code></pre>")
     
     if not result_parts:
-        return response.text if response.text else "Получен пустой ответ от модели."
+        return getattr(response, 'text', "Получен пустой ответ от модели.")
 
     return "".join(result_parts)
 
@@ -385,21 +353,20 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     chat_history = context.chat_data.setdefault("history", [])
     
     processed_parts = []
+    text_from_parts = next((p.text for p in parts if p.text), None)
+    
     if role == 'model':
-        text_part = next((p.text for p in parts if p.text), None)
-        if text_part:
+        if text_from_parts:
             if kwargs.get('is_media_response'):
                 processed_parts.append(types.Part(text="[Был дан ответ на медиа-запрос]"))
-            elif len(text_part) > MAX_HISTORY_RESPONSE_LEN:
-                text_to_save = (text_part[:MAX_HISTORY_RESPONSE_LEN] + "...")
+            elif len(text_from_parts) > MAX_HISTORY_RESPONSE_LEN:
+                text_to_save = (text_from_parts[:MAX_HISTORY_RESPONSE_LEN] + "...")
                 logger.info(f"Ответ модели для чата {context.chat_data.get('id')} был обрезан для сохранения в историю.")
                 processed_parts.append(types.Part(text=text_to_save))
             else:
-                processed_parts.append(types.Part(text=text_part))
+                processed_parts.append(types.Part(text=text_from_parts))
     elif role == 'user':
-        text_part = next((p.text for p in parts if p.text), None)
-        if text_part:
-            processed_parts.append(types.Part(text=text_part))
+        processed_parts.extend(parts)
 
     serializable_parts = [part_to_dict(p) for p in processed_parts if p]
     if not serializable_parts: return
@@ -419,20 +386,21 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         
         request_specific_parts = list(content_parts)
         text_part_index = next((i for i, part in enumerate(request_specific_parts) if part.text), -1)
+        
         if text_part_index != -1:
             original_text = request_specific_parts[text_part_index].text
             
-            # ИЗМЕНЕНО: Этот блок заменен согласно твоему запросу
-            search_context_str = ""
-            if get_user_setting(context, 'proactive_search', True) and not is_media_request:
-                search_results = await perform_proactive_search(original_text)
-                if search_results:
-                    search_context_str = f"\n\n---Сниппеты из результатов интернет-поиска---\n{search_results}\n---\n"
-
             user_prefix = f"[{user.id}; Name: {user.first_name}]: "
-            final_prompt_text = f"{user_prefix}{original_text}"
-            if search_context_str:
-                final_prompt_text += f"\n\n<b>ВАЖНО:</b>ОБЯЗАТЕЛЬНЫЙ Grounding with Google Search: Учитывая текущую дату и время, АКТИВНО используй встроенный поиск а интернете, чтобы перепроверить предоставленные и найти актуальные ВСЕВОЗМОЖНЫЕ и ВСЕСТОРОННИЕ ДАННЫЕ, СОХРАНЯЯ все источники. Используй как ЧАСТЬ СВОИХ ЗНАНИЙ.\n{search_context_str}"
+            is_first_message = not bool(history)
+            
+            date_prefix = f"(System Note: Today is {get_current_time_str()}. Verify facts. "
+            if not is_first_message:
+                date_prefix += "This is an ongoing conversation, do not greet the user.)\n"
+            else:
+                date_prefix += "This is the first message.)\n"
+
+            grounding_instruction = "\n<b>ВАЖНО:</b>ОБЯЗАТЕЛЬНЫЙ Grounding with Google Search: Учитывая текущую дату и время, АКТИВНО используй встроенный поиск а интернете, чтобы перепроверить предоставленные и найти актуальные ВСЕВОЗМОЖНЫЕ и ВСЕСТОРОННИЕ ДАННЫЕ, СОХРАНЯЯ все источники. Используй как ЧАСТЬ СВОИХ ЗНАНИЙ.\n"
+            final_prompt_text = f"{date_prefix}{user_prefix}{original_text}{grounding_instruction}"
             
             request_specific_parts[text_part_index].text = final_prompt_text
 
@@ -445,7 +413,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             full_response_for_history = reply_text
         else:
             reply_text = format_gemini_response(response_obj)
-            full_response_for_history = response_obj.text
+            full_response_for_history = reply_text
 
         sent_message = await send_reply(message, reply_text)
         
@@ -478,6 +446,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data.setdefault('thinking_mode', 'auto')
     start_text = """Я - Женя, интеллект новой Google Gemini 2.5 Flash с лучшим поиском:
 
 🌐 Обладаю глубокими знаниями во всех сферах и умно использую Google.
@@ -495,9 +464,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(start_text)
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    search = get_user_setting(context, 'proactive_search', True)
+    mode = get_user_setting(context, 'thinking_mode', 'auto')
     keyboard = [
-        [InlineKeyboardButton(f"Добавлять сниппеты DDG/GCS: {'✅ Вкл' if search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
+        [
+            InlineKeyboardButton(f"Мышление: {'✅ ' if mode == 'auto' else ''}Авто", callback_data="set_thinking_auto"),
+            InlineKeyboardButton(f"Мышление: {'✅ ' if mode == 'max' else ''}Максимум", callback_data="set_thinking_max")
+        ]
     ]
     await update.message.reply_text("⚙️ Настройки:", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -505,17 +477,20 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query, data = update.callback_query, update.callback_query.data
     await query.answer()
     
-    current_search = get_user_setting(context, 'proactive_search', True)
+    current_mode = get_user_setting(context, 'thinking_mode', 'auto')
 
-    if data == "toggle_proactive_search":
-        set_user_setting(context, 'proactive_search', not current_search)
-        
-    new_search = get_user_setting(context, 'proactive_search', True)
+    if data.startswith("set_thinking_"):
+        new_mode_val = data.replace("set_thinking_", "")
+        set_user_setting(context, 'thinking_mode', new_mode_val)
 
-    if current_search == new_search: return
+    new_mode = get_user_setting(context, 'thinking_mode', 'auto')
+    if current_mode == new_mode: return
 
     keyboard = [
-        [InlineKeyboardButton(f"Добавлять сниппеты DDG/GCS: {'✅ Вкл' if new_search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
+        [
+            InlineKeyboardButton(f"Мышление: {'✅ ' if new_mode == 'auto' else ''}Авто", callback_data="set_thinking_auto"),
+            InlineKeyboardButton(f"Мышление: {'✅ ' if new_mode == 'max' else ''}Максимум", callback_data="set_thinking_max")
+        ]
     ]
     try:
         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
@@ -525,9 +500,12 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat:
+        chat_id = update.effective_chat.id
         context.chat_data.clear()
-        await context.application.persistence.drop_chat_data(update.effective_chat.id)
-        await update.message.reply_text("История чата и связанные данные очищены.")
+        context.chat_data['id'] = chat_id
+        context.chat_data.setdefault('thinking_mode', 'auto')
+        await context.application.persistence.update_chat_data(chat_id, context.chat_data)
+        await update.message.reply_text("История чата и связанные данные очищены. Настройки сброшены по умолчанию.")
     else:
         logger.warning("Не удалось определить chat_id для команды /clear")
 
@@ -650,7 +628,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_file = await video.get_file()
         video_bytes = await video_file.download_as_bytearray()
         video_part = await upload_and_wait_for_file(client, video_bytes, video.mime_type, video.file_name or "video.mp4")
-        await handle_media_request(update, context, video_part, message.caption or "Проанализируй видео и выскажи свое мнение.")
+        await handle_media_request(update, context, video_part, message.caption or "Проанализируй видео и выскажи свое мнение. Не указывай таймкоды без просьбы. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'.")
     except BadRequest as e:
         if "File is too big" in str(e): await message.reply_text(f"❌ Видеофайл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB).")
         else:
@@ -668,7 +646,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
          return await message.reply_text(f"❌ Аудиофайл больше {TELEGRAM_FILE_LIMIT_MB} МБ.")
 
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
-    user_text = message.caption or "Проанализируй аудио и выскажи свое мнение. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'."
+    user_text = message.caption or "Проанализируй аудио и выскажи свое мнение. Не указывай таймкоды без просьбы. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'."
     
     try:
         audio_file = await audio.get_file()
@@ -693,7 +671,7 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await message.reply_text("Анализирую видео с YouTube...", reply_to_message_id=message.id)
     try:
         youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
-        user_prompt = text.replace(match.group(0), "").strip() or "Проанализируй YouTube-видео и выскажи свое мнение."
+        user_prompt = text.replace(match.group(0), "").strip() or "Проанализируй YouTube-видео и выскажи свое мнение. Не указывай таймкоды без просьбы. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'."
         await handle_media_request(update, context, youtube_part, user_prompt)
     except Exception as e:
         logger.error(f"Ошибка при обработке YouTube URL {youtube_url}: {e}", exc_info=True)
@@ -775,7 +753,7 @@ async def main():
     
     commands = [
         BotCommand("start", "Инфо и начало работы"),
-        BotCommand("config", "Настроить мышление и поиск"),
+        BotCommand("config", "Настроить силу мышления"),
         BotCommand("transcript", "Транскрипция медиа (ответом)"),
         BotCommand("summarize", "Краткий пересказ (ответом)"),
         BotCommand("keypoints", "Ключевые тезисы (ответом)"),
