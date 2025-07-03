@@ -1,7 +1,5 @@
-# Версия 26.1 'Final Stability & Cleanup'
-# 1. КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ (Ошибки API): Полностью переписан блок обработки исключений в `generate_response`. Теперь он корректно отлавливает все `GoogleAPIError`, включая 429 (ResourceExhausted) и 403 (PermissionDenied).
-# 2. УЛУЧШЕНО (Контекст): Внедрен механизм "протухания" медиа-контекста. Ссылки на файлы старше 47 часов больше не используются, что предотвращает ошибки PERMISSION_DENIED.
-# 3. Все остальные рабочие механики (Мультиконтекст, Амнезия истории, Персонализация) сохранены и отполированы.
+# Версия 26.2 'Organic-Style Integration'
+# 1. ИЗМЕНЕНО (Стиль ответов): Скорректирована формулировка промпта для проактивного поиска. Теперь модель получает инструкцию интегрировать найденную информацию как часть своих знаний, а не ссылаться на нее. Это делает ответы более естественными.
 
 import logging
 import os
@@ -216,7 +214,7 @@ def dict_to_part(part_dict: dict) -> types.Part | None:
     if part_dict.get('type') == 'text': return types.Part(text=part_dict.get('content', ''))
     if part_dict.get('type') == 'file':
         if time.time() - part_dict.get('timestamp', 0) > MEDIA_CONTEXT_TTL_SECONDS:
-            logger.info(f"Медиа-контекст {part_dict.get('uri')} протух и будет проигнорирован.")
+            logger.info(f"Медиа-контекст {part_dict.get('uri')} поврежден и будет проигнорирован.")
             return None
         return types.Part(file_data=types.FileData(file_uri=part_dict['uri'], mime_type=part_dict['mime']))
     return None
@@ -327,7 +325,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         logger.info(f"ChatID: {chat_id} | Ответ получен.")
         return response.text
     except genai_errors.GoogleAPIError as e:
-        error_code = getattr(e, 'error', {}).get('code')
+        error_code = getattr(getattr(e, 'error', None), 'code', None)
         if error_code == 429: # ResourceExhausted
             logger.warning(f"ChatID: {chat_id} | Достигнут лимит API. Ошибка: {e}")
             return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
@@ -356,7 +354,8 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         
         if get_user_setting(context, 'proactive_search', True) and not is_media_request:
             search_results = await perform_proactive_search(original_text)
-            search_context = f"\n\n--- Контекст из веба для справки ---\n{search_results}\n--------------------------\n" if search_results else ""
+            # ИЗМЕНЕНИЕ ЗДЕСЬ: Новая, более органичная формулировка для контекста
+            search_context = f"Твои знания могли устареть. Предоставлены результаты интернет-поиска. Учитывая текущую дату и время, АКТИВНО используй Grounding with Google Search, чтобы перепроверить предоставленные и найти актуальные ВСЕВОЗМОЖНЫЕ и ВСЕСТОРОННИЕ ДАННЫЕ, СОХРАНЯЯ все источники. Используй как ЧАСТЬ СВОИХ ЗНАНИЙ.:\n{search_results}\n\n" if search_results else ""
         else:
             search_context = ""
 
@@ -372,7 +371,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 
     request_contents = history + [types.Content(parts=request_specific_parts, role="user")]
 
-    # Ошибка IOError или TimeoutError будет поймана в хендлере выше, но на всякий случай оставим
     try:
         reply_text = await generate_response(client, request_contents, context, tools)
         sent_message = await send_reply(message, reply_text)
@@ -535,10 +533,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_file = await message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         file_part = await upload_and_wait_for_file(client, photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
-        await handle_media_request(update, context, file_part, message.caption or "Проанализируй этот файл.")
+        await handle_media_request(update, context, file_part, message.caption or "Проанализируй это изображение и выскажи мнение.")
     except (IOError, asyncio.TimeoutError) as e:
-        logger.error(f"Ошибка обработки фото: {e}")
-        await message.reply_text(f"❌ Не удалось обработать фото: {e}")
+        logger.error(f"Ошибка обработки изображения: {e}")
+        await message.reply_text(f"❌ Не удалось обработать изображение: {e}")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -552,7 +550,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc_file = await doc.get_file()
         doc_bytes = await doc_file.download_as_bytearray()
         file_part = await upload_and_wait_for_file(client, doc_bytes, doc.mime_type, doc.file_name or "document")
-        await handle_media_request(update, context, file_part, message.caption or "Проанализируй этот файл.")
+        await handle_media_request(update, context, file_part, message.caption or "Проанализируй этот документ и выскажи свое мнение.")
     except (IOError, asyncio.TimeoutError) as e:
         logger.error(f"Ошибка обработки документа: {e}")
         await message.reply_text(f"❌ Не удалось обработать документ: {e}")
@@ -568,7 +566,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_file = await video.get_file()
         video_bytes = await video_file.download_as_bytearray()
         video_part = await upload_and_wait_for_file(client, video_bytes, video.mime_type, video.file_name or "video.mp4")
-        await handle_media_request(update, context, video_part, message.caption or "Проанализируй этот файл.")
+        await handle_media_request(update, context, video_part, message.caption or "Проанализируй это видео и выскажи свое мнение.")
     except (IOError, asyncio.TimeoutError) as e:
         logger.error(f"Ошибка обработки видео: {e}")
         await message.reply_text(f"❌ Не удалось обработать видео: {e}")
@@ -582,7 +580,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
         if not audio: return
         
         file_name = getattr(audio, 'file_name', 'voice_message.ogg')
-        user_text = message.caption or "Проанализируй суть этого аудио и дай содержательный ответ. Полную транскрипцию предоставляй только по прямой просьбе со словами 'транскрипт' или 'дословно'."
+        user_text = message.caption or "Проанализируй это аудио и выскажи свое мнение. Транскрипцию предоставляй только по просьбе со словами 'транскрипт' или 'дословно'."
         audio_file = await audio.get_file()
         audio_bytes = await audio_file.download_as_bytearray()
         audio_part = await upload_and_wait_for_file(client, audio_bytes, audio.mime_type, file_name)
@@ -600,7 +598,7 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     youtube_url = f"https://www.youtube.com/watch?v={match.group(1)}"
     await message.reply_text("Анализирую видео с YouTube...", reply_to_message_id=message.message_id)
     youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
-    user_prompt = text.replace(match.group(0), "").strip() or "Проанализируй это видео."
+    user_prompt = text.replace(match.group(0), "").strip() or "Проанализируй это видео и выскажи свое мнение."
     await handle_media_request(update, context, youtube_part, user_prompt)
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
