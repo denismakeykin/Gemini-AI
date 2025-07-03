@@ -1,4 +1,4 @@
-# Версия 2.4 (основана на 'Custom vrs' с учетом пожеланий и правок автора)
+# Версия 2.5 (основана на 'Custom vrs' с учетом пожеланий и правок автора)
 
 import logging
 import os
@@ -376,6 +376,8 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     if len(chat_history) > MAX_HISTORY_ITEMS:
         context.chat_data["history"] = chat_history[-MAX_HISTORY_ITEMS:]
 
+# Версия 2.5 (основана на 'Custom vrs' с исправлением "лени" модели)
+
 async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, is_media_request: bool = False):
     message, client = update.message, context.bot_data['gemini_client']
     user = message.from_user
@@ -390,17 +392,24 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         if text_part_index != -1:
             original_text = request_specific_parts[text_part_index].text
             
+            # ## ИЗМЕНЕНО: Полная переработка логики промпта для принудительного поиска
+            
             user_prefix = f"[{user.id}; Name: {user.first_name}]: "
             is_first_message = not bool(history)
             
-            date_prefix = f"(System Note: Today is {get_current_time_str()}. Verify facts. "
+            # 1. Системная заметка о дате и контексте диалога
+            date_prefix = f"(System Note: Today is {get_current_time_str()}. "
             if not is_first_message:
                 date_prefix += "This is an ongoing conversation, do not greet the user.)\n"
             else:
                 date_prefix += "This is the first message.)\n"
 
-            grounding_instruction = "\n<b>ВАЖНО:</b>ОБЯЗАТЕЛЬНЫЙ Grounding with Google Search: Учитывая текущую дату и время, АКТИВНО используй встроенный поиск а интернете, чтобы перепроверить предоставленные и найти актуальные ВСЕВОЗМОЖНЫЕ и ВСЕСТОРОННИЕ ДАННЫЕ, СОХРАНЯЯ все источники. Используй как ЧАСТЬ СВОИХ ЗНАНИЙ.\n"
-            final_prompt_text = f"{date_prefix}{user_prefix}{original_text}{grounding_instruction}"
+            # 2. Критическое, безапелляционное правило поиска, которое идет ПЕРЕД запросом пользователя
+            grounding_instruction = """
+КРИТИЧЕСКОЕ ПРАВИЛО: Учитывая текущую дату и время, ты ОБЯЗАН АКТИВНО использовать Grounding with Google Search для поиска в интернете, чтобы найти ответы, перепроверить предоставленные и найти актуальные ВСЕВОЗМОЖНЫЕ и ВСЕСТОРОННИЕ ДАННЫЕ, учитывая и СОХРАНЯЯ все источники. Твоя внутренняя память устарела, поэтому не отвечай только на её основе, если запрос подразумевает информацию о фактах, событиях, личностях или любых данных, которые могут меняться со временем.
+"""
+            # 3. Формируем итоговый промпт: сначала все инструкции, потом сам запрос
+            final_prompt_text = f"{date_prefix}{grounding_instruction}\n{user_prefix}{original_text}"
             
             request_specific_parts[text_part_index].text = final_prompt_text
 
@@ -418,6 +427,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         sent_message = await send_reply(message, reply_text)
         
         if sent_message:
+            # В историю сохраняем оригинальный запрос пользователя, без наших инструкций
             await add_to_history(context, role="user", parts=content_parts, original_message_id=message.message_id)
             await add_to_history(context, role="model", parts=[types.Part(text=full_response_for_history)], original_message_id=message.message_id, bot_message_id=sent_message.message_id, is_media_response=is_media_request)
             
