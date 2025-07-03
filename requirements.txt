@@ -1,8 +1,8 @@
 python-telegram-bot[webhooks]
 google-genai
-pytz
 psycopg2-binary
 httpx
 aiohttp
 duckduckgo-search
-google-api-core
+pytz
+google-api-python-client
