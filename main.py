@@ -430,7 +430,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             if get_user_setting(context, 'proactive_search', True) and not is_media_request:
                 search_results = await perform_proactive_search(original_text)
                 if search_results:
-                    search_context_str = f"\n\n---Результаты интернет-поиска---\n"
+                    search_context_str = f"\n\n---Результаты интернет-поиска---\n{search_results}\n---\n"
 
             user_prefix = f"[{user.id}; Name: {user.first_name}]: "
             final_prompt_text = f"{user_prefix}{original_text}"
