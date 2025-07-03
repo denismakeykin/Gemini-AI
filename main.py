@@ -1,7 +1,4 @@
-# Версия 27.3 'Prompt Signal Tuning'
-# 1. ИЗМЕНЕНО: Обновлена логика формирования промпта. Теперь результаты проактивного поиска не передаются модели,
-#    а используется только как сигнал для активации встроенного инструмента Grounding with Google Search.
-# 2. Все предыдущие исправления (единый клиент, обработка ошибок и т.д.) сохранены.
+# Версия 2 'Custom vrs'
 
 import logging
 import os
@@ -430,12 +427,12 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             if get_user_setting(context, 'proactive_search', True) and not is_media_request:
                 search_results = await perform_proactive_search(original_text)
                 if search_results:
-                    search_context_str = f"\n\n---Результаты интернет-поиска---\n{search_results}\n---\n"
+                    search_context_str = f"\n\n---Сниппеты из результатов интернет-поиска---\n{search_results}\n---\n"
 
             user_prefix = f"[{user.id}; Name: {user.first_name}]: "
             final_prompt_text = f"{user_prefix}{original_text}"
             if search_context_str:
-                final_prompt_text += f"\n\n<b>ВАЖНО:</b>Учитывая текущую дату и время, АКТИВНО используй Grounding with Google Search.\n{search_context_str}"
+                final_prompt_text += f"\n\n<b>ВАЖНО:</b>ОБЯЗАТЕЛЬНЫЙ Grounding with Google Search: Учитывая текущую дату и время, АКТИВНО используй встроенный поиск а интернете, чтобы перепроверить предоставленные и найти актуальные ВСЕВОЗМОЖНЫЕ и ВСЕСТОРОННИЕ ДАННЫЕ, СОХРАНЯЯ все источники. Используй как ЧАСТЬ СВОИХ ЗНАНИЙ.\n{search_context_str}"
             
             request_specific_parts[text_part_index].text = final_prompt_text
 
@@ -500,7 +497,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     search = get_user_setting(context, 'proactive_search', True)
     keyboard = [
-        [InlineKeyboardButton(f"Проактивный поиск: {'✅ Вкл' if search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
+        [InlineKeyboardButton(f"Добавлять сниппеты DDG/GCS: {'✅ Вкл' if search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
     ]
     await update.message.reply_text("⚙️ Настройки:", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -518,7 +515,7 @@ async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if current_search == new_search: return
 
     keyboard = [
-        [InlineKeyboardButton(f"Проактивный поиск: {'✅ Вкл' if new_search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
+        [InlineKeyboardButton(f"Добавлять сниппеты DDG/GCS: {'✅ Вкл' if new_search else '❌ Выкл'}", callback_data="toggle_proactive_search")]
     ]
     try:
         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
@@ -671,7 +668,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
          return await message.reply_text(f"❌ Аудиофайл больше {TELEGRAM_FILE_LIMIT_MB} МБ.")
 
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
-    user_text = message.caption or "Проанализируй аудио и выскажи свое мнение. Предоставь транскрипт только по запросу со словами 'транскрипт' или 'дословно'."
+    user_text = message.caption or "Проанализируй аудио и выскажи свое мнение. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'."
     
     try:
         audio_file = await audio.get_file()
@@ -778,7 +775,7 @@ async def main():
     
     commands = [
         BotCommand("start", "Инфо и начало работы"),
-        BotCommand("config", "Настроить поиск"),
+        BotCommand("config", "Настроить мышление и поиск"),
         BotCommand("transcript", "Транскрипция медиа (ответом)"),
         BotCommand("summarize", "Краткий пересказ (ответом)"),
         BotCommand("keypoints", "Ключевые тезисы (ответом)"),
