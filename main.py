@@ -1,4 +1,4 @@
-# Версия 2.9 (основана на 'Custom vrs' с исправлением всех обнаруженных ошибок)
+# Версия 3.0 (Стабильная, полностью на новом SDK)
 
 import logging
 import os
@@ -19,15 +19,15 @@ import aiohttp
 import aiohttp.web
 from telegram import Update, Message, BotCommand
 from telegram.constants import ChatAction, ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, BasePersistence, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, BasePersistence
 from telegram.error import BadRequest
 
 from google import genai
 from google.genai import types
-from google.generativeai import errors as GoogleErrors # ## ИЗМЕНЕНО: Правильный импорт для ошибок API
+# ## ИЗМЕНЕНО: Правильный импорт для ошибок API из нового SDK
+from google.genai import errors as genai_errors
 
 # --- КОНФИГУРАЦИЯ ---
-# ... (блок конфигурации остается без изменений) ...
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=log_level)
 logger = logging.getLogger(__name__)
@@ -54,9 +54,8 @@ MEDIA_CONTEXT_TTL_SECONDS = 47 * 3600
 TELEGRAM_FILE_LIMIT_MB = 20
 
 # --- ИНСТРУМЕНТЫ И ПРОМПТЫ ---
-# ## ИЗМЕНЕНО: Возвращено разделение инструментов для разных типов контента
 TEXT_TOOLS = [types.Tool(google_search=types.GoogleSearch(), code_execution=types.ToolCodeExecution())]
-MEDIA_TOOLS = [types.Tool(google_search=types.GoogleSearch())] # Для медиа - только поиск
+MEDIA_TOOLS = [types.Tool(google_search=types.GoogleSearch())]
 
 SAFETY_SETTINGS = [
     types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
@@ -72,7 +71,6 @@ except FileNotFoundError:
     SYSTEM_INSTRUCTION = """ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Не анонсируй свои внутренние действия. Сразу пиши ответ."""
 
 # --- КЛАСС PERSISTENCE ---
-# ... (код класса PostgresPersistence остается без изменений) ...
 class PostgresPersistence(BasePersistence):
     def __init__(self, database_url: str):
         super().__init__()
@@ -121,10 +119,8 @@ class PostgresPersistence(BasePersistence):
                 logger.warning(f"Postgres: Ошибка соединения (попытка {attempt + 1}/{retries}): {e}")
                 last_exception = e
                 if conn:
-                    try:
-                        self.db_pool.putconn(conn, close=True)
-                    except psycopg2.pool.PoolError:
-                        logger.warning("Postgres: Не удалось вернуть 'сломанное' соединение в пул.")
+                    try: self.db_pool.putconn(conn, close=True)
+                    except psycopg2.pool.PoolError: logger.warning("Postgres: Не удалось вернуть 'сломанное' соединение в пул.")
                     conn = None
                 if attempt < retries - 1:
                     time.sleep(1 + attempt)
@@ -170,9 +166,7 @@ class PostgresPersistence(BasePersistence):
     def close(self):
         if self.db_pool: self.db_pool.closeall()
 
-
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-# ... (функции с get_current_time_str до upload_and_wait_for_file остаются без изменений) ...
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
     return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
 
@@ -261,7 +255,6 @@ def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_i
 async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime_type: str, file_name: str) -> types.Part:
     logger.info(f"Загрузка файла '{file_name}' ({len(file_bytes) / 1024:.2f} KB) через File API...")
     try:
-        # ## ИЗМЕНЕНО: Исправлен вызов функции upload в соответствии с новым SDK
         upload_config = types.UploadFileConfig(mime_type=mime_type, display_name=file_name)
         upload_response = await client.aio.files.upload(
             file=io.BytesIO(file_bytes),
@@ -292,7 +285,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
     
     config = types.GenerateContentConfig(
         safety_settings=SAFETY_SETTINGS, 
-        tools=tools, # ## ИЗМЕНЕНО: Используем переданный набор инструментов
+        tools=tools,
         system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)]),
         temperature=0.7,
         thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget)
@@ -306,20 +299,18 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         )
         logger.info(f"ChatID: {chat_id} | Ответ от Gemini API получен.")
         return response
-    # ## ИЗМЕНЕНО: Исправлен класс ошибки на корректный
-    except GoogleErrors.GoogleAPIError as e:
+    except genai_errors.GoogleAPIError as e:
         logger.error(f"ChatID: {chat_id} | Ошибка Google API: {e}", exc_info=True)
-        if hasattr(e, 'code'):
-             if e.code == 429:
-                 return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
-             if e.code == 403:
-                 return "❌ <b>Ошибка доступа к файлу.</b>\nВозможно, файл был удален с серверов Google (срок хранения 48 часов) или возникла другая проблема. Попробуйте отправить файл заново."
+        # hasattr(e, 'code') тут не нужен, у ошибок этого типа он всегда есть
+        if isinstance(e, genai_errors.ResourceExhausted):
+            return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
+        if isinstance(e, genai_errors.PermissionDenied):
+            return "❌ <b>Ошибка доступа к файлу.</b>\nВозможно, файл был удален с серверов Google (срок хранения 48 часов) или возникла другая проблема. Попробуйте отправить файл заново."
         return f"❌ <b>Ошибка Google API:</b>\n<code>{html.escape(str(e))}</code>"
     except Exception as e:
         logger.error(f"ChatID: {chat_id} | Неизвестная ошибка генерации: {e}", exc_info=True)
         return f"❌ <b>Произошла внутренняя ошибка:</b>\n<code>{html.escape(str(e))}</code>"
 
-# ... (функция format_gemini_response и далее до process_request остаются без изменений) ...
 def format_gemini_response(response: types.GenerateContentResponse) -> str:
     try:
         if response and response.candidates:
@@ -419,7 +410,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 
         request_contents = history + [types.Content(parts=request_specific_parts, role="user")]
         
-        # ## ИЗМЕНЕНО: Выбираем правильный набор инструментов
         tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
         response_obj = await generate_response(client, request_contents, context, tools)
         
@@ -460,7 +450,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         await message.reply_text("❌ Произошла критическая внутренняя ошибка. Попробуйте еще раз.")
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
-# ... (весь оставшийся код, начиная с start_command, остается без изменений как в версии 2.7) ...
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_text = """Я - Женя, интеллект новой Google Gemini 2.5 Flash с лучшим поиском:
 
@@ -487,7 +476,7 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("История чата и связанные данные очищены.")
     else:
         logger.warning("Не удалось определить chat_id для команды /clear")
-        
+
 async def newtopic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('last_media_context', None)
     context.chat_data.pop('media_contexts', None)
