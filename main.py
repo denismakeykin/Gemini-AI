@@ -1,4 +1,4 @@
-# Версия 3.8.4 (Финальная, с защитой от гонки, санитайзером и умной обрезкой истории)
+# Версия 3.8.5 (Финальная, с защитой от гонки, санитайзером и умной обрезкой истории)
 
 import logging
 import os
@@ -375,21 +375,42 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         logger.error(f"ChatID: {chat_id} | Неизвестная ошибка генерации: {e}", exc_info=True)
         return f"❌ <b>Произошла внутренняя ошибка:</b>\n<code>{html.escape(str(e))}</code>"
 
+# main.py
+# ЗАМЕНИТЬ ТОЛЬКО ЭТУ ФУНКЦИЮ
+
 def format_gemini_response(response: types.GenerateContentResponse) -> str:
     try:
-        if response and response.candidates:
-            if response.candidates[0].finish_reason.name == "SAFETY":
-                logger.warning("Ответ заблокирован по соображениям безопасности.")
-                return "Мой ответ был заблокирован из-за внутренних правил безопасности. Пожалуйста, переформулируйте запрос."
+        if not response or not response.candidates:
+            logger.warning("Получен пустой или некорректный ответ от API (нет кандидатов).")
+            return "Я не смогла сформировать ответ. Попробуйте еще раз."
+            
+        candidate = response.candidates[0]
+        if candidate.finish_reason.name == "SAFETY":
+            logger.warning("Ответ заблокирован по соображениям безопасности.")
+            return "Мой ответ был заблокирован из-за внутренних правил безопасности. Пожалуйста, переформулируйте запрос."
 
-            if response.candidates[0].content and response.candidates[0].content.parts:
-                full_text = "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text'))
-                # ИСПРАВЛЕНИЕ: Принудительно вырезаем "мысли" модели, если она их показала
-                sanitized_text = re.sub(r'tool_code\n.*?thought\n', '', full_text, flags=re.DOTALL)
-                return sanitized_text.strip()
+        if not candidate.content or not candidate.content.parts:
+            logger.warning("Получен пустой или некорректный ответ от API (нет частей контента).")
+            return "Я не смогла сформировать ответ. Попробуйте еще раз."
+            
+        # НАДЕЖНЫЙ СБОР ТЕКСТА:
+        # Собираем в список только те части, где .text является строкой, а не None.
+        text_parts = [part.text for part in candidate.content.parts if part.text is not None]
         
-        logger.warning("Получен пустой или некорректный ответ от API.")
-        return "Я не смогла сформировать ответ. Попробуйте еще раз."
+        if not text_parts:
+            logger.warning("В ответе модели не найдено текстовых частей.")
+            # Это может произойти, если модель вернула только вызов инструмента.
+            # В этом случае лучше вернуть пустую строку, чем падать.
+            return "Я получила нетекстовый ответ, который не могу отобразить."
+
+        full_text = "".join(text_parts)
+        
+        # Санитайзер, который принудительно вырезает "мысли" модели
+        sanitized_text = re.sub(r'tool_code\n.*?thought\n', '', full_text, flags=re.DOTALL)
+        user_prefix_pattern = r'\[\d+;\s*Name:\s*.*?\]:\s*'
+        sanitized_text = re.sub(user_prefix_pattern, '', sanitized_text)
+        
+        return sanitized_text.strip()
         
     except (AttributeError, IndexError) as e:
         logger.error(f"Ошибка при парсинге ответа Gemini: {e}", exc_info=True)
