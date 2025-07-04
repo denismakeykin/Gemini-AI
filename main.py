@@ -1,4 +1,4 @@
-# Версия 4.1 (Финальная, с единым набором инструментов и всеми исправлениями)
+# Версия 4.2 (Финальная, с корректным разделением инструментов и всеми исправлениями)
 
 import logging
 import os
@@ -55,8 +55,9 @@ MEDIA_CONTEXT_TTL_SECONDS = 47 * 3600
 TELEGRAM_FILE_LIMIT_MB = 20
 
 # --- ИНСТРУМЕНТЫ И ПРОМПТЫ ---
-# ИСПРАВЛЕНИЕ: Единый набор инструментов для всех запросов
-ALL_TOOLS = [types.Tool(google_search=types.GoogleSearch(), code_execution=types.ToolCodeExecution(), url_context=types.UrlContext())]
+# ИСПРАВЛЕНИЕ: Возвращаем раздельные наборы инструментов
+TEXT_TOOLS = [types.Tool(google_search=types.GoogleSearch(), code_execution=types.ToolCodeExecution(), url_context=types.UrlContext())]
+MEDIA_TOOLS = [types.Tool(google_search=types.GoogleSearch())] # Для медиа - только поиск
 
 SAFETY_SETTINGS = [
     types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
@@ -250,14 +251,13 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
                 user_prefix = f"[{user_id}; Name: {user_name}]: "
                 
                 for part_dict in entry["parts"]:
-                    # Здесь мы не используем dict_to_part, т.к. нам не нужно проверять TTL для сборки истории
+                    # Не используем dict_to_part, чтобы не проверять TTL для сборки истории
                     if part_dict.get('type') == 'text':
                         prefixed_text = f"{user_prefix}{part_dict.get('content', '')}"
                         entry_api_parts.append(types.Part(text=prefixed_text))
                         entry_text_len += len(prefixed_text)
                     elif part_dict.get('type') == 'file':
-                        # В историю медиа не добавляем, чтобы не переполнять контекст
-                        # Они будут подтянуты из "липкого" контекста при необходимости
+                         # В историю медиа не добавляем, они будут подтянуты из "липкого" контекста
                         pass
             else: 
                 for part_dict in entry["parts"]:
@@ -487,7 +487,9 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         
         request_contents = history_for_api + [types.Content(parts=current_request_parts, role="user")]
         
-        response_obj = await generate_response(client, request_contents, context, ALL_TOOLS)
+        # ИСПРАВЛЕНИЕ: Используем раздельные наборы инструментов
+        tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
+        response_obj = await generate_response(client, request_contents, context, tools)
         
         if isinstance(response_obj, str):
             reply_text = response_obj
@@ -607,7 +609,7 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
         
         content_parts = [media_part, types.Part(text=prompt)]
         
-        response_obj = await generate_response(client, [types.Content(parts=content_parts, role="user")], context, ALL_TOOLS)
+        response_obj = await generate_response(client, [types.Content(parts=content_parts, role="user")], context, MEDIA_TOOLS)
         result_text = format_gemini_response(response_obj) if not isinstance(response_obj, str) else response_obj
         await send_reply(update.message, result_text)
     
