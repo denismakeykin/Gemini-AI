@@ -1,4 +1,4 @@
-# Версия 3.2 (Стабильная, с поддержкой контекста в группах)
+# Версия 3.5 (Стабильная, с финальными правками промпта от автора)
 
 import logging
 import os
@@ -45,6 +45,7 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 MODEL_NAME = 'gemini-2.5-flash'
 YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/|youtube-nocookie\.com\/embed\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
+DATE_TIME_REGEX = r'\b(день|дата|число|время|который час)\b'
 MAX_CONTEXT_CHARS = 200000
 MAX_HISTORY_RESPONSE_LEN = 2000
 MAX_HISTORY_ITEMS = 50
@@ -67,6 +68,7 @@ try:
     logger.info("Системный промпт успешно загружен из файла.")
 except FileNotFoundError:
     logger.error("Файл system_prompt.md не найден! Будет использована инструкция по умолчанию.")
+    # ## ИЗМЕНЕНО: Обновлена формулировка
     SYSTEM_INSTRUCTION = """ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме."""
 
 # --- КЛАСС PERSISTENCE ---
@@ -167,10 +169,11 @@ class PostgresPersistence(BasePersistence):
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
-    return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
-
-def get_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, default_value): return context.chat_data.get(key, default_value)
-def set_user_setting(context: ContextTypes.DEFAULT_TYPE, key: str, value): context.chat_data[key] = value
+    now = datetime.datetime.now(pytz.timezone(timezone))
+    days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+    months = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+    day_of_week = days[now.weekday()]
+    return f"Сегодня {day_of_week}, {now.day} {months[now.month-1]} {now.year} года, время {now.strftime('%H:%M')} (MSK)."
 
 def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
     chunks, tag_stack, remaining_text = [], [], text_to_chunk
@@ -214,7 +217,6 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
         if entry.get("role") in ("user", "model") and isinstance(entry.get("parts"), list):
             entry_api_parts = []
             entry_text_len = 0
-            # ## ИЗМЕНЕНО: Добавляем префикс автора к сообщениям пользователя из истории
             if entry.get("role") == "user":
                 user_id = entry.get('user_id', 'Unknown')
                 user_name = entry.get('user_name', 'User')
@@ -225,14 +227,12 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
                     if not part: continue
                     
                     if part.text:
-                        # Добавляем префикс только к текстовой части
                         prefixed_text = f"{user_prefix}{part.text}"
                         entry_api_parts.append(types.Part(text=prefixed_text))
                         entry_text_len += len(prefixed_text)
                     else:
-                        # Медиа-части добавляем как есть
                         entry_api_parts.append(part)
-            else: # Для 'model'
+            else: 
                 entry_api_parts = [p for p in (dict_to_part(part_dict) for part_dict in entry["parts"]) if p is not None]
                 entry_text_len = sum(len(p.text) for p in entry_api_parts if p.text)
 
@@ -324,7 +324,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         logger.info(f"ChatID: {chat_id} | Ответ от Gemini API получен.")
         return response
     except genai_errors.GoogleAPIError as e:
-        logger.error(f"ChatID: {chat_id} | Ошибка Google API: {e}", exc_info=False) # Не выводим полный traceback для известных ошибок
+        logger.error(f"ChatID: {chat_id} | Ошибка Google API: {e}", exc_info=False)
         if isinstance(e, genai_errors.ResourceExhausted):
             return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
         if isinstance(e, genai_errors.PermissionDenied):
@@ -377,17 +377,14 @@ async def send_reply(target_message: Message, response_text: str) -> Message | N
 async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list[types.Part], user: User = None, **kwargs):
     chat_history = context.chat_data.setdefault("history", [])
     
-    # ## ИЗМЕНЕНО: Добавляем информацию о пользователе в запись истории
     entry = {"role": role, "parts": [part_to_dict(p) for p in parts if p], **kwargs}
     if role == 'user' and user:
         entry['user_id'] = user.id
         entry['user_name'] = user.first_name
     
-    # Упрощенная логика обрезки ответа модели
     if role == 'model':
         text_part = next((p.get('content') for p in entry["parts"] if p.get('type') == 'text'), None)
         if text_part and len(text_part) > MAX_HISTORY_RESPONSE_LEN:
-             # Обрезаем текст прямо в словаре
              entry["parts"][0]['content'] = text_part[:MAX_HISTORY_RESPONSE_LEN] + "..."
              logger.info(f"Ответ модели для чата {context.chat_data.get('id')} был обрезан для сохранения в историю.")
     
@@ -401,10 +398,20 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     
     try:
-        # ## ИЗМЕНЕНО: Логика построения промпта теперь в build_history_for_request
         history_for_api = build_history_for_request(context.chat_data.get("history", []))
         
-        # Готовим текущий запрос
+        text_part_content = next((p.text for p in content_parts if p.text), None)
+        
+        if text_part_content and re.search(DATE_TIME_REGEX, text_part_content, re.IGNORECASE):
+            logger.info("Обнаружен запрос о времени/дате. Отвечаем напрямую.")
+            time_str = get_current_time_str()
+            response_text = f"{user.first_name}, {time_str[0].lower()}{time_str[1:]}"
+            sent_message = await send_reply(message, response_text)
+            if sent_message:
+                await add_to_history(context, role="user", parts=content_parts, user=user, original_message_id=message.message_id)
+                await add_to_history(context, role="model", parts=[types.Part(text=response_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
+            return
+
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
         is_first_message = not bool(history_for_api)
         
@@ -412,18 +419,20 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         if not is_first_message: date_prefix += "This is an ongoing conversation, do not greet the user.)\n"
         else: date_prefix += "This is the first message.)\n"
 
-        grounding_instruction = "\nВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.\n"
+        grounding_instruction = """
+ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.
+"""
         
         current_request_parts = []
         text_part_found = False
         for part in content_parts:
             if part.text and not text_part_found:
-                final_prompt_text = f"{date_prefix}{grounding_instruction}{user_prefix}{part.text}"
+                final_prompt_text = f"{date_prefix}{grounding_instruction}\n{user_prefix}{part.text}"
                 current_request_parts.append(types.Part(text=final_prompt_text))
                 text_part_found = True
             else:
                 current_request_parts.append(part)
-
+        
         request_contents = history_for_api + [types.Content(parts=current_request_parts, role="user")]
         
         tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
@@ -439,7 +448,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         sent_message = await send_reply(message, reply_text)
         
         if sent_message:
-            # ## ИЗМЕНЕНО: Передаем объект user для сохранения в историю
             await add_to_history(context, role="user", parts=content_parts, user=user, original_message_id=message.message_id)
             await add_to_history(context, role="model", parts=[types.Part(text=full_response_for_history)], original_message_id=message.message_id, bot_message_id=sent_message.message_id, is_media_response=is_media_request)
             
@@ -560,34 +568,34 @@ async def handle_media_request(update: Update, context: ContextTypes.DEFAULT_TYP
     await process_request(update, context, content_parts, is_media_request=True)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, client = update.message, context.bot_data['gemini_client']
-    
-    if message.photo:
-        photo = message.photo[-1]
-        if photo.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
-            await message.reply_text(f"🖼️ Изображение слишком большое (> {TELEGRAM_FILE_LIMIT_MB} MB), я не могу его проанализировать, но сейчас отвечу на текстовую часть сообщения, если она есть.")
-            if message.caption:
-                message.text = message.caption
-                await handle_message(update, context)
-            return
+    message = update.message
+    if not message or not message.photo: return
+
+    photo = message.photo[-1]
+    if photo.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
+        await message.reply_text(f"🖼️ Изображение слишком большое (> {TELEGRAM_FILE_LIMIT_MB} MB), я не могу его проанализировать, но сейчас отвечу на текстовую часть сообщения, если она есть.")
+        if message.caption:
+            message.text = message.caption
+            await handle_message(update, context)
+        return
 
     try:
-        photo_file = await message.photo[-1].get_file()
+        photo_file = await photo.get_file()
         photo_bytes = await photo_file.download_as_bytearray()
-        file_part = await upload_and_wait_for_file(client, photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
+        file_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
         await handle_media_request(update, context, file_part, message.caption or "Проанализируй изображение и выскажи свое мнение.")
-    except BadRequest as e:
-        if "File is too big" in str(e): await message.reply_text(f"❌ Изображение слишком большое (> {TELEGRAM_FILE_LIMIT_MB} MB).")
-        else:
-            logger.error(f"Ошибка BadRequest при обработке изображения: {e}")
-            await message.reply_text(f"❌ Произошла ошибка Telegram при обработке изображения: {e}")
+    except (BadRequest, IOError) as e:
+        logger.error(f"Ошибка при обработке фото: {e}")
+        await message.reply_text(f"❌ Ошибка обработки изображения: {e}")
     except Exception as e:
         logger.error(f"Непредвиденная ошибка при обработке изображения: {e}", exc_info=True)
         await message.reply_text("❌ Произошла внутренняя ошибка при обработке изображения.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, doc, client = update.message, update.message.document, context.bot_data['gemini_client']
-    
+    message = update.message
+    if not message or not message.document: return
+    doc = message.document
+
     if doc.file_size > 50 * 1024 * 1024:
         await message.reply_text("📑 Файл слишком большой (> 50 MB). Отвечу на текст, если он есть.")
         if message.caption:
@@ -609,19 +617,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         doc_file = await doc.get_file()
         doc_bytes = await doc_file.download_as_bytearray()
-        file_part = await upload_and_wait_for_file(client, doc_bytes, doc.mime_type, doc.file_name or "document")
+        file_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], doc_bytes, doc.mime_type, doc.file_name or "document")
         await handle_media_request(update, context, file_part, message.caption or "Проанализируй документ и выскажи свое мнение.")
-    except BadRequest as e:
-        if "File is too big" in str(e): await message.reply_text(f"❌ Файл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB).")
-        else:
-            logger.error(f"Ошибка BadRequest при обработке документа: {e}")
-            await message.reply_text(f"❌ Ошибка Telegram: {e}")
+    except (BadRequest, IOError) as e:
+        logger.error(f"Ошибка при обработке документа: {e}")
+        await message.reply_text(f"❌ Ошибка обработки документа: {e}")
     except Exception as e:
         logger.error(f"Непредвиденная ошибка при обработке документа: {e}", exc_info=True)
         await message.reply_text("❌ Внутренняя ошибка при обработке документа.")
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, video, client = update.message, update.message.video, context.bot_data['gemini_client']
+    message = update.message
+    if not message or not message.video: return
+    video = message.video
 
     if video.file_size > 50 * 1024 * 1024:
         await message.reply_text("📹 Видеофайл слишком большой (> 50 MB). Отвечу на текст, если он есть.")
@@ -641,19 +649,18 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         video_file = await video.get_file()
         video_bytes = await video_file.download_as_bytearray()
-        video_part = await upload_and_wait_for_file(client, video_bytes, video.mime_type, video.file_name or "video.mp4")
+        video_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], video_bytes, video.mime_type, video.file_name or "video.mp4")
         await handle_media_request(update, context, video_part, message.caption or "Проанализируй видео и выскажи свое мнение. Не указывай таймкоды без просьбы. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'.")
-    except BadRequest as e:
-        if "File is too big" in str(e): await message.reply_text(f"❌ Видеофайл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB).")
-        else:
-            logger.error(f"Ошибка BadRequest при обработке видео: {e}")
-            await message.reply_text(f"❌ Ошибка Telegram: {e}")
+    except (BadRequest, IOError) as e:
+        logger.error(f"Ошибка при обработке видео: {e}")
+        await message.reply_text(f"❌ Ошибка обработки видео: {e}")
     except Exception as e:
         logger.error(f"Непредвиденная ошибка при обработке видео: {e}", exc_info=True)
         await message.reply_text("❌ Внутренняя ошибка при обработке видео.")
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_source=None):
-    message, client = update.message, context.bot_data['gemini_client']
+    message = update.message
+    if not message: return
     audio = audio_source or message.audio or message.voice
     if not audio: return
 
@@ -670,13 +677,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
     try:
         audio_file = await audio.get_file()
         audio_bytes = await audio_file.download_as_bytearray()
-        audio_part = await upload_and_wait_for_file(client, audio_bytes, audio.mime_type, file_name)
+        audio_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], audio_bytes, audio.mime_type, file_name)
         await handle_media_request(update, context, audio_part, user_text)
-    except BadRequest as e:
-        if "File is too big" in str(e): await message.reply_text(f"❌ Аудиофайл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB).")
-        else:
-            logger.error(f"Ошибка BadRequest при обработке аудио: {e}")
-            await message.reply_text(f"❌ Ошибка Telegram: {e}")
+    except (BadRequest, IOError) as e:
+        logger.error(f"Ошибка при обработке аудио: {e}")
+        await message.reply_text(f"❌ Ошибка обработки аудио: {e}")
     except Exception as e:
         logger.error(f"Непредвиденная ошибка при обработке аудио: {e}", exc_info=True)
         await message.reply_text("❌ Внутренняя ошибка при обработке аудио.")
@@ -703,7 +708,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, text = update.message, (update.message.text or "").strip()
-    if not text or not message.from_user: return
+    if (not text and not message.caption) or not message.from_user: return
+    if message.caption and not text:
+        text = message.caption
+        message.text = text
+        
     context.chat_data['id'] = message.chat_id
     
     content_parts = [types.Part(text=text)]
