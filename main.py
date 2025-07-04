@@ -649,7 +649,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
          return
 
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
-    user_text = message.caption or "Проанализируй аудио и выскажи свое мнение. Не указывай таймкоды без просьбы. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'."
+    user_text = message.caption or "Нужно дать содержательный ответ. Не указывай таймкоды без просьбы. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'."
     
     try:
         audio_file = await audio.get_file()
