@@ -1,4 +1,4 @@
-# Версия 3.6 (Финальная стабильная версия)
+# Версия 3.7 (Финальная, с корректно замененными обработчиками)
 
 import logging
 import os
@@ -45,6 +45,7 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 MODEL_NAME = 'gemini-2.5-flash'
 YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/|youtube-nocookie\.com\/embed\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
+DATE_TIME_REGEX = r'^\s*(какой\s+)?(день|дата|число|время|который\s+час)\??\s*$'
 MAX_CONTEXT_CHARS = 200000
 MAX_HISTORY_RESPONSE_LEN = 2000
 MAX_HISTORY_ITEMS = 50
@@ -167,7 +168,11 @@ class PostgresPersistence(BasePersistence):
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
-    return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
+    now = datetime.datetime.now(pytz.timezone(timezone))
+    days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+    months = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+    day_of_week = days[now.weekday()]
+    return f"Сегодня {day_of_week}, {now.day} {months[now.month-1]} {now.year} года, время {now.strftime('%H:%M')} (MSK)."
 
 def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
     chunks, tag_stack, remaining_text = [], [], text_to_chunk
@@ -317,7 +322,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         )
         logger.info(f"ChatID: {chat_id} | Ответ от Gemini API получен.")
         return response
-    except genai_errors.GoogleAPIError as e:
+    except genai_errors.APIError as e:
         logger.error(f"ChatID: {chat_id} | Ошибка Google API: {e}", exc_info=False)
         if isinstance(e, genai_errors.ResourceExhausted):
             return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
@@ -394,7 +399,18 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     try:
         history_for_api = build_history_for_request(context.chat_data.get("history", []))
         
-        # ## ИЗМЕНЕНО: Удалена логика с детектором времени
+        text_part_content = next((p.text for p in content_parts if p.text), None)
+        
+        if text_part_content and re.search(DATE_TIME_REGEX, text_part_content, re.IGNORECASE):
+            logger.info("Обнаружен запрос о времени/дате. Отвечаем напрямую.")
+            time_str = get_current_time_str()
+            response_text = f"{user.first_name}, {time_str[0].lower()}{time_str[1:]}"
+            sent_message = await send_reply(message, response_text)
+            if sent_message:
+                await add_to_history(context, role="user", parts=content_parts, user=user, original_message_id=message.message_id)
+                await add_to_history(context, role="model", parts=[types.Part(text=response_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
+            return
+
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
         
         date_prefix = f"(System Note: Today is {get_current_time_str()}. "
@@ -628,7 +644,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_file = await video.get_file()
         video_bytes = await video_file.download_as_bytearray()
         video_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], video_bytes, video.mime_type, video.file_name or "video.mp4")
-        await handle_media_request(update, context, video_part, message.caption or "Проанализируй видео и выскажи свое мнение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом.")
+        await handle_media_request(update, context, video_part, message.caption or "Проанализируй видео и выскажи свое мнение. Не указывай таймкоды без просьбы. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'.")
     except (BadRequest, IOError) as e:
         logger.error(f"Ошибка при обработке видео: {e}")
         await message.reply_text(f"❌ Ошибка обработки видео: {e}")
@@ -649,7 +665,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
          return
 
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
-    user_text = message.caption or "Ответь на это голосовое сообщение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом."
+    user_text = message.caption or "Проанализируй аудио и выскажи свое мнение. Не указывай таймкоды без просьбы. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'."
     
     try:
         audio_file = await audio.get_file()
@@ -672,7 +688,7 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await message.reply_text("Анализирую видео с YouTube...", reply_to_message_id=message.id)
     try:
         youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
-        user_prompt = text.replace(match.group(0), "").strip() or "Посмотри YouTube-видео и выскажи свое мнение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом."
+        user_prompt = text.replace(match.group(0), "").strip() or "Проанализируй YouTube-видео и выскажи свое мнение. Не указывай таймкоды без просьбы. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'."
         await handle_media_request(update, context, youtube_part, user_prompt)
     except Exception as e:
         logger.error(f"Ошибка при обработке YouTube URL {youtube_url}: {e}", exc_info=True)
