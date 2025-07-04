@@ -1,4 +1,4 @@
-# Версия 2.7 (основана на 'Custom vrs' с финальными правками и мышлением на максимум)
+# Версия 2.9 (основана на 'Custom vrs' с финальными правками и мышлением на максимум)
 
 import logging
 import os
@@ -407,9 +407,9 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             else:
                 date_prefix += "This is the first message.)\n"
 
-            # ## ИЗМЕНЕНО: Обновлена тактическая инструкция в соответствии с твоей версией
+            # ## ИЗМЕНЕНО: Добавлено указание не комментировать поиск
             grounding_instruction = """
-КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search для поиска актуальных ВСЕВОЗМОЖНЫХ и ВСЕСТОРОННИХ ДАННЫХ, СОХРАНЯЯ все источники.
+ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Не анонсируй свои внутренние действия. Сразу пиши ответ.
 """
             final_prompt_text = f"{date_prefix}{grounding_instruction}\n{user_prefix}{original_text}"
             
@@ -454,7 +454,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     except Exception as e:
         logger.error(f"Непредвиденная ошибка в process_request: {e}", exc_info=True)
         await message.reply_text("❌ Произошла критическая внутренняя ошибка. Попробуйте еще раз.")
-
+        
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_text = """Я - Женя, интеллект новой Google Gemini 2.5 Flash с лучшим поиском:
