@@ -45,8 +45,6 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 MODEL_NAME = 'gemini-2.5-flash'
 YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/|youtube-nocookie\.com\/embed\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
-# ## ИЗМЕНЕНО: Добавлена недостающая константа
-DATE_TIME_REGEX = r'^\s*(какой\s+)?(день|дата|число|время|который\s+час)\??\s*$'
 MAX_CONTEXT_CHARS = 200000
 MAX_HISTORY_RESPONSE_LEN = 2000
 MAX_HISTORY_ITEMS = 50
@@ -169,11 +167,7 @@ class PostgresPersistence(BasePersistence):
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
-    now = datetime.datetime.now(pytz.timezone(timezone))
-    days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-    months = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
-    day_of_week = days[now.weekday()]
-    return f"Сегодня {day_of_week}, {now.day} {months[now.month-1]} {now.year} года, время {now.strftime('%H:%M')} (MSK)."
+    return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
 
 def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
     chunks, tag_stack, remaining_text = [], [], text_to_chunk
@@ -419,6 +413,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         if not is_first_message: date_prefix += "This is an ongoing conversation.)\n"
         else: date_prefix += "This is the first message.)\n"
 
+        # ## ИЗМЕНЕНО: Добавлено явное указание про использование даты
         grounding_instruction = """
 ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Тебе уже предоставлена точная дата и время в системной заметке, используй эти данные, не пытайся вычислить их самостоятельно. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.
 """
@@ -704,16 +699,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cus
     if not message: return
     
     text = custom_text or (message.text or "").strip()
-    # ## ИЗМЕНЕНО: Проверяем, есть ли вообще текст для обработки
-    if not text:
-        # Если есть медиа, но нет текста, и это не вызов из медиа-обработчика, то ничего не делаем
-        if (message.photo or message.video or message.document or message.audio or message.voice) and custom_text is None:
-            return
-        # Если нет ни текста, ни медиа
-        if not (message.photo or message.video or message.document or message.audio or message.voice):
-             return
-
-    if not message.from_user: return
+    if not text or not message.from_user: return
         
     context.chat_data['id'] = message.chat_id
     
@@ -797,7 +783,6 @@ async def main():
     application.add_handler(CommandHandler("keypoints", keypoints_command))
     application.add_handler(CommandHandler("newtopic", newtopic_command))
     
-    # ## ИЗМЕНЕНО: Указаны конкретные типы для медиа-обработчиков
     application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo))
     application.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_video))
     application.add_handler(MessageHandler(filters.VOICE & ~filters.COMMAND, handle_audio))
