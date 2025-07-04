@@ -1,4 +1,4 @@
-# Версия 3.8.5 (Финальная, с защитой от гонки, санитайзером и умной обрезкой истории)
+# Версия 4.0 (Финальная, с разделением контекста и защитой от всех известных сбоев)
 
 import logging
 import os
@@ -48,7 +48,7 @@ YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|em
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
 DATE_TIME_REGEX = r'^\s*(какой\s+)?(день|дата|число|время|который\s+час)\??\s*$'
 MAX_CONTEXT_CHARS = 150000
-MAX_HISTORY_RESPONSE_LEN = 3000 # Лимит для сохранения ответа модели в историю
+MAX_HISTORY_RESPONSE_LEN = 3000
 MAX_HISTORY_ITEMS = 50
 MAX_MEDIA_CONTEXTS = 10
 MEDIA_CONTEXT_TTL_SECONDS = 47 * 3600
@@ -140,7 +140,7 @@ class PostgresPersistence(BasePersistence):
         return pickle.loads(res[0]) if res and res[0] else None
     def _set_pickled(self, key: str, data: object) -> None: self._execute("INSERT INTO persistence_data (key, data) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET data = %s;", (key, pickle.dumps(data), pickle.dumps(data)))
     async def get_bot_data(self) -> dict: return defaultdict(dict)
-    async def update_bot_data(self, data: dict) -> None: self.bot_data.update(data)
+    async def update_bot_data(self, data: dict) -> None: pass
     async def get_chat_data(self) -> defaultdict[int, dict]:
         all_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'chat_data_%';", fetch="all")
         chat_data = defaultdict(dict)
@@ -200,7 +200,6 @@ def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
     return chunks
 
 def ignore_if_processing(func):
-    """Декоратор для предотвращения повторной обработки одного и того же сообщения."""
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         if not update or not update.effective_message:
@@ -251,18 +250,19 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
                 user_prefix = f"[{user_id}; Name: {user_name}]: "
                 
                 for part_dict in entry["parts"]:
-                    part = dict_to_part(part_dict)
-                    if not part: continue
-                    
-                    if part.text:
-                        prefixed_text = f"{user_prefix}{part.text}"
+                    # Здесь мы не используем dict_to_part, т.к. нам не нужно проверять TTL для сборки истории
+                    if part_dict.get('type') == 'text':
+                        prefixed_text = f"{user_prefix}{part_dict.get('content', '')}"
                         entry_api_parts.append(types.Part(text=prefixed_text))
                         entry_text_len += len(prefixed_text)
-                    else:
-                        entry_api_parts.append(part)
+                    elif part_dict.get('type') == 'file':
+                        entry_api_parts.append(types.Part(file_data=types.FileData(file_uri=part_dict['uri'], mime_type=part_dict['mime'])))
             else: 
-                entry_api_parts = [p for p in (dict_to_part(part_dict) for part_dict in entry["parts"]) if p is not None]
-                entry_text_len = sum(len(p.text) for p in entry_api_parts if p.text)
+                for part_dict in entry["parts"]:
+                    if part_dict.get('type') == 'text':
+                        text = part_dict.get('content', '')
+                        entry_api_parts.append(types.Part(text=text))
+                        entry_text_len += len(text)
 
             if not entry_api_parts: continue
             
@@ -278,15 +278,19 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
     return valid_history
 
 def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_id: int) -> dict | None:
+    chat_id = context.effective_chat.id
     history = context.chat_data.get("history", [])
-    media_contexts = context.chat_data.get("media_contexts", {})
+    # ИСПРАВЛЕНИЕ: Берем медиа-контексты из сессионного bot_data
+    all_media_contexts = context.application.bot_data.setdefault('media_contexts', {})
+    chat_media_contexts = all_media_contexts.get(chat_id, {})
+    
     current_reply_id = reply_to_id
     for _ in range(len(history)):
         bot_message = next((msg for msg in reversed(history) if msg.get("role") == "model" and msg.get("bot_message_id") == current_reply_id), None)
         if bot_message and 'original_message_id' in bot_message:
             user_msg_id = bot_message['original_message_id']
-            if user_msg_id in media_contexts:
-                media_context = media_contexts[user_msg_id]
+            if user_msg_id in chat_media_contexts:
+                media_context = chat_media_contexts[user_msg_id]
                 if time.time() - media_context.get('timestamp', 0) < MEDIA_CONTEXT_TTL_SECONDS:
                     return media_context
                 else:
@@ -294,8 +298,8 @@ def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_i
                     return None
             current_reply_id = user_msg_id
         else:
-            if current_reply_id in media_contexts:
-                media_context = media_contexts[current_reply_id]
+            if current_reply_id in chat_media_contexts:
+                media_context = chat_media_contexts[current_reply_id]
                 if time.time() - media_context.get('timestamp', 0) < MEDIA_CONTEXT_TTL_SECONDS:
                     return media_context
                 else:
@@ -332,7 +336,7 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
         raise IOError(f"Не удалось загрузить или обработать файл '{file_name}' на сервере Google.")
 
 async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> types.GenerateContentResponse | str:
-    chat_id = context.chat_data.get('id', 'Unknown')
+    chat_id = context.effective_chat.id
     thinking_budget = 24576
     
     try:
@@ -375,9 +379,6 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         logger.error(f"ChatID: {chat_id} | Неизвестная ошибка генерации: {e}", exc_info=True)
         return f"❌ <b>Произошла внутренняя ошибка:</b>\n<code>{html.escape(str(e))}</code>"
 
-# main.py
-# ЗАМЕНИТЬ ТОЛЬКО ЭТУ ФУНКЦИЮ
-
 def format_gemini_response(response: types.GenerateContentResponse) -> str:
     try:
         if not response or not response.candidates:
@@ -393,19 +394,14 @@ def format_gemini_response(response: types.GenerateContentResponse) -> str:
             logger.warning("Получен пустой или некорректный ответ от API (нет частей контента).")
             return "Я не смогла сформировать ответ. Попробуйте еще раз."
             
-        # НАДЕЖНЫЙ СБОР ТЕКСТА:
-        # Собираем в список только те части, где .text является строкой, а не None.
         text_parts = [part.text for part in candidate.content.parts if part.text is not None]
         
         if not text_parts:
             logger.warning("В ответе модели не найдено текстовых частей.")
-            # Это может произойти, если модель вернула только вызов инструмента.
-            # В этом случае лучше вернуть пустую строку, чем падать.
             return "Я получила нетекстовый ответ, который не могу отобразить."
 
         full_text = "".join(text_parts)
         
-        # Санитайзер, который принудительно вырезает "мысли" модели
         sanitized_text = re.sub(r'tool_code\n.*?thought\n', '', full_text, flags=re.DOTALL)
         user_prefix_pattern = r'\[\d+;\s*Name:\s*.*?\]:\s*'
         sanitized_text = re.sub(user_prefix_pattern, '', sanitized_text)
@@ -453,7 +449,8 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
 async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, is_media_request: bool = False):
     message, client = update.message, context.bot_data['gemini_client']
     user = message.from_user
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    chat_id = message.chat_id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     user_parts_for_history = content_parts.copy()
 
@@ -497,10 +494,9 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         else:
             reply_text = format_gemini_response(response_obj)
         
-        # ИСПРАВЛЕНИЕ: Обрезаем слишком длинный ответ *перед* сохранением в историю
         if len(reply_text) > MAX_HISTORY_RESPONSE_LEN:
             full_response_for_history = reply_text[:MAX_HISTORY_RESPONSE_LEN] + "..."
-            logger.info(f"Ответ модели для чата {context.chat_data.get('id')} был обрезан для сохранения в историю.")
+            logger.info(f"Ответ модели для чата {chat_id} был обрезан для сохранения в историю.")
         else:
             full_response_for_history = reply_text
 
@@ -513,13 +509,17 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             if any(p.file_data for p in user_parts_for_history):
                 media_part = next((p for p in user_parts_for_history if p.file_data), None)
                 if media_part:
-                    media_contexts = context.chat_data.setdefault('media_contexts', OrderedDict())
-                    media_contexts[message.message_id] = part_to_dict(media_part)
-                    if len(media_contexts) > MAX_MEDIA_CONTEXTS: media_contexts.popitem(last=False)
-                    context.chat_data['last_media_context'] = media_contexts[message.message_id]
-                    logger.info(f"Сохранен/обновлен 'липкий' медиа-контекст для msg_id {message.message_id}")
+                    all_media_contexts = context.application.bot_data.setdefault('media_contexts', {})
+                    chat_media_contexts = all_media_contexts.setdefault(chat_id, OrderedDict())
+                    
+                    chat_media_contexts[message.message_id] = part_to_dict(media_part)
+                    if len(chat_media_contexts) > MAX_MEDIA_CONTEXTS: chat_media_contexts.popitem(last=False)
+
+                    all_last_contexts = context.application.bot_data.setdefault('last_media_context', {})
+                    all_last_contexts[chat_id] = chat_media_contexts[message.message_id]
+                    logger.info(f"Сохранен/обновлен 'липкий' медиа-контекст для msg_id {message.message_id} в чате {chat_id}")
             
-            await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
+            await context.application.persistence.update_chat_data(chat_id, context.chat_data)
         else:
             logger.error(f"Не удалось отправить ответ для msg_id {message.message_id}. История не будет сохранена, чтобы избежать повреждения.")
 
@@ -553,10 +553,11 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat:
         chat_id = update.effective_chat.id
         
-        context.chat_data.pop('history', None)
-        context.chat_data.pop('media_contexts', None)
-        context.chat_data.pop('last_media_context', None)
-        context.application.bot_data.pop('processing_messages', None)
+        context.chat_data.clear()
+        
+        bot_data = context.application.bot_data
+        bot_data.get('media_contexts', {}).pop(chat_id, None)
+        bot_data.get('last_media_context', {}).pop(chat_id, None)
         
         await context.application.persistence.update_chat_data(chat_id, context.chat_data)
         
@@ -567,9 +568,12 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @ignore_if_processing
 async def newtopic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data.pop('last_media_context', None)
-    context.chat_data.pop('media_contexts', None)
-    await update.message.reply_text("Контекст предыдущих файлов очищен. Начинаем новую тему.")
+    if update.effective_chat:
+        chat_id = update.effective_chat.id
+        bot_data = context.application.bot_data
+        bot_data.get('media_contexts', {}).pop(chat_id, None)
+        bot_data.get('last_media_context', {}).pop(chat_id, None)
+        await update.message.reply_text("Контекст предыдущих файлов очищен. Начинаем новую тему.")
 
 @ignore_if_processing
 async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
@@ -604,7 +608,7 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
         content_parts = [media_part, types.Part(text=prompt)]
         
         response_obj = await generate_response(client, [types.Content(parts=content_parts, role="user")], context, MEDIA_TOOLS)
-        result_text = format_gemini_response(response_obj) if isinstance(response_obj, types.GenerateContentResponse) else response_obj
+        result_text = format_gemini_response(response_obj) if not isinstance(response_obj, str) else response_obj
         await send_reply(update.message, result_text)
     
     except BadRequest as e:
@@ -639,7 +643,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.photo: return
     
-    context.chat_data.pop('last_media_context', None)
+    context.application.bot_data.get('last_media_context', {}).pop(message.chat_id, None)
     
     photo = message.photo[-1]
     if photo.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
@@ -665,7 +669,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.document: return
     
-    context.chat_data.pop('last_media_context', None)
+    context.application.bot_data.get('last_media_context', {}).pop(message.chat_id, None)
     doc = message.document
     
     if doc.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
@@ -695,7 +699,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.video: return
 
-    context.chat_data.pop('last_media_context', None)
+    context.application.bot_data.get('last_media_context', {}).pop(message.chat_id, None)
     video = message.video
 
     if video.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
@@ -722,7 +726,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
     message = update.message
     if not message: return
     
-    context.chat_data.pop('last_media_context', None)
+    context.application.bot_data.get('last_media_context', {}).pop(message.chat_id, None)
     audio = audio_source or message.audio or message.voice
     if not audio: return
 
@@ -751,7 +755,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
 async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, text = update.message, update.message.text or ""
     
-    context.chat_data.pop('last_media_context', None)
+    context.application.bot_data.get('last_media_context', {}).pop(message.chat_id, None)
     match = re.search(YOUTUBE_REGEX, text)
     if not match: return
     
@@ -767,7 +771,7 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @ignore_if_processing
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data.pop('last_media_context', None)
+    context.application.bot_data.get('last_media_context', {}).pop(update.effective_chat.id, None)
     await process_request(update, context, [types.Part(text=update.message.text)])
 
 @ignore_if_processing
@@ -778,7 +782,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cus
     text = custom_text or (message.text or "").strip()
     if not text: return
         
-    context.chat_data['id'] = message.chat_id
+    chat_id = message.chat_id
+    context.chat_data['id'] = chat_id # Для совместимости с persistence
     
     content_parts = [types.Part(text=text)]
     is_media_follow_up = False
@@ -791,16 +796,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cus
                 if media_part:
                     content_parts.insert(0, media_part)
                     is_media_follow_up = True
-                    logger.info(f"Применен ЯВНЫЙ медиа-контекст (через reply) для чата {message.chat_id}")
+                    logger.info(f"Применен ЯВНЫЙ медиа-контекст (через reply) для чата {chat_id}")
 
         if not is_media_follow_up:
-            last_media_context_dict = context.chat_data.get('last_media_context')
+            all_last_contexts = context.application.bot_data.setdefault('last_media_context', {})
+            last_media_context_dict = all_last_contexts.get(chat_id)
+            
             if last_media_context_dict:
                 media_part = dict_to_part(last_media_context_dict)
                 if media_part:
                     content_parts.insert(0, media_part)
                     is_media_follow_up = True
-                    logger.info(f"Применен НЕЯВНЫЙ 'липкий' медиа-контекст для чата {message.chat_id}")
+                    logger.info(f"Применен НЕЯВНЫЙ 'липкий' медиа-контекст для чата {chat_id}")
 
     await process_request(update, context, content_parts, is_media_request=is_media_follow_up)
 
