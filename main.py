@@ -1,4 +1,4 @@
-# Версия 4.0 (Финальная, с разделением контекста и защитой от всех известных сбоев)
+# Версия 4.1 (Финальная, с единым набором инструментов и всеми исправлениями)
 
 import logging
 import os
@@ -55,8 +55,8 @@ MEDIA_CONTEXT_TTL_SECONDS = 47 * 3600
 TELEGRAM_FILE_LIMIT_MB = 20
 
 # --- ИНСТРУМЕНТЫ И ПРОМПТЫ ---
-TEXT_TOOLS = [types.Tool(google_search=types.GoogleSearch(), code_execution=types.ToolCodeExecution(), url_context=types.UrlContext())]
-MEDIA_TOOLS = [types.Tool(google_search=types.GoogleSearch())]
+# ИСПРАВЛЕНИЕ: Единый набор инструментов для всех запросов
+ALL_TOOLS = [types.Tool(google_search=types.GoogleSearch(), code_execution=types.ToolCodeExecution(), url_context=types.UrlContext())]
 
 SAFETY_SETTINGS = [
     types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
@@ -256,7 +256,9 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
                         entry_api_parts.append(types.Part(text=prefixed_text))
                         entry_text_len += len(prefixed_text)
                     elif part_dict.get('type') == 'file':
-                        entry_api_parts.append(types.Part(file_data=types.FileData(file_uri=part_dict['uri'], mime_type=part_dict['mime'])))
+                        # В историю медиа не добавляем, чтобы не переполнять контекст
+                        # Они будут подтянуты из "липкого" контекста при необходимости
+                        pass
             else: 
                 for part_dict in entry["parts"]:
                     if part_dict.get('type') == 'text':
@@ -280,7 +282,6 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
 def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_id: int) -> dict | None:
     chat_id = context.effective_chat.id
     history = context.chat_data.get("history", [])
-    # ИСПРАВЛЕНИЕ: Берем медиа-контексты из сессионного bot_data
     all_media_contexts = context.application.bot_data.setdefault('media_contexts', {})
     chat_media_contexts = all_media_contexts.get(chat_id, {})
     
@@ -486,8 +487,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         
         request_contents = history_for_api + [types.Content(parts=current_request_parts, role="user")]
         
-        tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
-        response_obj = await generate_response(client, request_contents, context, tools)
+        response_obj = await generate_response(client, request_contents, context, ALL_TOOLS)
         
         if isinstance(response_obj, str):
             reply_text = response_obj
@@ -607,7 +607,7 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
         
         content_parts = [media_part, types.Part(text=prompt)]
         
-        response_obj = await generate_response(client, [types.Content(parts=content_parts, role="user")], context, MEDIA_TOOLS)
+        response_obj = await generate_response(client, [types.Content(parts=content_parts, role="user")], context, ALL_TOOLS)
         result_text = format_gemini_response(response_obj) if not isinstance(response_obj, str) else response_obj
         await send_reply(update.message, result_text)
     
@@ -783,7 +783,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cus
     if not text: return
         
     chat_id = message.chat_id
-    context.chat_data['id'] = chat_id # Для совместимости с persistence
+    context.chat_data['id'] = chat_id
     
     content_parts = [types.Part(text=text)]
     is_media_follow_up = False
