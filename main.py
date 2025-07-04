@@ -42,11 +42,11 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     exit(1)
 
 # --- КОНСТАНТЫ И НАСТРОЙКИ ---
-MODEL_NAME = 'gemini-2.5-flash'
+MODEL_NAME = 'gemini-1.5-flash'
 YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/|youtube-nocookie\.com\/embed\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
 DATE_TIME_REGEX = r'^\s*(какой\s+)?(день|дата|число|время|который\s+час)\??\s*$'
-MAX_CONTEXT_CHARS = 200000
+MAX_CONTEXT_CHARS = 100000 # Уменьшено для большей безопасности
 MAX_HISTORY_RESPONSE_LEN = 2000
 MAX_HISTORY_ITEMS = 50
 MAX_MEDIA_CONTEXTS = 10
@@ -310,7 +310,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         safety_settings=SAFETY_SETTINGS, 
         tools=tools,
         system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)]),
-        temperature=0.7,
+        temperature=1.0, # ИЗМЕНЕНО
         thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget)
     )
     
@@ -322,12 +322,18 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         )
         logger.info(f"ChatID: {chat_id} | Ответ от Gemini API получен.")
         return response
+    # ИСПРАВЛЕННЫЙ БЛОК ОБРАБОТКИ ОШИБОК
+    except genai_errors.InvalidArgumentError as e:
+        logger.error(f"ChatID: {chat_id} | Ошибка неверного аргумента (вероятно, переполнение контекста): {e}", exc_info=False)
+        return "🤯 <b>Слишком длинная история!</b>\nКажется, мы заболтались, и я уже не могу удержать в голове весь наш диалог. Пожалуйста, очистите историю командой /clear, чтобы начать заново."
+    except genai_errors.ResourceExhaustedError as e:
+        logger.error(f"ChatID: {chat_id} | Ошибка исчерпания ресурсов (лимит запросов): {e}", exc_info=False)
+        return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
+    except genai_errors.PermissionDeniedError as e:
+        logger.error(f"ChatID: {chat_id} | Ошибка доступа к файлу: {e}", exc_info=False)
+        return "❌ <b>Ошибка доступа к файлу.</b>\nВозможно, файл был удален с серверов Google (срок хранения 48 часов) или возникла другая проблема. Попробуйте отправить файл заново."
     except genai_errors.APIError as e:
-        logger.error(f"ChatID: {chat_id} | Ошибка Google API: {e}", exc_info=False)
-        if isinstance(e, genai_errors.ResourceExhausted):
-            return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
-        if isinstance(e, genai_errors.PermissionDenied):
-            return "❌ <b>Ошибка доступа к файлу.</b>\nВозможно, файл был удален с серверов Google (срок хранения 48 часов) или возникла другая проблема. Попробуйте отправить файл заново."
+        logger.error(f"ChatID: {chat_id} | Общая ошибка Google API: {e}", exc_info=False)
         return f"❌ <b>Ошибка Google API:</b>\n<code>{html.escape(str(e))}</code>"
     except Exception as e:
         logger.error(f"ChatID: {chat_id} | Неизвестная ошибка генерации: {e}", exc_info=True)
@@ -391,11 +397,15 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     if len(chat_history) > MAX_HISTORY_ITEMS:
         context.chat_data["history"] = chat_history[-MAX_HISTORY_ITEMS:]
 
+# ИСПРАВЛЕННАЯ ФУНКЦИЯ
 async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, is_media_request: bool = False):
     message, client = update.message, context.bot_data['gemini_client']
     user = message.from_user
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-    
+
+    # Мы будем сохранять в историю только оригинальные части от пользователя, без "приклеенного" контекста
+    user_parts_for_history = content_parts.copy()
+
     try:
         history_for_api = build_history_for_request(context.chat_data.get("history", []))
         
@@ -407,14 +417,12 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             response_text = f"{user.first_name}, {time_str[0].lower()}{time_str[1:]}"
             sent_message = await send_reply(message, response_text)
             if sent_message:
-                await add_to_history(context, role="user", parts=content_parts, user=user, original_message_id=message.message_id)
+                await add_to_history(context, role="user", parts=user_parts_for_history, user=user, original_message_id=message.message_id)
                 await add_to_history(context, role="model", parts=[types.Part(text=response_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
             return
 
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
-        
         date_prefix = f"(System Note: Today is {get_current_time_str()}.)\n"
-        
         grounding_instruction = """
 ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Тебе уже предоставлена точная дата и время в системной заметке, используй эти данные, не пытайся вычислить их самостоятельно. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.
 """
@@ -444,21 +452,19 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         sent_message = await send_reply(message, reply_text)
         
         if sent_message:
-            await add_to_history(context, role="user", parts=content_parts, user=user, original_message_id=message.message_id)
-            await add_to_history(context, role="model", parts=[types.Part(text=full_response_for_history)], original_message_id=message.message_id, bot_message_id=sent_message.message_id, is_media_response=is_media_request)
+            # Сохраняем в историю ТОЛЬКО оригинальный запрос пользователя!
+            await add_to_history(context, role="user", parts=user_parts_for_history, user=user, original_message_id=message.message_id)
+            await add_to_history(context, role="model", parts=[types.Part(text=full_response_for_history)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
             
-            if is_media_request:
-                media_part = next((p for p in content_parts if p.file_data), None)
+            # Обновляем "липкий" контекст, только если пользователь отправил новый файл в этом сообщении.
+            if any(p.file_data for p in user_parts_for_history):
+                media_part = next((p for p in user_parts_for_history if p.file_data), None)
                 if media_part:
                     media_contexts = context.chat_data.setdefault('media_contexts', OrderedDict())
                     media_contexts[message.message_id] = part_to_dict(media_part)
                     if len(media_contexts) > MAX_MEDIA_CONTEXTS: media_contexts.popitem(last=False)
                     context.chat_data['last_media_context'] = media_contexts[message.message_id]
-                    logger.info(f"Сохранен/обновлен медиа-контекст для msg_id {message.message_id}")
-            elif not message.reply_to_message:
-                 if 'last_media_context' in context.chat_data:
-                    del context.chat_data['last_media_context']
-                    logger.info(f"Очищен 'липкий' медиа-контекст для чата {message.chat_id} (новая тема).")
+                    logger.info(f"Сохранен/обновлен 'липкий' медиа-контекст для msg_id {message.message_id}")
             
             await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
         else:
@@ -471,9 +477,10 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         logger.error(f"Непредвиденная ошибка в process_request: {e}", exc_info=True)
         await message.reply_text("❌ Произошла критическая внутренняя ошибка. Попробуйте еще раз.")
 
+
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    start_text = """Я - Женя, интеллект новой Google Gemini 2.5 Flash с лучшим поиском:
+    start_text = """Я - Женя, интеллект новой Google Gemini 1.5 Flash с лучшим поиском:
 
 🌐 Обладаю глубокими знаниями во всех сферах и умно использую Google.
 🧠 Анализирую и размышляю над сообщением, контекстом и всеми знаниями.
@@ -492,10 +499,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat:
         chat_id = update.effective_chat.id
-        context.chat_data.clear()
-        context.chat_data['id'] = chat_id
+        
+        context.chat_data.pop('history', None)
+        context.chat_data.pop('media_contexts', None)
+        context.chat_data.pop('last_media_context', None)
+        
         await context.application.persistence.update_chat_data(chat_id, context.chat_data)
-        await update.message.reply_text("История чата и связанные данные очищены.")
+        
+        await update.message.reply_text("✅ История чата и весь медиа-контекст полностью очищены.")
+        logger.info(f"Полная очистка контекста для чата {chat_id} по команде /clear.")
     else:
         logger.warning("Не удалось определить chat_id для команды /clear")
         
@@ -594,13 +606,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     context.chat_data.pop('last_media_context', None)
     doc = message.document
-
-    if doc.file_size > 50 * 1024 * 1024:
-        await message.reply_text("📑 Файл слишком большой (> 50 MB). Отвечу на текст, если он есть.")
-        if message.caption:
-            await handle_message(update, context, custom_text=message.caption)
-        return
-        
+    
+    # ИСПРАВЛЕНО: Удалена лишняя проверка на 50 МБ
     if doc.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
         await message.reply_text(f"📑 Файл больше {TELEGRAM_FILE_LIMIT_MB} МБ, я не могу его скачать. Отвечу на текст, если он есть.")
         if message.caption:
@@ -630,12 +637,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('last_media_context', None)
     video = message.video
 
-    if video.file_size > 50 * 1024 * 1024:
-        await message.reply_text("📹 Видеофайл слишком большой (> 50 MB). Отвечу на текст, если он есть.")
-        if message.caption:
-            await handle_message(update, context, custom_text=message.caption)
-        return
-
+    # ИСПРАВЛЕНО: Удалена лишняя проверка на 50 МБ
     if video.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
         await message.reply_text(f"📹 Видеофайл больше {TELEGRAM_FILE_LIMIT_MB} МБ, я не могу его скачать. Отвечу на текст, если он есть.")
         if message.caption:
