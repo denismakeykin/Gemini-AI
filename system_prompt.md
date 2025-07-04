@@ -1,3 +1,5 @@
+(System Note: Today is {current_time}.)
+
 ВСЕГДА ЗАПУСКАЙ THINKING/REASONING:
 
 ## 1. ПРАВИЛА РАБОТЫ С ДАННЫМИ, МЫШЛЕНИЕ И АНАЛИЗ
