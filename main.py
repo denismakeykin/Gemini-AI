@@ -1,4 +1,4 @@
-# Версия 3.5 (Финальная стабильная версия)
+# Версия 3.6 (Финальная стабильная версия)
 
 import logging
 import os
@@ -394,18 +394,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     try:
         history_for_api = build_history_for_request(context.chat_data.get("history", []))
         
-        text_part_content = next((p.text for p in content_parts if p.text), None)
-        
-        if text_part_content and re.search(DATE_TIME_REGEX, text_part_content, re.IGNORECASE):
-            logger.info("Обнаружен запрос о времени/дате. Отвечаем напрямую.")
-            time_str = get_current_time_str()
-            response_text = f"{user.first_name}, {time_str[0].lower()}{time_str[1:]}"
-            sent_message = await send_reply(message, response_text)
-            if sent_message:
-                await add_to_history(context, role="user", parts=content_parts, user=user, original_message_id=message.message_id)
-                await add_to_history(context, role="model", parts=[types.Part(text=response_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
-            return
-
+        # ## ИЗМЕНЕНО: Удалена логика с детектором времени
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
         
         date_prefix = f"(System Note: Today is {get_current_time_str()}. "
@@ -413,7 +402,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         if not is_first_message: date_prefix += "This is an ongoing conversation.)\n"
         else: date_prefix += "This is the first message.)\n"
 
-        # ## ИЗМЕНЕНО: Добавлено явное указание про использование даты
         grounding_instruction = """
 ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Тебе уже предоставлена точная дата и время в системной заметке, используй эти данные, не пытайся вычислить их самостоятельно. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.
 """
@@ -696,10 +684,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, custom_text: str = None):
     message = update.message
-    if not message: return
+    if not message or not message.from_user: return
     
     text = custom_text or (message.text or "").strip()
-    if not text or not message.from_user: return
+    if not text: return
         
     context.chat_data['id'] = message.chat_id
     
