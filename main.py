@@ -1,4 +1,4 @@
-# Версия 3.7 (Финальная, с корректно замененными обработчиками)
+# Версия 3.8 (Стабильная Гавань)
 
 import logging
 import os
@@ -399,25 +399,10 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     try:
         history_for_api = build_history_for_request(context.chat_data.get("history", []))
         
-        text_part_content = next((p.text for p in content_parts if p.text), None)
-        
-        if text_part_content and re.search(DATE_TIME_REGEX, text_part_content, re.IGNORECASE):
-            logger.info("Обнаружен запрос о времени/дате. Отвечаем напрямую.")
-            time_str = get_current_time_str()
-            response_text = f"{user.first_name}, {time_str[0].lower()}{time_str[1:]}"
-            sent_message = await send_reply(message, response_text)
-            if sent_message:
-                await add_to_history(context, role="user", parts=content_parts, user=user, original_message_id=message.message_id)
-                await add_to_history(context, role="model", parts=[types.Part(text=response_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
-            return
-
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
         
-        date_prefix = f"(System Note: Today is {get_current_time_str()}. "
-        is_first_message = not bool(history_for_api)
-        if not is_first_message: date_prefix += "This is an ongoing conversation.)\n"
-        else: date_prefix += "This is the first message.)\n"
-
+        date_prefix = f"(System Note: Today is {get_current_time_str()}.)\n"
+        
         grounding_instruction = """
 ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Тебе уже предоставлена точная дата и время в системной заметке, используй эти данные, не пытайся вычислить их самостоятельно. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.
 """
@@ -474,93 +459,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         logger.error(f"Непредвиденная ошибка в process_request: {e}", exc_info=True)
         await message.reply_text("❌ Произошла критическая внутренняя ошибка. Попробуйте еще раз.")
 
-# --- ОБРАБОТЧИКИ КОМАНД ---
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    start_text = """Я - Женя, интеллект новой Google Gemini 2.5 Flash с лучшим поиском:
-
-🌐 Обладаю глубокими знаниями во всех сферах и умно использую Google.
-🧠 Анализирую и размышляю над сообщением, контекстом и всеми знаниями.
-💬 Отвечу на любые вопросы в понятном и приятном стиле, иногда с юмором. Могу сделать описание/конспект, расшифровку, искать по содержимому.
-
-Принимаю и понимаю:
-✉️ Текстовые, 🎤 Голосовые и 🎧 Аудиофайлы,
-📸 Изображения, 🎞 Видео (до 50 мб), 📹 ссылки на YouTube, 
-🔗 Веб-страницы,📑 Файлы PDF, TXT, JSON.
-
-Пользуйтесь и добавляйте в свои группы!
-
-(!) Используя бот, Вы автоматически соглашаетесь на передачу сообщений и файлов для получения ответов через Google Gemini API."""
-    await update.message.reply_html(start_text)
-
-async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat:
-        chat_id = update.effective_chat.id
-        context.chat_data.clear()
-        context.chat_data['id'] = chat_id
-        await context.application.persistence.update_chat_data(chat_id, context.chat_data)
-        await update.message.reply_text("История чата и связанные данные очищены.")
-    else:
-        logger.warning("Не удалось определить chat_id для команды /clear")
-        
-async def newtopic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data.pop('last_media_context', None)
-    context.chat_data.pop('media_contexts', None)
-    await update.message.reply_text("Контекст предыдущих файлов очищен. Начинаем новую тему.")
-
-async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
-    if not update.message or not update.message.reply_to_message:
-        return await update.message.reply_text("Пожалуйста, используйте эту команду в ответ на сообщение с медиафайлом или ссылкой.")
-
-    replied_message = update.message.reply_to_message
-    media_obj = replied_message.audio or replied_message.voice or replied_message.video or replied_message.photo or replied_message.document
-    
-    media_part = None
-    client = context.bot_data['gemini_client']
-    
-    try:
-        if media_obj:
-            if hasattr(media_obj, 'file_size') and media_obj.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
-                return await update.message.reply_text(f"❌ Файл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB) для обработки этой командой.")
-            media_file = await media_obj.get_file()
-            media_bytes = await media_file.download_as_bytearray()
-            media_part = await upload_and_wait_for_file(client, media_bytes, media_obj.mime_type, getattr(media_obj, 'file_name', 'media.bin'))
-        elif replied_message.text:
-            yt_match = re.search(YOUTUBE_REGEX, replied_message.text)
-            if yt_match:
-                youtube_url = f"https://www.youtube.com/watch?v={yt_match.group(1)}"
-                media_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
-            else:
-                return await update.message.reply_text("В цитируемом сообщении нет поддерживаемого медиафайла или YouTube-ссылки.")
-        else:
-            return await update.message.reply_text("Не удалось найти медиафайл в цитируемом сообщении.")
-
-        await update.message.reply_text("Анализирую...", reply_to_message_id=update.message.message_id)
-        
-        content_parts = [media_part, types.Part(text=prompt)]
-        
-        response_obj = await generate_response(client, [types.Content(parts=content_parts, role="user")], context, MEDIA_TOOLS)
-        result_text = format_gemini_response(response_obj) if isinstance(response_obj, types.GenerateContentResponse) else response_obj
-        await send_reply(update.message, result_text)
-    
-    except BadRequest as e:
-        if "File is too big" in str(e):
-             await update.message.reply_text(f"❌ Файл слишком большой (> {TELEGRAM_FILE_LIMIT_MB} MB) для обработки.")
-        else:
-             logger.error(f"Ошибка BadRequest в утилитарной команде: {e}", exc_info=True)
-             await update.message.reply_text(f"❌ Произошла ошибка Telegram: {e}")
-    except Exception as e:
-        logger.error(f"Ошибка в утилитарной команде: {e}", exc_info=True)
-        await update.message.reply_text(f"❌ Не удалось выполнить команду: {e}")
-
-async def transcript_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await utility_media_command(update, context, "Transcribe this audio/video file. Return only the transcribed text, without any comments or introductory phrases.")
-
-async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await utility_media_command(update, context, "Summarize this material in a few paragraphs. Provide a concise but comprehensive overview.")
-    
-async def keypoints_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await utility_media_command(update, context, "Extract the key points or main theses from this material. Present them as a structured bulleted list.")
-
+# ## ИЗМЕНЕНО: Заменяю весь блок обработчиков на твою версию
 # --- ОБРАБОТЧИКИ СООБЩЕНИЙ ---
 async def handle_media_request(update: Update, context: ContextTypes.DEFAULT_TYPE, file_part: types.Part, user_text: str):
     content_parts = [file_part, types.Part(text=user_text)]
@@ -569,7 +468,10 @@ async def handle_media_request(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.photo: return
-
+    
+    # Очистка старого "липкого" контекста при получении нового медиа
+    context.chat_data.pop('last_media_context', None)
+    
     photo = message.photo[-1]
     if photo.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
         await message.reply_text(f"🖼️ Изображение слишком большое (> {TELEGRAM_FILE_LIMIT_MB} MB), я не могу его проанализировать, но сейчас отвечу на текстовую часть сообщения, если она есть.")
@@ -592,6 +494,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.document: return
+    
+    context.chat_data.pop('last_media_context', None)
     doc = message.document
 
     if doc.file_size > 50 * 1024 * 1024:
@@ -625,6 +529,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.video: return
+
+    context.chat_data.pop('last_media_context', None)
     video = message.video
 
     if video.file_size > 50 * 1024 * 1024:
@@ -644,7 +550,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_file = await video.get_file()
         video_bytes = await video_file.download_as_bytearray()
         video_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], video_bytes, video.mime_type, video.file_name or "video.mp4")
-        await handle_media_request(update, context, video_part, message.caption or "Проанализируй видео и выскажи свое мнение. Не указывай таймкоды без просьбы. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'.")
+        await handle_media_request(update, context, video_part, message.caption or "Проанализируй видео и выскажи свое мнение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом.")
     except (BadRequest, IOError) as e:
         logger.error(f"Ошибка при обработке видео: {e}")
         await message.reply_text(f"❌ Ошибка обработки видео: {e}")
@@ -655,6 +561,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_source=None):
     message = update.message
     if not message: return
+
+    context.chat_data.pop('last_media_context', None)
     audio = audio_source or message.audio or message.voice
     if not audio: return
 
@@ -665,7 +573,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
          return
 
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
-    user_text = message.caption or "Проанализируй аудио и выскажи свое мнение. Не указывай таймкоды без просьбы. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'."
+    user_text = message.caption or "Ответь на это голосовое сообщение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом."
     
     try:
         audio_file = await audio.get_file()
@@ -681,6 +589,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
 
 async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, text = update.message, update.message.text or ""
+    
+    context.chat_data.pop('last_media_context', None)
     match = re.search(YOUTUBE_REGEX, text)
     if not match: return
     
@@ -688,7 +598,7 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await message.reply_text("Анализирую видео с YouTube...", reply_to_message_id=message.id)
     try:
         youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
-        user_prompt = text.replace(match.group(0), "").strip() or "Проанализируй YouTube-видео и выскажи свое мнение. Не указывай таймкоды без просьбы. Предоставляй транскрипт только при запросе со словами 'расшифровка', 'транскрипт' или 'дословно'."
+        user_prompt = text.replace(match.group(0), "").strip() or "Посмотри YouTube-видео и выскажи свое мнение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом."
         await handle_media_request(update, context, youtube_part, user_prompt)
     except Exception as e:
         logger.error(f"Ошибка при обработке YouTube URL {youtube_url}: {e}", exc_info=True)
