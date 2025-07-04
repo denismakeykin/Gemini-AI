@@ -1,4 +1,4 @@
-# Версия 2.5 (основана на 'Custom vrs' с учетом пожеланий и правок автора)
+# Версия 2.7 (основана на 'Custom vrs' с финальными правками и мышлением на максимум)
 
 import logging
 import os
@@ -54,6 +54,7 @@ TELEGRAM_FILE_LIMIT_MB = 20
 # --- ИНСТРУМЕНТЫ И ПРОМПТЫ ---
 CORE_TOOLS = [types.Tool(google_search=types.GoogleSearch(), code_execution=types.ToolCodeExecution())]
 
+# ## ИЗМЕНЕНО: Подтверждено, что цензура отключена (BLOCK_NONE - верная настройка)
 SAFETY_SETTINGS = [
     types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
     for c in (types.HarmCategory.HARM_CATEGORY_HARASSMENT, types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -65,9 +66,10 @@ try:
     logger.info("Системный промпт успешно загружен из файла.")
 except FileNotFoundError:
     logger.error("Файл system_prompt.md не найден! Будет использована инструкция по умолчанию.")
-    SYSTEM_INSTRUCTION = """Ты - Женя, дружелюбный и полезный ассистент. Всегда используй поиск Google для проверки фактов и получения актуальной информации."""
+    SYSTEM_INSTRUCTION = """КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search для поиска актуальных ВСЕВОЗМОЖНЫХ и ВСЕСТОРОННИХ ДАННЫХ, СОХРАНЯЯ все источники."""
 
 # --- КЛАСС PERSISTENCE ---
+# ... (код класса PostgresPersistence остается без изменений) ...
 class PostgresPersistence(BasePersistence):
     def __init__(self, database_url: str):
         super().__init__()
@@ -165,7 +167,9 @@ class PostgresPersistence(BasePersistence):
     def close(self):
         if self.db_pool: self.db_pool.closeall()
 
+
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# ... (функции с get_current_time_str до generate_response остаются без изменений) ...
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
     return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
 
@@ -278,10 +282,11 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
         logger.error(f"Ошибка при загрузке файла через File API: {e}", exc_info=True)
         raise IOError(f"Не удалось загрузить или обработать файл '{file_name}' на сервере Google.")
 
+
 async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE) -> types.GenerateContentResponse | str:
     chat_id = context.chat_data.get('id', 'Unknown')
-    thinking_mode = get_user_setting(context, 'thinking_mode', 'auto')
-    thinking_budget = -1 if thinking_mode == 'auto' else 24576
+    # ## ИЗМЕНЕНО: Мышление включено на максимум по умолчанию. Настройки через /config убраны.
+    thinking_budget = 24576
     
     config = types.GenerateContentConfig(
         safety_settings=SAFETY_SETTINGS, 
@@ -299,13 +304,12 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         )
         logger.info(f"ChatID: {chat_id} | Ответ от Gemini API получен.")
         return response
-    # ## ИЗМЕНЕНО: Возвращена детальная обработка ошибок API из V1
     except types.GoogleAPIError as e:
         logger.error(f"ChatID: {chat_id} | Ошибка Google API: {e}", exc_info=True)
         if hasattr(e, 'code'):
-             if e.code == 429: # ResourceExhausted
+             if e.code == 429:
                  return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
-             if e.code == 403: # PermissionDenied
+             if e.code == 403:
                  return "❌ <b>Ошибка доступа к файлу.</b>\nВозможно, файл был удален с серверов Google (срок хранения 48 часов) или возникла другая проблема. Попробуйте отправить файл заново."
         return f"❌ <b>Ошибка Google API:</b>\n<code>{html.escape(str(e))}</code>"
     except Exception as e:
@@ -313,20 +317,24 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         return f"❌ <b>Произошла внутренняя ошибка:</b>\n<code>{html.escape(str(e))}</code>"
 
 def format_gemini_response(response: types.GenerateContentResponse) -> str:
-    if not response or not response.candidates:
-        return "Ответа не последовало."
-    
-    result_parts = []
-    if response.candidates[0].content and response.candidates[0].content.parts:
-        for part in response.candidates[0].content.parts:
-            if part.text:
-                result_parts.append(part.text)
-    
-    if not result_parts:
-        return getattr(response, 'text', "Получен пустой ответ от модели.")
+    try:
+        if response and response.candidates:
+            if response.candidates[0].finish_reason.name == "SAFETY":
+                logger.warning("Ответ заблокирован по соображениям безопасности.")
+                return "Мой ответ был заблокирован из-за внутренних правил безопасности. Пожалуйста, переформулируйте запрос."
 
-    return "".join(result_parts)
+            if response.candidates[0].content and response.candidates[0].content.parts:
+                result_parts = [part.text for part in response.candidates[0].content.parts if part.text]
+                return "".join(result_parts)
+        
+        logger.warning("Получен пустой или некорректный ответ от API.")
+        return "Я не смогла сформировать ответ. Попробуйте еще раз."
+        
+    except (AttributeError, IndexError) as e:
+        logger.error(f"Ошибка при парсинге ответа Gemini: {e}", exc_info=True)
+        return "Произошла ошибка при обработке ответа от нейросети."
 
+# ... (функции send_reply и add_to_history остаются без изменений) ...
 async def send_reply(target_message: Message, response_text: str) -> Message | None:
     sanitized_text = re.sub(r'<br\s*/?>', '\n', response_text)
     chunks = html_safe_chunker(sanitized_text)
@@ -376,8 +384,6 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     if len(chat_history) > MAX_HISTORY_ITEMS:
         context.chat_data["history"] = chat_history[-MAX_HISTORY_ITEMS:]
 
-# Версия 2.5 (основана на 'Custom vrs' с исправлением "лени" модели)
-
 async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, is_media_request: bool = False):
     message, client = update.message, context.bot_data['gemini_client']
     user = message.from_user
@@ -392,23 +398,19 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         if text_part_index != -1:
             original_text = request_specific_parts[text_part_index].text
             
-            # ## ИЗМЕНЕНО: Полная переработка логики промпта для принудительного поиска
-            
             user_prefix = f"[{user.id}; Name: {user.first_name}]: "
             is_first_message = not bool(history)
             
-            # 1. Системная заметка о дате и контексте диалога
             date_prefix = f"(System Note: Today is {get_current_time_str()}. "
             if not is_first_message:
                 date_prefix += "This is an ongoing conversation, do not greet the user.)\n"
             else:
                 date_prefix += "This is the first message.)\n"
 
-            # 2. Критическое, безапелляционное правило поиска, которое идет ПЕРЕД запросом пользователя
+            # ## ИЗМЕНЕНО: Обновлена тактическая инструкция в соответствии с твоей версией
             grounding_instruction = """
-КРИТИЧЕСКОЕ ПРАВИЛО: Учитывая текущую дату и время, ты ОБЯЗАН АКТИВНО использовать Grounding with Google Search для поиска в интернете, чтобы найти ответы, перепроверить предоставленные и найти актуальные ВСЕВОЗМОЖНЫЕ и ВСЕСТОРОННИЕ ДАННЫЕ, учитывая и СОХРАНЯЯ все источники. Твоя внутренняя память устарела, поэтому не отвечай только на её основе, если запрос подразумевает информацию о фактах, событиях, личностях или любых данных, которые могут меняться со временем.
+КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search для поиска актуальных ВСЕВОЗМОЖНЫХ и ВСЕСТОРОННИХ ДАННЫХ, СОХРАНЯЯ все источники.
 """
-            # 3. Формируем итоговый промпт: сначала все инструкции, потом сам запрос
             final_prompt_text = f"{date_prefix}{grounding_instruction}\n{user_prefix}{original_text}"
             
             request_specific_parts[text_part_index].text = final_prompt_text
@@ -427,7 +429,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         sent_message = await send_reply(message, reply_text)
         
         if sent_message:
-            # В историю сохраняем оригинальный запрос пользователя, без наших инструкций
             await add_to_history(context, role="user", parts=content_parts, original_message_id=message.message_id)
             await add_to_history(context, role="model", parts=[types.Part(text=full_response_for_history)], original_message_id=message.message_id, bot_message_id=sent_message.message_id, is_media_response=is_media_request)
             
@@ -456,7 +457,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data.setdefault('thinking_mode', 'auto')
     start_text = """Я - Женя, интеллект новой Google Gemini 2.5 Flash с лучшим поиском:
 
 🌐 Обладаю глубокими знаниями во всех сферах и умно использую Google.
@@ -473,52 +473,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 (!) Используя бот, Вы автоматически соглашаетесь на передачу сообщений и файлов для получения ответов через Google Gemini API."""
     await update.message.reply_html(start_text)
 
-async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mode = get_user_setting(context, 'thinking_mode', 'auto')
-    keyboard = [
-        [
-            InlineKeyboardButton(f"Мышление: {'✅ ' if mode == 'auto' else ''}Авто", callback_data="set_thinking_auto"),
-            InlineKeyboardButton(f"Мышление: {'✅ ' if mode == 'max' else ''}Максимум", callback_data="set_thinking_max")
-        ]
-    ]
-    await update.message.reply_text("⚙️ Настройки:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def config_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query, data = update.callback_query, update.callback_query.data
-    await query.answer()
-    
-    current_mode = get_user_setting(context, 'thinking_mode', 'auto')
-
-    if data.startswith("set_thinking_"):
-        new_mode_val = data.replace("set_thinking_", "")
-        set_user_setting(context, 'thinking_mode', new_mode_val)
-
-    new_mode = get_user_setting(context, 'thinking_mode', 'auto')
-    if current_mode == new_mode: return
-
-    keyboard = [
-        [
-            InlineKeyboardButton(f"Мышление: {'✅ ' if new_mode == 'auto' else ''}Авто", callback_data="set_thinking_auto"),
-            InlineKeyboardButton(f"Мышление: {'✅ ' if new_mode == 'max' else ''}Максимум", callback_data="set_thinking_max")
-        ]
-    ]
-    try:
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
-    except BadRequest as e:
-        if "Message is not modified" in str(e): logger.info("Сообщение с настройками не изменилось.")
-        else: raise e
+# ## ИЗМЕНЕНО: Команды config и config_callback удалены за ненадобностью
+# async def config_command...
+# async def config_callback...
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat:
         chat_id = update.effective_chat.id
         context.chat_data.clear()
         context.chat_data['id'] = chat_id
-        context.chat_data.setdefault('thinking_mode', 'auto')
         await context.application.persistence.update_chat_data(chat_id, context.chat_data)
-        await update.message.reply_text("История чата и связанные данные очищены. Настройки сброшены по умолчанию.")
+        await update.message.reply_text("История чата и связанные данные очищены.")
     else:
         logger.warning("Не удалось определить chat_id для команды /clear")
-
+        
+# ... (остальной код с newtopic_command до main остается без изменений) ...
 async def newtopic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('last_media_context', None)
     context.chat_data.pop('media_contexts', None)
@@ -720,6 +689,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await process_request(update, context, content_parts, is_media_request=is_media_follow_up)
 
+
 # --- ЗАПУСК БОТА ---
 async def handle_health_check(request: aiohttp.web.Request) -> aiohttp.web.Response:
     logger.info("Health check OK")
@@ -761,9 +731,9 @@ async def main():
     
     application.bot_data['gemini_client'] = genai.Client(api_key=GOOGLE_API_KEY)
     
+    # ## ИЗМЕНЕНО: Команда /config удалена из списка
     commands = [
         BotCommand("start", "Инфо и начало работы"),
-        BotCommand("config", "Настроить силу мышления"),
         BotCommand("transcript", "Транскрипция медиа (ответом)"),
         BotCommand("summarize", "Краткий пересказ (ответом)"),
         BotCommand("keypoints", "Ключевые тезисы (ответом)"),
@@ -771,13 +741,13 @@ async def main():
         BotCommand("clear", "Очистить всю историю чата")
     ]
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("config", config_command))
+    # ## ИЗМЕНЕНО: Обработчик для /config удален
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("transcript", transcript_command))
     application.add_handler(CommandHandler("summarize", summarize_command))
     application.add_handler(CommandHandler("keypoints", keypoints_command))
     application.add_handler(CommandHandler("newtopic", newtopic_command))
-    application.add_handler(CallbackQueryHandler(config_callback))
+    # ## ИЗМЕНЕНО: Обработчик для колбэка /config удален
     
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
