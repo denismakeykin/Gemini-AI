@@ -244,7 +244,6 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
         if entry.get("role") in ("user", "model") and isinstance(entry.get("parts"), list):
             entry_api_parts = []
             entry_text_len = 0
-            # Восстановлена простая и надежная логика
             if entry.get("role") == "user":
                 user_id = entry.get('user_id', 'Unknown')
                 user_name = entry.get('user_name', 'User')
