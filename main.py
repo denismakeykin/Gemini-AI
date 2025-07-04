@@ -336,7 +336,7 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
         raise IOError(f"Не удалось загрузить или обработать файл '{file_name}' на сервере Google.")
 
 async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> types.GenerateContentResponse | str:
-    chat_id = context.effective_chat.id
+    chat_id = context.chat_data.get('id', 'Unknown')
     thinking_budget = 24576
     
     try:
