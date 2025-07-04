@@ -1,4 +1,4 @@
-# Версия 3.5 (Стабильная, с финальными правками промпта от автора)
+# Версия 3.5 (Финальная стабильная версия)
 
 import logging
 import os
@@ -45,7 +45,7 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
 MODEL_NAME = 'gemini-2.5-flash'
 YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/|youtube-nocookie\.com\/embed\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
-DATE_TIME_REGEX = r'\b(день|дата|число|время|который час)\b'
+# ## ИЗМЕНЕНО: Детектор времени полностью удален
 MAX_CONTEXT_CHARS = 200000
 MAX_HISTORY_RESPONSE_LEN = 2000
 MAX_HISTORY_ITEMS = 50
@@ -68,7 +68,6 @@ try:
     logger.info("Системный промпт успешно загружен из файла.")
 except FileNotFoundError:
     logger.error("Файл system_prompt.md не найден! Будет использована инструкция по умолчанию.")
-    # ## ИЗМЕНЕНО: Обновлена формулировка
     SYSTEM_INSTRUCTION = """ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме."""
 
 # --- КЛАСС PERSISTENCE ---
@@ -169,11 +168,7 @@ class PostgresPersistence(BasePersistence):
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
-    now = datetime.datetime.now(pytz.timezone(timezone))
-    days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-    months = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
-    day_of_week = days[now.weekday()]
-    return f"Сегодня {day_of_week}, {now.day} {months[now.month-1]} {now.year} года, время {now.strftime('%H:%M')} (MSK)."
+    return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
 
 def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
     chunks, tag_stack, remaining_text = [], [], text_to_chunk
@@ -413,14 +408,14 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             return
 
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
-        is_first_message = not bool(history_for_api)
         
         date_prefix = f"(System Note: Today is {get_current_time_str()}. "
-        if not is_first_message: date_prefix += "This is an ongoing conversation, do not greet the user.)\n"
+        is_first_message = not bool(history_for_api)
+        if not is_first_message: date_prefix += "This is an ongoing conversation.)\n"
         else: date_prefix += "This is the first message.)\n"
 
         grounding_instruction = """
-ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.
+ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Тебе уже предоставлена точная дата и время в системной заметке, используй эти данные, не пытайся вычислить их самостоятельно. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.
 """
         
         current_request_parts = []
@@ -451,6 +446,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             await add_to_history(context, role="user", parts=content_parts, user=user, original_message_id=message.message_id)
             await add_to_history(context, role="model", parts=[types.Part(text=full_response_for_history)], original_message_id=message.message_id, bot_message_id=sent_message.message_id, is_media_response=is_media_request)
             
+            # ## ИЗМЕНЕНО: Возвращена логика "липкого" контекста
             if is_media_request:
                 media_part = next((p for p in content_parts if p.file_data), None)
                 if media_part:
@@ -459,9 +455,10 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
                     if len(media_contexts) > MAX_MEDIA_CONTEXTS: media_contexts.popitem(last=False)
                     context.chat_data['last_media_context'] = media_contexts[message.message_id]
                     logger.info(f"Сохранен/обновлен медиа-контекст для msg_id {message.message_id}")
-            elif not message.reply_to_message and 'last_media_context' in context.chat_data:
-                del context.chat_data['last_media_context']
-                logger.info(f"Очищен 'липкий' медиа-контекст для чата {message.chat_id} (новая тема).")
+            elif not message.reply_to_message:
+                 if 'last_media_context' in context.chat_data:
+                    del context.chat_data['last_media_context']
+                    logger.info(f"Очищен 'липкий' медиа-контекст для чата {message.chat_id} (новая тема).")
             
             await context.application.persistence.update_chat_data(context.chat_data.get('id'), context.chat_data)
         else:
@@ -563,7 +560,7 @@ async def keypoints_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ОБРАБОТЧИКИ СООБЩЕНИЙ ---
 async def handle_media_request(update: Update, context: ContextTypes.DEFAULT_TYPE, file_part: types.Part, user_text: str):
-    context.chat_data.pop('last_media_context', None)
+    # ## ИЗМЕНЕНО: Убираем очистку липкого контекста отсюда
     content_parts = [file_part, types.Part(text=user_text)]
     await process_request(update, context, content_parts, is_media_request=True)
 
@@ -575,8 +572,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if photo.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
         await message.reply_text(f"🖼️ Изображение слишком большое (> {TELEGRAM_FILE_LIMIT_MB} MB), я не могу его проанализировать, но сейчас отвечу на текстовую часть сообщения, если она есть.")
         if message.caption:
-            message.text = message.caption
-            await handle_message(update, context)
+            await handle_message(update, context, custom_text=message.caption)
         return
 
     try:
@@ -599,15 +595,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if doc.file_size > 50 * 1024 * 1024:
         await message.reply_text("📑 Файл слишком большой (> 50 MB). Отвечу на текст, если он есть.")
         if message.caption:
-            message.text = message.caption
-            await handle_message(update, context)
+            await handle_message(update, context, custom_text=message.caption)
         return
         
     if doc.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
         await message.reply_text(f"📑 Файл больше {TELEGRAM_FILE_LIMIT_MB} МБ, я не могу его скачать. Отвечу на текст, если он есть.")
         if message.caption:
-            message.text = message.caption
-            await handle_message(update, context)
+            await handle_message(update, context, custom_text=message.caption)
         return
 
     if doc.mime_type and doc.mime_type.startswith("audio/"):
@@ -634,15 +628,13 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if video.file_size > 50 * 1024 * 1024:
         await message.reply_text("📹 Видеофайл слишком большой (> 50 MB). Отвечу на текст, если он есть.")
         if message.caption:
-            message.text = message.caption
-            await handle_message(update, context)
+            await handle_message(update, context, custom_text=message.caption)
         return
 
     if video.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
         await message.reply_text(f"📹 Видеофайл больше {TELEGRAM_FILE_LIMIT_MB} МБ, я не могу его скачать. Отвечу на текст, если он есть.")
         if message.caption:
-            message.text = message.caption
-            await handle_message(update, context)
+            await handle_message(update, context, custom_text=message.caption)
         return
     
     await message.reply_text("Загружаю видео...", reply_to_message_id=message.id)
@@ -667,8 +659,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
     if audio.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
          await message.reply_text(f"🎧 Аудиофайл больше {TELEGRAM_FILE_LIMIT_MB} МБ, я не могу его скачать. Отвечу на текст, если он есть.")
          if message.caption:
-            message.text = message.caption
-            await handle_message(update, context)
+            await handle_message(update, context, custom_text=message.caption)
          return
 
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
@@ -703,38 +694,38 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('last_media_context', None)
-    context.chat_data.pop('media_contexts', None)
     await process_request(update, context, [types.Part(text=update.message.text)])
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message, text = update.message, (update.message.text or "").strip()
-    if (not text and not message.caption) or not message.from_user: return
-    if message.caption and not text:
-        text = message.caption
-        message.text = text
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, custom_text: str = None):
+    message = update.message
+    if not message: return
+    
+    text = custom_text or (message.text or "").strip()
+    if not text or not message.from_user: return
         
     context.chat_data['id'] = message.chat_id
     
     content_parts = [types.Part(text=text)]
     is_media_follow_up = False
     
-    if message.reply_to_message:
-        media_context = find_media_context_in_history(context, message.reply_to_message.message_id)
-        if media_context:
-            media_part = dict_to_part(media_context)
-            if media_part:
-                content_parts.insert(0, media_part)
-                is_media_follow_up = True
-                logger.info(f"Применен ЯВНЫЙ медиа-контекст (через reply) для чата {message.chat_id}")
+    if custom_text is None:
+        if message.reply_to_message:
+            media_context = find_media_context_in_history(context, message.reply_to_message.message_id)
+            if media_context:
+                media_part = dict_to_part(media_context)
+                if media_part:
+                    content_parts.insert(0, media_part)
+                    is_media_follow_up = True
+                    logger.info(f"Применен ЯВНЫЙ медиа-контекст (через reply) для чата {message.chat_id}")
 
-    if not is_media_follow_up:
-        last_media_context_dict = context.chat_data.get('last_media_context')
-        if last_media_context_dict:
-            media_part = dict_to_part(last_media_context_dict)
-            if media_part:
-                content_parts.insert(0, media_part)
-                is_media_follow_up = True
-                logger.info(f"Применен НЕЯВНЫЙ 'липкий' медиа-контекст для чата {message.chat_id}")
+        if not is_media_follow_up:
+            last_media_context_dict = context.chat_data.get('last_media_context')
+            if last_media_context_dict:
+                media_part = dict_to_part(last_media_context_dict)
+                if media_part:
+                    content_parts.insert(0, media_part)
+                    is_media_follow_up = True
+                    logger.info(f"Применен НЕЯВНЫЙ 'липкий' медиа-контекст для чата {message.chat_id}")
 
     await process_request(update, context, content_parts, is_media_request=is_media_follow_up)
 
