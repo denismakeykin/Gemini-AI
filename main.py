@@ -1,4 +1,4 @@
-# Версия 3.8.1 (Финальная, с гибридным промптом и динамической датой)
+# Версия 3.8.2 (Финальная, с защитой от гонки состояний)
 
 import logging
 import os
@@ -14,6 +14,7 @@ import time
 import datetime
 import pytz
 import html
+from functools import wraps
 
 import aiohttp
 import aiohttp.web
@@ -195,6 +196,33 @@ def html_safe_chunker(text_to_chunk: str, chunk_size: int = 4096) -> list[str]:
     chunks.append(remaining_text)
     return chunks
 
+# НОВЫЙ ДЕКОРАТОР
+def ignore_if_processing(func):
+    """Декоратор для предотвращения повторной обработки одного и того же сообщения."""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if not update or not update.message:
+            return await func(update, context, *args, **kwargs)
+
+        message_id = update.message.message_id
+        chat_id = update.message.chat_id
+        
+        processing_key = f"{chat_id}_{message_id}"
+        
+        processing_messages = context.chat_data.setdefault('processing_messages', set())
+
+        if processing_key in processing_messages:
+            logger.warning(f"Сообщение {processing_key} уже в обработке. Новый запрос проигнорирован.")
+            return
+
+        processing_messages.add(processing_key)
+        try:
+            await func(update, context, *args, **kwargs)
+        finally:
+            processing_messages.discard(processing_key)
+            
+    return wrapper
+
 def part_to_dict(part: types.Part) -> dict:
     if part.text: return {'type': 'text', 'content': part.text}
     if part.file_data: return {'type': 'file', 'uri': part.file_data.file_uri, 'mime': part.file_data.mime_type, 'timestamp': time.time()}
@@ -302,9 +330,6 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
         logger.error(f"Ошибка при загрузке файла через File API: {e}", exc_info=True)
         raise IOError(f"Не удалось загрузить или обработать файл '{file_name}' на сервере Google.")
 
-# main.py
-# ЗАМЕНИТЬ ФУНКЦИЮ generate_response ЦЕЛИКОМ
-
 async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> types.GenerateContentResponse | str:
     chat_id = context.chat_data.get('id', 'Unknown')
     thinking_budget = 24576
@@ -325,13 +350,12 @@ async def generate_response(client: genai.Client, request_contents: list, contex
     
     try:
         response = await client.aio.models.generate_content(
-            model=MODEL_NAME, # Здесь будет твоя модель 'gemini-2.5-flash'
+            model=MODEL_NAME,
             contents=request_contents,
             config=config
         )
         logger.info(f"ChatID: {chat_id} | Ответ от Gemini API получен.")
         return response
-    # ИСПРАВЛЕННЫЙ И НАДЕЖНЫЙ БЛОК ОБРАБОТКИ ОШИБОК
     except genai_errors.APIError as e:
         error_text = str(e).lower()
         logger.error(f"ChatID: {chat_id} | Ошибка Google API: {e}", exc_info=False)
@@ -339,13 +363,12 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         if "input token count" in error_text and "exceeds the maximum" in error_text:
             return "🤯 <b>Слишком длинная история!</b>\nКажется, мы заболтались, и я уже не могу удержать в голове весь наш диалог. Пожалуйста, очистите историю командой /clear, чтобы начать заново."
         
-        if "resource has been exhausted" in error_text: # Ловит ошибки лимитов запросов
+        if "resource has been exhausted" in error_text:
             return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
 
-        if "permission denied" in error_text: # Ловит ошибки доступа к файлам
+        if "permission denied" in error_text:
             return "❌ <b>Ошибка доступа к файлу.</b>\nВозможно, файл был удален с серверов Google (срок хранения 48 часов) или возникла другая проблема. Попробуйте отправить файл заново."
 
-        # Общая ошибка, если ни одно из условий не подошло
         return f"❌ <b>Ошибка Google API:</b>\n<code>{html.escape(str(e))}</code>"
     except Exception as e:
         logger.error(f"ChatID: {chat_id} | Неизвестная ошибка генерации: {e}", exc_info=True)
@@ -409,13 +432,11 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     if len(chat_history) > MAX_HISTORY_ITEMS:
         context.chat_data["history"] = chat_history[-MAX_HISTORY_ITEMS:]
 
-# ИСПРАВЛЕННАЯ ФУНКЦИЯ
 async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, content_parts: list, is_media_request: bool = False):
     message, client = update.message, context.bot_data['gemini_client']
     user = message.from_user
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
 
-    # Мы будем сохранять в историю только оригинальные части от пользователя, без "приклеенного" контекста
     user_parts_for_history = content_parts.copy()
 
     try:
@@ -434,7 +455,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             return
 
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
-        # ИСПРАВЛЕНО: Удален date_prefix. Он теперь подставляется в системную инструкцию.
         grounding_instruction = """
 ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Тебе уже предоставлена точная дата и время в системной заметке, используй эти данные, не пытайся вычислить их самостоятельно. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.
 """
@@ -443,7 +463,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         text_part_found = False
         for part in content_parts:
             if part.text and not text_part_found:
-                # ИСПРАВЛЕНО: Удален date_prefix из формирования промпта
                 final_prompt_text = f"{grounding_instruction}\n{user_prefix}{part.text}"
                 current_request_parts.append(types.Part(text=final_prompt_text))
                 text_part_found = True
@@ -465,11 +484,9 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         sent_message = await send_reply(message, reply_text)
         
         if sent_message:
-            # Сохраняем в историю ТОЛЬКО оригинальный запрос пользователя!
             await add_to_history(context, role="user", parts=user_parts_for_history, user=user, original_message_id=message.message_id)
             await add_to_history(context, role="model", parts=[types.Part(text=full_response_for_history)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
             
-            # Обновляем "липкий" контекст, только если пользователь отправил новый файл в этом сообщении.
             if any(p.file_data for p in user_parts_for_history):
                 media_part = next((p for p in user_parts_for_history if p.file_data), None)
                 if media_part:
@@ -508,6 +525,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 (!) Используя бот, Вы автоматически соглашаетесь на передачу сообщений и файлов для получения ответов через Google Gemini API."""
     await update.message.reply_html(start_text)
 
+@ignore_if_processing
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat:
         chat_id = update.effective_chat.id
@@ -522,7 +540,8 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Полная очистка контекста для чата {chat_id} по команде /clear.")
     else:
         logger.warning("Не удалось определить chat_id для команды /clear")
-        
+
+@ignore_if_processing
 async def newtopic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('last_media_context', None)
     context.chat_data.pop('media_contexts', None)
@@ -573,12 +592,15 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error(f"Ошибка в утилитарной команде: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Не удалось выполнить команду: {e}")
 
+@ignore_if_processing
 async def transcript_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await utility_media_command(update, context, "Transcribe this audio/video file. Return only the transcribed text, without any comments or introductory phrases.")
 
+@ignore_if_processing
 async def summarize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await utility_media_command(update, context, "Summarize this material in a few paragraphs. Provide a concise but comprehensive overview.")
-    
+
+@ignore_if_processing
 async def keypoints_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await utility_media_command(update, context, "Extract the key points or main theses from this material. Present them as a structured bulleted list.")
 
@@ -587,6 +609,7 @@ async def handle_media_request(update: Update, context: ContextTypes.DEFAULT_TYP
     content_parts = [file_part, types.Part(text=user_text)]
     await process_request(update, context, content_parts, is_media_request=True)
 
+@ignore_if_processing
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.photo: return
@@ -612,6 +635,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Непредвиденная ошибка при обработке изображения: {e}", exc_info=True)
         await message.reply_text("❌ Произошла внутренняя ошибка при обработке изображения.")
 
+@ignore_if_processing
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.document: return
@@ -641,6 +665,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Непредвиденная ошибка при обработке документа: {e}", exc_info=True)
         await message.reply_text("❌ Внутренняя ошибка при обработке документа.")
 
+@ignore_if_processing
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.video: return
@@ -667,6 +692,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Непредвиденная ошибка при обработке видео: {e}", exc_info=True)
         await message.reply_text("❌ Внутренняя ошибка при обработке видео.")
 
+@ignore_if_processing
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_source=None):
     message = update.message
     if not message: return
@@ -696,6 +722,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
         logger.error(f"Непредвиденная ошибка при обработке аудио: {e}", exc_info=True)
         await message.reply_text("❌ Внутренняя ошибка при обработке аудио.")
 
+@ignore_if_processing
 async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, text = update.message, update.message.text or ""
     
@@ -713,10 +740,12 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.error(f"Ошибка при обработке YouTube URL {youtube_url}: {e}", exc_info=True)
         await message.reply_text("❌ Не удалось обработать ссылку на YouTube. Возможно, видео недоступно или имеет ограничения.")
 
+@ignore_if_processing
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('last_media_context', None)
     await process_request(update, context, [types.Part(text=update.message.text)])
 
+@ignore_if_processing
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, custom_text: str = None):
     message = update.message
     if not message or not message.from_user: return
