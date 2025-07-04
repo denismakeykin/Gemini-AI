@@ -1,4 +1,4 @@
-# Версия 4.2 (Финальная, с корректным разделением инструментов и всеми исправлениями)
+# Версия 5.0 (Финальная, с разделением данных, корректными инструментами и всеми исправлениями)
 
 import logging
 import os
@@ -55,9 +55,8 @@ MEDIA_CONTEXT_TTL_SECONDS = 47 * 3600
 TELEGRAM_FILE_LIMIT_MB = 20
 
 # --- ИНСТРУМЕНТЫ И ПРОМПТЫ ---
-# ИСПРАВЛЕНИЕ: Возвращаем раздельные наборы инструментов
 TEXT_TOOLS = [types.Tool(google_search=types.GoogleSearch(), code_execution=types.ToolCodeExecution(), url_context=types.UrlContext())]
-MEDIA_TOOLS = [types.Tool(google_search=types.GoogleSearch())] # Для медиа - только поиск
+MEDIA_TOOLS = [types.Tool(google_search=types.GoogleSearch())] 
 
 SAFETY_SETTINGS = [
     types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
@@ -251,13 +250,13 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
                 user_prefix = f"[{user_id}; Name: {user_name}]: "
                 
                 for part_dict in entry["parts"]:
-                    # Не используем dict_to_part, чтобы не проверять TTL для сборки истории
                     if part_dict.get('type') == 'text':
                         prefixed_text = f"{user_prefix}{part_dict.get('content', '')}"
                         entry_api_parts.append(types.Part(text=prefixed_text))
                         entry_text_len += len(prefixed_text)
                     elif part_dict.get('type') == 'file':
-                         # В историю медиа не добавляем, они будут подтянуты из "липкого" контекста
+                        # Медиа-объекты больше не добавляются в историю для API, чтобы избежать переполнения.
+                        # Они будут подтянуты из "липкого" контекста.
                         pass
             else: 
                 for part_dict in entry["parts"]:
@@ -487,7 +486,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         
         request_contents = history_for_api + [types.Content(parts=current_request_parts, role="user")]
         
-        # ИСПРАВЛЕНИЕ: Используем раздельные наборы инструментов
         tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
         response_obj = await generate_response(client, request_contents, context, tools)
         
