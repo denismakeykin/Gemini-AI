@@ -1,4 +1,4 @@
-# Версия 5.0 (Финальная, с разделением данных, корректными инструментами и всеми исправлениями)
+# Версия 6.0 (Финальная, с восстановленной логикой истории и всеми рабочими исправлениями)
 
 import logging
 import os
@@ -76,6 +76,7 @@ except FileNotFoundError:
 
 # --- КЛАСС PERSISTENCE ---
 class PostgresPersistence(BasePersistence):
+    # ... (код класса без изменений) ...
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
@@ -250,20 +251,18 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
                 user_prefix = f"[{user_id}; Name: {user_name}]: "
                 
                 for part_dict in entry["parts"]:
-                    if part_dict.get('type') == 'text':
-                        prefixed_text = f"{user_prefix}{part_dict.get('content', '')}"
+                    part = dict_to_part(part_dict) # Проверяем TTL
+                    if not part: continue
+                    
+                    if part.text:
+                        prefixed_text = f"{user_prefix}{part.text}"
                         entry_api_parts.append(types.Part(text=prefixed_text))
                         entry_text_len += len(prefixed_text)
-                    elif part_dict.get('type') == 'file':
-                        # Медиа-объекты больше не добавляются в историю для API, чтобы избежать переполнения.
-                        # Они будут подтянуты из "липкого" контекста.
-                        pass
+                    else:
+                        entry_api_parts.append(part) # Добавляем медиа в историю для API
             else: 
-                for part_dict in entry["parts"]:
-                    if part_dict.get('type') == 'text':
-                        text = part_dict.get('content', '')
-                        entry_api_parts.append(types.Part(text=text))
-                        entry_text_len += len(text)
+                entry_api_parts = [p for p in (dict_to_part(part_dict) for part_dict in entry["parts"]) if p is not None]
+                entry_text_len = sum(len(p.text) for p in entry_api_parts if p.text)
 
             if not entry_api_parts: continue
             
@@ -280,10 +279,11 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
 
 def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_id: int) -> dict | None:
     chat_id = context.effective_chat.id
-    history = context.chat_data.get("history", [])
     all_media_contexts = context.application.bot_data.setdefault('media_contexts', {})
     chat_media_contexts = all_media_contexts.get(chat_id, {})
     
+    # Ищем в истории чата, чтобы найти ID оригинального сообщения
+    history = context.chat_data.get("history", [])
     current_reply_id = reply_to_id
     for _ in range(len(history)):
         bot_message = next((msg for msg in reversed(history) if msg.get("role") == "model" and msg.get("bot_message_id") == current_reply_id), None)
@@ -643,6 +643,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.photo: return
     
+    context.chat_data['id'] = message.chat_id
     context.application.bot_data.get('last_media_context', {}).pop(message.chat_id, None)
     
     photo = message.photo[-1]
@@ -669,6 +670,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.document: return
     
+    context.chat_data['id'] = message.chat_id
     context.application.bot_data.get('last_media_context', {}).pop(message.chat_id, None)
     doc = message.document
     
@@ -699,6 +701,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.video: return
 
+    context.chat_data['id'] = message.chat_id
     context.application.bot_data.get('last_media_context', {}).pop(message.chat_id, None)
     video = message.video
 
@@ -726,6 +729,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
     message = update.message
     if not message: return
     
+    context.chat_data['id'] = message.chat_id
     context.application.bot_data.get('last_media_context', {}).pop(message.chat_id, None)
     audio = audio_source or message.audio or message.voice
     if not audio: return
@@ -755,6 +759,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
 async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, text = update.message, update.message.text or ""
     
+    context.chat_data['id'] = message.chat_id
     context.application.bot_data.get('last_media_context', {}).pop(message.chat_id, None)
     match = re.search(YOUTUBE_REGEX, text)
     if not match: return
@@ -771,8 +776,10 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @ignore_if_processing
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.application.bot_data.get('last_media_context', {}).pop(update.effective_chat.id, None)
-    await process_request(update, context, [types.Part(text=update.message.text)])
+    message = update.message
+    context.chat_data['id'] = message.chat_id
+    context.application.bot_data.get('last_media_context', {}).pop(message.chat_id, None)
+    await process_request(update, context, [types.Part(text=message.text)])
 
 @ignore_if_processing
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, custom_text: str = None):
