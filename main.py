@@ -1,4 +1,4 @@
-# Версия 3.8 (Финальная, стабильная, с исправленными ошибками и корректными обработчиками)
+# Версия 3.8.1 (Финальная, с гибридным промптом и динамической датой)
 
 import logging
 import os
@@ -42,11 +42,11 @@ if not all([TELEGRAM_BOT_TOKEN, GOOGLE_API_KEY, WEBHOOK_HOST, GEMINI_WEBHOOK_PAT
     exit(1)
 
 # --- КОНСТАНТЫ И НАСТРОЙКИ ---
-MODEL_NAME = 'gemini-1.5-flash'
+MODEL_NAME = 'gemini-2.5-flash'
 YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/|youtube-nocookie\.com\/embed\/)([a-zA-Z0-9_-]{11})'
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
 DATE_TIME_REGEX = r'^\s*(какой\s+)?(день|дата|число|время|который\s+час)\??\s*$'
-MAX_CONTEXT_CHARS = 100000 # Уменьшено для большей безопасности
+MAX_CONTEXT_CHARS = 150000
 MAX_HISTORY_RESPONSE_LEN = 2000
 MAX_HISTORY_ITEMS = 50
 MAX_MEDIA_CONTEXTS = 10
@@ -68,7 +68,7 @@ try:
     logger.info("Системный промпт успешно загружен из файла.")
 except FileNotFoundError:
     logger.error("Файл system_prompt.md не найден! Будет использована инструкция по умолчанию.")
-    SYSTEM_INSTRUCTION = """ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме."""
+    SYSTEM_INSTRUCTION = """(System Note: Today is {current_time}.)\nВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме."""
 
 # --- КЛАСС PERSISTENCE ---
 class PostgresPersistence(BasePersistence):
@@ -302,15 +302,23 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
         logger.error(f"Ошибка при загрузке файла через File API: {e}", exc_info=True)
         raise IOError(f"Не удалось загрузить или обработать файл '{file_name}' на сервере Google.")
 
+# ИСПРАВЛЕННАЯ ФУНКЦИЯ
 async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> types.GenerateContentResponse | str:
     chat_id = context.chat_data.get('id', 'Unknown')
     thinking_budget = 24576
     
+    # Динамически подставляем актуальное время в системный промпт
+    try:
+        final_system_instruction = SYSTEM_INSTRUCTION.format(current_time=get_current_time_str())
+    except KeyError:
+        logger.warning("В system_prompt.md отсутствует плейсхолдер {current_time}. Дата не будет подставлена.")
+        final_system_instruction = SYSTEM_INSTRUCTION
+
     config = types.GenerateContentConfig(
         safety_settings=SAFETY_SETTINGS, 
         tools=tools,
-        system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)]),
-        temperature=1.0, # ИЗМЕНЕНО
+        system_instruction=types.Content(parts=[types.Part(text=final_system_instruction)]),
+        temperature=1.0,
         thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget)
     )
     
@@ -322,7 +330,6 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         )
         logger.info(f"ChatID: {chat_id} | Ответ от Gemini API получен.")
         return response
-    # ИСПРАВЛЕННЫЙ БЛОК ОБРАБОТКИ ОШИБОК
     except genai_errors.InvalidArgumentError as e:
         logger.error(f"ChatID: {chat_id} | Ошибка неверного аргумента (вероятно, переполнение контекста): {e}", exc_info=False)
         return "🤯 <b>Слишком длинная история!</b>\nКажется, мы заболтались, и я уже не могу удержать в голове весь наш диалог. Пожалуйста, очистите историю командой /clear, чтобы начать заново."
@@ -338,6 +345,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
     except Exception as e:
         logger.error(f"ChatID: {chat_id} | Неизвестная ошибка генерации: {e}", exc_info=True)
         return f"❌ <b>Произошла внутренняя ошибка:</b>\n<code>{html.escape(str(e))}</code>"
+
 
 def format_gemini_response(response: types.GenerateContentResponse) -> str:
     try:
@@ -422,7 +430,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             return
 
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
-        date_prefix = f"(System Note: Today is {get_current_time_str()}.)\n"
+        # ИСПРАВЛЕНО: Удален date_prefix. Он теперь подставляется в системную инструкцию.
         grounding_instruction = """
 ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Тебе уже предоставлена точная дата и время в системной заметке, используй эти данные, не пытайся вычислить их самостоятельно. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.
 """
@@ -431,7 +439,8 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         text_part_found = False
         for part in content_parts:
             if part.text and not text_part_found:
-                final_prompt_text = f"{date_prefix}{grounding_instruction}\n{user_prefix}{part.text}"
+                # ИСПРАВЛЕНО: Удален date_prefix из формирования промпта
+                final_prompt_text = f"{grounding_instruction}\n{user_prefix}{part.text}"
                 current_request_parts.append(types.Part(text=final_prompt_text))
                 text_part_found = True
             else:
@@ -477,10 +486,9 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         logger.error(f"Непредвиденная ошибка в process_request: {e}", exc_info=True)
         await message.reply_text("❌ Произошла критическая внутренняя ошибка. Попробуйте еще раз.")
 
-
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    start_text = """Я - Женя, интеллект новой Google Gemini 1.5 Flash с лучшим поиском:
+    start_text = """Я - Женя, интеллект новой Google Gemini 2.5 Flash с лучшим поиском:
 
 🌐 Обладаю глубокими знаниями во всех сферах и умно использую Google.
 🧠 Анализирую и размышляю над сообщением, контекстом и всеми знаниями.
@@ -607,7 +615,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('last_media_context', None)
     doc = message.document
     
-    # ИСПРАВЛЕНО: Удалена лишняя проверка на 50 МБ
     if doc.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
         await message.reply_text(f"📑 Файл больше {TELEGRAM_FILE_LIMIT_MB} МБ, я не могу его скачать. Отвечу на текст, если он есть.")
         if message.caption:
@@ -637,7 +644,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('last_media_context', None)
     video = message.video
 
-    # ИСПРАВЛЕНО: Удалена лишняя проверка на 50 МБ
     if video.file_size > TELEGRAM_FILE_LIMIT_MB * 1024 * 1024:
         await message.reply_text(f"📹 Видеофайл больше {TELEGRAM_FILE_LIMIT_MB} МБ, я не могу его скачать. Отвечу на текст, если он есть.")
         if message.caption:
