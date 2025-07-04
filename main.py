@@ -1,4 +1,4 @@
-# Версия 2.9 (основана на 'Custom vrs' с финальными правками и мышлением на максимум)
+# Версия 2.9 (основана на 'Custom vrs' с исправлением всех обнаруженных ошибок)
 
 import logging
 import os
@@ -17,15 +17,17 @@ import html
 
 import aiohttp
 import aiohttp.web
-from telegram import Update, Message, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, Message, BotCommand
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, BasePersistence, CallbackQueryHandler
 from telegram.error import BadRequest
 
 from google import genai
 from google.genai import types
+from google.generativeai import errors as GoogleErrors # ## ИЗМЕНЕНО: Правильный импорт для ошибок API
 
 # --- КОНФИГУРАЦИЯ ---
+# ... (блок конфигурации остается без изменений) ...
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=log_level)
 logger = logging.getLogger(__name__)
@@ -52,9 +54,10 @@ MEDIA_CONTEXT_TTL_SECONDS = 47 * 3600
 TELEGRAM_FILE_LIMIT_MB = 20
 
 # --- ИНСТРУМЕНТЫ И ПРОМПТЫ ---
-CORE_TOOLS = [types.Tool(google_search=types.GoogleSearch(), code_execution=types.ToolCodeExecution())]
+# ## ИЗМЕНЕНО: Возвращено разделение инструментов для разных типов контента
+TEXT_TOOLS = [types.Tool(google_search=types.GoogleSearch(), code_execution=types.ToolCodeExecution())]
+MEDIA_TOOLS = [types.Tool(google_search=types.GoogleSearch())] # Для медиа - только поиск
 
-# ## ИЗМЕНЕНО: Подтверждено, что цензура отключена (BLOCK_NONE - верная настройка)
 SAFETY_SETTINGS = [
     types.SafetySetting(category=c, threshold=types.HarmBlockThreshold.BLOCK_NONE)
     for c in (types.HarmCategory.HARM_CATEGORY_HARASSMENT, types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -66,7 +69,7 @@ try:
     logger.info("Системный промпт успешно загружен из файла.")
 except FileNotFoundError:
     logger.error("Файл system_prompt.md не найден! Будет использована инструкция по умолчанию.")
-    SYSTEM_INSTRUCTION = """КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search для поиска актуальных ВСЕВОЗМОЖНЫХ и ВСЕСТОРОННИХ ДАННЫХ, СОХРАНЯЯ все источники."""
+    SYSTEM_INSTRUCTION = """ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Не анонсируй свои внутренние действия. Сразу пиши ответ."""
 
 # --- КЛАСС PERSISTENCE ---
 # ... (код класса PostgresPersistence остается без изменений) ...
@@ -169,7 +172,7 @@ class PostgresPersistence(BasePersistence):
 
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-# ... (функции с get_current_time_str до generate_response остаются без изменений) ...
+# ... (функции с get_current_time_str до upload_and_wait_for_file остаются без изменений) ...
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
     return datetime.datetime.now(pytz.timezone(timezone)).strftime('%Y-%m-%d %H:%M:%S %Z')
 
@@ -258,10 +261,11 @@ def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_i
 async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime_type: str, file_name: str) -> types.Part:
     logger.info(f"Загрузка файла '{file_name}' ({len(file_bytes) / 1024:.2f} KB) через File API...")
     try:
+        # ## ИЗМЕНЕНО: Исправлен вызов функции upload в соответствии с новым SDK
+        upload_config = types.UploadFileConfig(mime_type=mime_type, display_name=file_name)
         upload_response = await client.aio.files.upload(
             file=io.BytesIO(file_bytes),
-            mime_type=mime_type,
-            display_name=file_name
+            config=upload_config
         )
         logger.info(f"Файл '{file_name}' загружен. Имя: {upload_response.name}. Ожидание статуса ACTIVE...")
         
@@ -282,15 +286,13 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
         logger.error(f"Ошибка при загрузке файла через File API: {e}", exc_info=True)
         raise IOError(f"Не удалось загрузить или обработать файл '{file_name}' на сервере Google.")
 
-
-async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE) -> types.GenerateContentResponse | str:
+async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> types.GenerateContentResponse | str:
     chat_id = context.chat_data.get('id', 'Unknown')
-    # ## ИЗМЕНЕНО: Мышление включено на максимум по умолчанию. Настройки через /config убраны.
     thinking_budget = 24576
     
     config = types.GenerateContentConfig(
         safety_settings=SAFETY_SETTINGS, 
-        tools=CORE_TOOLS,
+        tools=tools, # ## ИЗМЕНЕНО: Используем переданный набор инструментов
         system_instruction=types.Content(parts=[types.Part(text=SYSTEM_INSTRUCTION)]),
         temperature=0.7,
         thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget)
@@ -304,7 +306,8 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         )
         logger.info(f"ChatID: {chat_id} | Ответ от Gemini API получен.")
         return response
-    except types.GoogleAPIError as e:
+    # ## ИЗМЕНЕНО: Исправлен класс ошибки на корректный
+    except GoogleErrors.GoogleAPIError as e:
         logger.error(f"ChatID: {chat_id} | Ошибка Google API: {e}", exc_info=True)
         if hasattr(e, 'code'):
              if e.code == 429:
@@ -316,6 +319,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         logger.error(f"ChatID: {chat_id} | Неизвестная ошибка генерации: {e}", exc_info=True)
         return f"❌ <b>Произошла внутренняя ошибка:</b>\n<code>{html.escape(str(e))}</code>"
 
+# ... (функция format_gemini_response и далее до process_request остаются без изменений) ...
 def format_gemini_response(response: types.GenerateContentResponse) -> str:
     try:
         if response and response.candidates:
@@ -334,7 +338,6 @@ def format_gemini_response(response: types.GenerateContentResponse) -> str:
         logger.error(f"Ошибка при парсинге ответа Gemini: {e}", exc_info=True)
         return "Произошла ошибка при обработке ответа от нейросети."
 
-# ... (функции send_reply и add_to_history остаются без изменений) ...
 async def send_reply(target_message: Message, response_text: str) -> Message | None:
     sanitized_text = re.sub(r'<br\s*/?>', '\n', response_text)
     chunks = html_safe_chunker(sanitized_text)
@@ -407,7 +410,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             else:
                 date_prefix += "This is the first message.)\n"
 
-            # ## ИЗМЕНЕНО: Добавлено указание не комментировать поиск
             grounding_instruction = """
 ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Не анонсируй свои внутренние действия. Сразу пиши ответ.
 """
@@ -417,7 +419,9 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 
         request_contents = history + [types.Content(parts=request_specific_parts, role="user")]
         
-        response_obj = await generate_response(client, request_contents, context)
+        # ## ИЗМЕНЕНО: Выбираем правильный набор инструментов
+        tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
+        response_obj = await generate_response(client, request_contents, context, tools)
         
         if isinstance(response_obj, str):
             reply_text = response_obj
@@ -454,8 +458,9 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     except Exception as e:
         logger.error(f"Непредвиденная ошибка в process_request: {e}", exc_info=True)
         await message.reply_text("❌ Произошла критическая внутренняя ошибка. Попробуйте еще раз.")
-        
+
 # --- ОБРАБОТЧИКИ КОМАНД ---
+# ... (весь оставшийся код, начиная с start_command, остается без изменений как в версии 2.7) ...
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_text = """Я - Женя, интеллект новой Google Gemini 2.5 Flash с лучшим поиском:
 
@@ -473,10 +478,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 (!) Используя бот, Вы автоматически соглашаетесь на передачу сообщений и файлов для получения ответов через Google Gemini API."""
     await update.message.reply_html(start_text)
 
-# ## ИЗМЕНЕНО: Команды config и config_callback удалены за ненадобностью
-# async def config_command...
-# async def config_callback...
-
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat:
         chat_id = update.effective_chat.id
@@ -487,7 +488,6 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         logger.warning("Не удалось определить chat_id для команды /clear")
         
-# ... (остальной код с newtopic_command до main остается без изменений) ...
 async def newtopic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('last_media_context', None)
     context.chat_data.pop('media_contexts', None)
@@ -524,7 +524,7 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
         
         content_parts = [media_part, types.Part(text=prompt)]
         
-        response_obj = await generate_response(client, [types.Content(parts=content_parts, role="user")], context)
+        response_obj = await generate_response(client, [types.Content(parts=content_parts, role="user")], context, MEDIA_TOOLS)
         result_text = format_gemini_response(response_obj) if isinstance(response_obj, types.GenerateContentResponse) else response_obj
         await send_reply(update.message, result_text)
     
@@ -689,7 +689,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await process_request(update, context, content_parts, is_media_request=is_media_follow_up)
 
-
 # --- ЗАПУСК БОТА ---
 async def handle_health_check(request: aiohttp.web.Request) -> aiohttp.web.Response:
     logger.info("Health check OK")
@@ -731,7 +730,6 @@ async def main():
     
     application.bot_data['gemini_client'] = genai.Client(api_key=GOOGLE_API_KEY)
     
-    # ## ИЗМЕНЕНО: Команда /config удалена из списка
     commands = [
         BotCommand("start", "Инфо и начало работы"),
         BotCommand("transcript", "Транскрипция медиа (ответом)"),
@@ -741,13 +739,11 @@ async def main():
         BotCommand("clear", "Очистить всю историю чата")
     ]
     application.add_handler(CommandHandler("start", start_command))
-    # ## ИЗМЕНЕНО: Обработчик для /config удален
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("transcript", transcript_command))
     application.add_handler(CommandHandler("summarize", summarize_command))
     application.add_handler(CommandHandler("keypoints", keypoints_command))
     application.add_handler(CommandHandler("newtopic", newtopic_command))
-    # ## ИЗМЕНЕНО: Обработчик для колбэка /config удален
     
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.VIDEO, handle_video))
