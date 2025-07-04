@@ -1,4 +1,4 @@
-# Версия 6.0 (Финальная, с восстановленной логикой истории и всеми рабочими исправлениями)
+# Версия 7.0 (Финальная, с разделением данных, корректными инструментами и всеми известными исправлениями)
 
 import logging
 import os
@@ -76,7 +76,6 @@ except FileNotFoundError:
 
 # --- КЛАСС PERSISTENCE ---
 class PostgresPersistence(BasePersistence):
-    # ... (код класса без изменений) ...
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
@@ -245,6 +244,7 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
         if entry.get("role") in ("user", "model") and isinstance(entry.get("parts"), list):
             entry_api_parts = []
             entry_text_len = 0
+            # Восстановлена простая и надежная логика
             if entry.get("role") == "user":
                 user_id = entry.get('user_id', 'Unknown')
                 user_name = entry.get('user_name', 'User')
@@ -259,7 +259,7 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
                         entry_api_parts.append(types.Part(text=prefixed_text))
                         entry_text_len += len(prefixed_text)
                     else:
-                        entry_api_parts.append(part) # Добавляем медиа в историю для API
+                        entry_api_parts.append(part)
             else: 
                 entry_api_parts = [p for p in (dict_to_part(part_dict) for part_dict in entry["parts"]) if p is not None]
                 entry_text_len = sum(len(p.text) for p in entry_api_parts if p.text)
@@ -279,11 +279,10 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
 
 def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_id: int) -> dict | None:
     chat_id = context.effective_chat.id
+    history = context.chat_data.get("history", [])
     all_media_contexts = context.application.bot_data.setdefault('media_contexts', {})
     chat_media_contexts = all_media_contexts.get(chat_id, {})
     
-    # Ищем в истории чата, чтобы найти ID оригинального сообщения
-    history = context.chat_data.get("history", [])
     current_reply_id = reply_to_id
     for _ in range(len(history)):
         bot_message = next((msg for msg in reversed(history) if msg.get("role") == "model" and msg.get("bot_message_id") == current_reply_id), None)
