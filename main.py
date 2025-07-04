@@ -1,4 +1,4 @@
-# Версия 3.8.3 (Финальная, с защитой от гонки состояний и умной обрезкой)
+# Версия 3.8.4 (Финальная, с защитой от гонки, санитайзером и умной обрезкой истории)
 
 import logging
 import os
@@ -48,10 +48,7 @@ YOUTUBE_REGEX = r'(?:https?:\/\/)?(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?v=|em
 URL_REGEX = r'https?:\/\/[^\s/$.?#].[^\s]*'
 DATE_TIME_REGEX = r'^\s*(какой\s+)?(день|дата|число|время|который\s+час)\??\s*$'
 MAX_CONTEXT_CHARS = 150000
-# НОВЫЕ КОНСТАНТЫ ДЛЯ УМНОЙ ОБРЕЗКИ
-MAX_CONTEXT_CHARS_WITH_MEDIA = 20000 # Резко сокращаем текстовый контекст, если в истории есть медиа
-MEDIA_TOKEN_ESTIMATE = 800000 # Примерная "стоимость" медиафайла в токенах (символах)
-MAX_HISTORY_RESPONSE_LEN = 2000
+MAX_HISTORY_RESPONSE_LEN = 3000 # Лимит для сохранения ответа модели в историю
 MAX_HISTORY_ITEMS = 50
 MAX_MEDIA_CONTEXTS = 10
 MEDIA_CONTEXT_TTL_SECONDS = 47 * 3600
@@ -72,10 +69,12 @@ try:
     logger.info("Системный промпт успешно загружен из файла.")
 except FileNotFoundError:
     logger.error("Файл system_prompt.md не найден! Будет использована инструкция по умолчанию.")
-    SYSTEM_INSTRUCTION = """(System Note: Today is {current_time}.)\nВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме."""
+    SYSTEM_INSTRUCTION = """(System Note: Today is {current_time}.)
+    ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.) и любые данные, которые могут меняться со временем. Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.
+    АБСОЛЮТНЫЕ ЗАПРЕТЫ: НИКОГДА не показывай `tool_code`, `thought` или другие внутренние рассуждения. НИКОГДА не начинай ответ с префикса пользователя (например, `[12345; Name: User]:`). Отвечай только по существу.
+    """
 
 # --- КЛАСС PERSISTENCE ---
-# ... (код класса без изменений) ...
 class PostgresPersistence(BasePersistence):
     def __init__(self, database_url: str):
         super().__init__()
@@ -140,8 +139,8 @@ class PostgresPersistence(BasePersistence):
         res = self._execute("SELECT data FROM persistence_data WHERE key = %s;", (key,), fetch="one")
         return pickle.loads(res[0]) if res and res[0] else None
     def _set_pickled(self, key: str, data: object) -> None: self._execute("INSERT INTO persistence_data (key, data) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET data = %s;", (key, pickle.dumps(data), pickle.dumps(data)))
-    async def get_bot_data(self) -> dict: return {}
-    async def update_bot_data(self, data: dict) -> None: pass
+    async def get_bot_data(self) -> dict: return defaultdict(dict)
+    async def update_bot_data(self, data: dict) -> None: self.bot_data.update(data)
     async def get_chat_data(self) -> defaultdict[int, dict]:
         all_data = await asyncio.to_thread(self._execute, "SELECT key, data FROM persistence_data WHERE key LIKE 'chat_data_%';", fetch="all")
         chat_data = defaultdict(dict)
@@ -172,7 +171,6 @@ class PostgresPersistence(BasePersistence):
         if self.db_pool: self.db_pool.closeall()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-# ... (остальные функции без изменений до build_history_for_request) ...
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
     now = datetime.datetime.now(pytz.timezone(timezone))
     days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
@@ -210,7 +208,6 @@ def ignore_if_processing(func):
 
         message_id = update.effective_message.message_id
         chat_id = update.effective_chat.id
-        
         processing_key = f"{chat_id}_{message_id}"
         
         processing_messages = context.application.bot_data.setdefault('processing_messages', set())
@@ -242,39 +239,12 @@ def dict_to_part(part_dict: dict) -> types.Part | None:
         return types.Part(file_data=types.FileData(file_uri=part_dict['uri'], mime_type=part_dict['mime']))
     return None
 
-# ИСПРАВЛЕННАЯ ФУНКЦИЯ
 def build_history_for_request(chat_history: list) -> list[types.Content]:
-    valid_history = []
-    current_chars = 0
-    history_has_media = any(
-        part.get('type') == 'file' 
-        for entry in chat_history 
-        for part in entry.get('parts', [])
-    )
-    
-    # Устанавливаем лимит символов в зависимости от наличия медиа в истории
-    char_limit = MAX_CONTEXT_CHARS_WITH_MEDIA if history_has_media else MAX_CONTEXT_CHARS
-
+    valid_history, current_chars = [], 0
     for entry in reversed(chat_history):
         if entry.get("role") in ("user", "model") and isinstance(entry.get("parts"), list):
             entry_api_parts = []
             entry_text_len = 0
-            has_media_in_entry = False
-
-            # Сначала проверяем на медиа, чтобы правильно оценить "стоимость"
-            for part_dict in entry["parts"]:
-                if part_dict.get('type') == 'file':
-                    has_media_in_entry = True
-                    break
-            
-            # Если в записи есть медиа, добавляем его "стоимость" и проверяем лимит
-            if has_media_in_entry:
-                if current_chars + MEDIA_TOKEN_ESTIMATE > char_limit:
-                    logger.info(f"Достигнут лимит контекста ({char_limit} симв) из-за медиафайла. История обрезана.")
-                    break
-                current_chars += MEDIA_TOKEN_ESTIMATE
-
-            # Теперь обрабатываем все части
             if entry.get("role") == "user":
                 user_id = entry.get('user_id', 'Unknown')
                 user_name = entry.get('user_name', 'User')
@@ -286,33 +256,20 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
                     
                     if part.text:
                         prefixed_text = f"{user_prefix}{part.text}"
-                        if current_chars + len(prefixed_text) > char_limit:
-                            logger.info(f"Достигнут лимит текста ({char_limit} симв). История обрезана.")
-                            current_chars = char_limit + 1 # Прерываем внешний цикл
-                            break
                         entry_api_parts.append(types.Part(text=prefixed_text))
                         entry_text_len += len(prefixed_text)
-                    else: # Медиа
+                    else:
                         entry_api_parts.append(part)
-            else: # model
-                for part_dict in entry["parts"]:
-                    part = dict_to_part(part_dict)
-                    if not part: continue
-                    if part.text:
-                        if current_chars + len(part.text) > char_limit:
-                           logger.info(f"Достигнут лимит текста ({char_limit} симв). История обрезана.")
-                           current_chars = char_limit + 1 # Прерываем внешний цикл
-                           break
-                        entry_api_parts.append(part)
-                        entry_text_len += len(part.text)
-                    else: # Медиа
-                        entry_api_parts.append(part)
-            
-            if current_chars > char_limit:
-                break
+            else: 
+                entry_api_parts = [p for p in (dict_to_part(part_dict) for part_dict in entry["parts"]) if p is not None]
+                entry_text_len = sum(len(p.text) for p in entry_api_parts if p.text)
 
             if not entry_api_parts: continue
             
+            if current_chars + entry_text_len > MAX_CONTEXT_CHARS:
+                logger.info(f"Достигнут лимит контекста ({MAX_CONTEXT_CHARS} симв). История обрезана до {len(valid_history)} сообщений.")
+                break
+
             clean_content = types.Content(role=entry["role"], parts=entry_api_parts)
             valid_history.append(clean_content)
             current_chars += entry_text_len
@@ -320,10 +277,6 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
     valid_history.reverse()
     return valid_history
 
-# ... (остальной код до process_request без изменений) ...
-# ... (весь код до этого места остается таким же, как в предыдущем ответе) ...
-# ... (остальной код до process_request без изменений) ...
-# ... (весь код до этого места остается таким же, как в предыдущем ответе) ...
 def find_media_context_in_history(context: ContextTypes.DEFAULT_TYPE, reply_to_id: int) -> dict | None:
     history = context.chat_data.get("history", [])
     media_contexts = context.chat_data.get("media_contexts", {})
@@ -430,8 +383,10 @@ def format_gemini_response(response: types.GenerateContentResponse) -> str:
                 return "Мой ответ был заблокирован из-за внутренних правил безопасности. Пожалуйста, переформулируйте запрос."
 
             if response.candidates[0].content and response.candidates[0].content.parts:
-                result_parts = [part.text for part in response.candidates[0].content.parts if part.text]
-                return "".join(result_parts)
+                full_text = "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text'))
+                # ИСПРАВЛЕНИЕ: Принудительно вырезаем "мысли" модели, если она их показала
+                sanitized_text = re.sub(r'tool_code\n.*?thought\n', '', full_text, flags=re.DOTALL)
+                return sanitized_text.strip()
         
         logger.warning("Получен пустой или некорректный ответ от API.")
         return "Я не смогла сформировать ответ. Попробуйте еще раз."
@@ -469,12 +424,6 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     if role == 'user' and user:
         entry['user_id'] = user.id
         entry['user_name'] = user.first_name
-    
-    if role == 'model':
-        text_part = next((p.get('content') for p in entry["parts"] if p.get('type') == 'text'), None)
-        if text_part and len(text_part) > MAX_HISTORY_RESPONSE_LEN:
-             entry["parts"][0]['content'] = text_part[:MAX_HISTORY_RESPONSE_LEN] + "..."
-             logger.info(f"Ответ модели для чата {context.chat_data.get('id')} был обрезан для сохранения в историю.")
     
     chat_history.append(entry)
     if len(chat_history) > MAX_HISTORY_ITEMS:
@@ -524,9 +473,14 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         
         if isinstance(response_obj, str):
             reply_text = response_obj
-            full_response_for_history = reply_text
         else:
             reply_text = format_gemini_response(response_obj)
+        
+        # ИСПРАВЛЕНИЕ: Обрезаем слишком длинный ответ *перед* сохранением в историю
+        if len(reply_text) > MAX_HISTORY_RESPONSE_LEN:
+            full_response_for_history = reply_text[:MAX_HISTORY_RESPONSE_LEN] + "..."
+            logger.info(f"Ответ модели для чата {context.chat_data.get('id')} был обрезан для сохранения в историю.")
+        else:
             full_response_for_history = reply_text
 
         sent_message = await send_reply(message, reply_text)
@@ -581,7 +535,7 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data.pop('history', None)
         context.chat_data.pop('media_contexts', None)
         context.chat_data.pop('last_media_context', None)
-        context.chat_data.pop('processing_messages', None) # Также очищаем флаги обработки
+        context.application.bot_data.pop('processing_messages', None)
         
         await context.application.persistence.update_chat_data(chat_id, context.chat_data)
         
@@ -596,6 +550,7 @@ async def newtopic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop('media_contexts', None)
     await update.message.reply_text("Контекст предыдущих файлов очищен. Начинаем новую тему.")
 
+@ignore_if_processing
 async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
     if not update.message or not update.message.reply_to_message:
         return await update.message.reply_text("Пожалуйста, используйте эту команду в ответ на сообщение с медиафайлом или ссылкой.")
@@ -807,16 +762,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cus
     content_parts = [types.Part(text=text)]
     is_media_follow_up = False
     
-    # ИСПРАВЛЕНИЕ: Предотвращаем повторное добавление "липкого" контекста, если он уже есть в последнем сообщении истории
-    history = context.chat_data.get("history", [])
-    last_user_message_has_media = False
-    if history:
-        last_entry = history[-1]
-        if last_entry.get("role") == "user":
-            if any(p.get("type") == "file" for p in last_entry.get("parts", [])):
-                last_user_message_has_media = True
-
-    if custom_text is None and not last_user_message_has_media:
+    if custom_text is None:
         if message.reply_to_message:
             media_context = find_media_context_in_history(context, message.reply_to_message.message_id)
             if media_context:
