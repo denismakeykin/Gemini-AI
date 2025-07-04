@@ -302,12 +302,13 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
         logger.error(f"Ошибка при загрузке файла через File API: {e}", exc_info=True)
         raise IOError(f"Не удалось загрузить или обработать файл '{file_name}' на сервере Google.")
 
-# ИСПРАВЛЕННАЯ ФУНКЦИЯ
+# main.py
+# ЗАМЕНИТЬ ФУНКЦИЮ generate_response ЦЕЛИКОМ
+
 async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> types.GenerateContentResponse | str:
     chat_id = context.chat_data.get('id', 'Unknown')
     thinking_budget = 24576
     
-    # Динамически подставляем актуальное время в системный промпт
     try:
         final_system_instruction = SYSTEM_INSTRUCTION.format(current_time=get_current_time_str())
     except KeyError:
@@ -324,28 +325,31 @@ async def generate_response(client: genai.Client, request_contents: list, contex
     
     try:
         response = await client.aio.models.generate_content(
-            model=MODEL_NAME,
+            model=MODEL_NAME, # Здесь будет твоя модель 'gemini-2.5-flash'
             contents=request_contents,
             config=config
         )
         logger.info(f"ChatID: {chat_id} | Ответ от Gemini API получен.")
         return response
-    except genai_errors.InvalidArgumentError as e:
-        logger.error(f"ChatID: {chat_id} | Ошибка неверного аргумента (вероятно, переполнение контекста): {e}", exc_info=False)
-        return "🤯 <b>Слишком длинная история!</b>\nКажется, мы заболтались, и я уже не могу удержать в голове весь наш диалог. Пожалуйста, очистите историю командой /clear, чтобы начать заново."
-    except genai_errors.ResourceExhaustedError as e:
-        logger.error(f"ChatID: {chat_id} | Ошибка исчерпания ресурсов (лимит запросов): {e}", exc_info=False)
-        return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
-    except genai_errors.PermissionDeniedError as e:
-        logger.error(f"ChatID: {chat_id} | Ошибка доступа к файлу: {e}", exc_info=False)
-        return "❌ <b>Ошибка доступа к файлу.</b>\nВозможно, файл был удален с серверов Google (срок хранения 48 часов) или возникла другая проблема. Попробуйте отправить файл заново."
+    # ИСПРАВЛЕННЫЙ И НАДЕЖНЫЙ БЛОК ОБРАБОТКИ ОШИБОК
     except genai_errors.APIError as e:
-        logger.error(f"ChatID: {chat_id} | Общая ошибка Google API: {e}", exc_info=False)
+        error_text = str(e).lower()
+        logger.error(f"ChatID: {chat_id} | Ошибка Google API: {e}", exc_info=False)
+        
+        if "input token count" in error_text and "exceeds the maximum" in error_text:
+            return "🤯 <b>Слишком длинная история!</b>\nКажется, мы заболтались, и я уже не могу удержать в голове весь наш диалог. Пожалуйста, очистите историю командой /clear, чтобы начать заново."
+        
+        if "resource has been exhausted" in error_text: # Ловит ошибки лимитов запросов
+            return "⏳ <b>Слишком много запросов!</b>\nПожалуйста, подождите минуту, я немного перегрузилась."
+
+        if "permission denied" in error_text: # Ловит ошибки доступа к файлам
+            return "❌ <b>Ошибка доступа к файлу.</b>\nВозможно, файл был удален с серверов Google (срок хранения 48 часов) или возникла другая проблема. Попробуйте отправить файл заново."
+
+        # Общая ошибка, если ни одно из условий не подошло
         return f"❌ <b>Ошибка Google API:</b>\n<code>{html.escape(str(e))}</code>"
     except Exception as e:
         logger.error(f"ChatID: {chat_id} | Неизвестная ошибка генерации: {e}", exc_info=True)
         return f"❌ <b>Произошла внутренняя ошибка:</b>\n<code>{html.escape(str(e))}</code>"
-
 
 def format_gemini_response(response: types.GenerateContentResponse) -> str:
     try:
