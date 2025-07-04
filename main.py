@@ -1,4 +1,4 @@
-# Версия 7.0 (Финальная, с разделением данных, корректными инструментами и всеми известными исправлениями)
+# Версия 8.0 (Финальная, с полной изоляцией медиа-контекста и всеми исправлениями)
 
 import logging
 import os
@@ -250,18 +250,17 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
                 user_prefix = f"[{user_id}; Name: {user_name}]: "
                 
                 for part_dict in entry["parts"]:
-                    part = dict_to_part(part_dict) # Проверяем TTL
-                    if not part: continue
-                    
-                    if part.text:
-                        prefixed_text = f"{user_prefix}{part.text}"
+                    # Не используем dict_to_part, чтобы не проверять TTL для сборки истории
+                    if part_dict.get('type') == 'text':
+                        prefixed_text = f"{user_prefix}{part_dict.get('content', '')}"
                         entry_api_parts.append(types.Part(text=prefixed_text))
                         entry_text_len += len(prefixed_text)
-                    else:
-                        entry_api_parts.append(part)
-            else: 
-                entry_api_parts = [p for p in (dict_to_part(part_dict) for part_dict in entry["parts"]) if p is not None]
-                entry_text_len = sum(len(p.text) for p in entry_api_parts if p.text)
+            else: # model
+                for part_dict in entry["parts"]:
+                    if part_dict.get('type') == 'text':
+                        text = part_dict.get('content', '')
+                        entry_api_parts.append(types.Part(text=text))
+                        entry_text_len += len(text)
 
             if not entry_api_parts: continue
             
