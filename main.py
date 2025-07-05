@@ -664,7 +664,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_file = await photo.get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         file_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
-        await handle_media_request(update, context, file_part, message.caption or "Проанализируй изображение и выскажи свое мнение.")
+        await handle_media_request(update, context, file_part, message.caption or "Проанализируй содержимое изображения и выскажи свое мнение.")
     except (BadRequest, IOError) as e:
         logger.error(f"Ошибка при обработке фото: {e}")
         await message.reply_text(f"❌ Ошибка обработки изображения: {e}")
@@ -694,7 +694,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc_file = await doc.get_file()
         doc_bytes = await doc_file.download_as_bytearray()
         file_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], doc_bytes, doc.mime_type, doc.file_name or "document")
-        await handle_media_request(update, context, file_part, message.caption or "Проанализируй документ и выскажи свое мнение.")
+        await handle_media_request(update, context, file_part, message.caption or "Проанализируй содержимое документа и выскажи свое мнение.")
     except (BadRequest, IOError) as e:
         logger.error(f"Ошибка при обработке документа: {e}")
         await message.reply_text(f"❌ Ошибка обработки документа: {e}")
@@ -721,7 +721,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_file = await video.get_file()
         video_bytes = await video_file.download_as_bytearray()
         video_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], video_bytes, video.mime_type, video.file_name or "video.mp4")
-        await handle_media_request(update, context, video_part, message.caption or "Проанализируй видео и выскажи свое мнение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом.")
+        await handle_media_request(update, context, video_part, message.caption or "Проанализируй содержимое видео и выскажи свое мнение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом.")
     except (BadRequest, IOError) as e:
         logger.error(f"Ошибка при обработке видео: {e}")
         await message.reply_text(f"❌ Ошибка обработки видео: {e}")
@@ -745,7 +745,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
          return
 
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
-    user_text = message.caption or "Ответь на это голосовое сообщение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом."
+    user_text = message.caption or "Содержательно ответь на это голосовое сообщение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом."
     
     try:
         audio_file = await audio.get_file()
@@ -771,7 +771,10 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await message.reply_text("Анализирую видео с YouTube...", reply_to_message_id=message.id)
     try:
         youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
-        user_prompt = text.replace(match.group(0), "").strip() or "Посмотри YouTube-видео и выскажи свое мнение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом."
+        
+        # ИСПРАВЛЕНИЕ: Делаем промпт более строгим и конкретным
+        user_prompt = text.replace(match.group(0), "").strip() or "Сначала точно определи автора и название этого YouTube-видео. Не выдумывай, если не уверен. Проанализируй содержимое видео и выскажи свое мнение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом."
+        
         await handle_media_request(update, context, youtube_part, user_prompt)
     except Exception as e:
         logger.error(f"Ошибка при обработке YouTube URL {youtube_url}: {e}", exc_info=True)
