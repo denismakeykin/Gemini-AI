@@ -1,4 +1,4 @@
-# Версия 11.0
+# Версия 11.1 (исправленная)
 
 import logging
 import os
@@ -76,7 +76,6 @@ except FileNotFoundError:
 
 # --- КЛАСС PERSISTENCE ---
 class PostgresPersistence(BasePersistence):
-    # ... (код класса без изменений) ...
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
@@ -335,7 +334,6 @@ async def upload_and_wait_for_file(client: genai.Client, file_bytes: bytes, mime
 
 async def generate_response(client: genai.Client, request_contents: list, context: ContextTypes.DEFAULT_TYPE, tools: list) -> types.GenerateContentResponse | str:
     chat_id = context.chat_data.get('id', 'Unknown')
-    thinking_budget = 24576
     
     try:
         final_system_instruction = SYSTEM_INSTRUCTION.format(current_time=get_current_time_str())
@@ -348,7 +346,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         tools=tools,
         system_instruction=types.Content(parts=[types.Part(text=final_system_instruction)]),
         temperature=1.0,
-        thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget)
+        thinking_config=types.ThinkingConfig(thinking_budget=-1) # Динамическое мышление
     )
     
     try:
@@ -466,48 +464,46 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     chat_id = message.chat_id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
+    # Шаг 1: Предварительная проверка на запрос времени/даты. Вынесена из try-except.
+    text_part_content = next((p.text for p in content_parts if p.text), None)
+    if text_part_content and re.search(DATE_TIME_REGEX, text_part_content, re.IGNORECASE):
+        logger.info("Обнаружен запрос о времени/дате. Отвечаем напрямую.")
+        time_str = get_current_time_str()
+        response_text = f"{user.first_name}, {time_str[0].lower()}{time_str[1:]}"
+        sent_message = await send_reply(message, response_text)
+        if sent_message:
+            await add_to_history(context, role="user", parts=content_parts, user=user, original_message_id=message.message_id)
+            await add_to_history(context, role="model", parts=[types.Part(text=response_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
+        return # Завершаем выполнение здесь
+
+    # Шаг 2: Основная логика в блоке try-except
     try:
         history_for_api = build_history_for_request(context.chat_data.get("history", []))
         
-        text_part_content = next((p.text for p in content_parts if p.text), None)
+        user_prefix = f"[{user.id}; Name: {user.first_name}]: "
+        prompt_text = next((p.text for p in content_parts if p.text), "")
         
-        if text_part_content and re.search(DATE_TIME_REGEX, text_part_content, re.IGNORECASE):
-            logger.info("Обнаружен запрос о времени/дате. Отвечаем напрямую.")
-            time_str = get_current_time_str()
-            response_text = f"{user.first_name}, {time_str[0].lower()}{time_str[1:]}"
-            sent_message = await send_reply(message, response_text)
-            if sent_message:
-                await add_to_history(context, role="user", parts=content_parts, user=user, original_message_id=message.message_id)
-                await add_to_history(context, role="model", parts=[types.Part(text=response_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
-        return
+        has_media = any(p.file_data for p in content_parts)
 
-    user_prefix = f"[{user.id}; Name: {user.name}]: "
-    prompt_text = next((p.text for p in content_parts if p.text), "")
-    
-    # Проверяем, есть ли в запросе медиа-часть
-    has_media = any(p.file_data for p in content_parts)
-
-    # Добавляем строгую инструкцию для поиска только если это чисто текстовый запрос
-    if not has_media:
-        grounding_instruction = """
+        if not has_media:
+            grounding_instruction = """
 ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Тебе уже предоставлены точная дата и время в System Note, используй эти данные и не пытайся вычислять их самостоятельно. Не анонсируй свои внутренние действия, а выполняй их в скрытом режиме.
 """
-        final_prompt_text = f"{grounding_instruction}\n{user_prefix}{prompt_text}"
-    else:
-        final_prompt_text = f"{user_prefix}{prompt_text}"
+            final_prompt_text = f"{grounding_instruction}\n{user_prefix}{prompt_text}"
+        else:
+            final_prompt_text = f"{user_prefix}{prompt_text}"
 
-    current_request_parts = []
-    # Заменяем текстовую часть на новую, обработанную
-    text_part_found = False
-    for part in content_parts:
-        if part.text and not text_part_found:
-            if final_prompt_text: # Добавляем только если есть текст
-                current_request_parts.append(types.Part(text=final_prompt_text))
-            text_part_found = True
-        elif not part.text: # Добавляем все нетекстовые части
-             current_request_parts.append(part)
+        current_request_parts = []
+        text_part_found = False
+        for part in content_parts:
+            if part.text and not text_part_found:
+                if final_prompt_text:
+                    current_request_parts.append(types.Part(text=final_prompt_text))
+                text_part_found = True
+            elif not part.text:
+                current_request_parts.append(part)
 
-    request_contents = history_for_api + [types.Content(parts=current_request_parts, role="user")]
+        request_contents = history_for_api + [types.Content(parts=current_request_parts, role="user")]
         
         tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
         response_obj = await generate_response(client, request_contents, context, tools)
@@ -545,10 +541,10 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 
     except (IOError, asyncio.TimeoutError) as e:
         logger.error(f"Ошибка обработки файла: {e}", exc_info=False)
-        await message.reply_text(f"❌ Ошибка обработки файла: {e}")
+        await message.reply_text(f"❌ <b>Ошибка обработки файла:</b> {html.escape(str(e))}")
     except Exception as e:
         logger.error(f"Непредвиденная ошибка в process_request: {e}", exc_info=True)
-        await message.reply_text("❌ Произошла критическая внутренняя ошибка. Попробуйте еще раз.")
+        await message.reply_text(f"❌ <b>Произошла критическая внутренняя ошибка:</b>\n<code>{html.escape(str(e))}</code>")
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -783,7 +779,6 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
         
-        # ИСПРАВЛЕНИЕ: Делаем промпт более строгим и конкретным
         user_prompt = text.replace(match.group(0), "").strip() or "Проанализируй видео по ссылке, лаконично перескажи, ответь на содержимое и выскажи свое мнение. Не вставляй транскрипт и не указывай таймкоды, если я об этом не просил."
         
         await handle_media_request(update, context, youtube_part, user_prompt)
