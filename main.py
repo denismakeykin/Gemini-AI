@@ -1,4 +1,4 @@
-# Версия 12.0 (Финальная, без конфликта инструкций)
+# Версия 10.0 (Финальная, архитектура по твоим правилам: без "липкого" контекста)
 
 import logging
 import os
@@ -76,6 +76,7 @@ except FileNotFoundError:
 
 # --- КЛАСС PERSISTENCE ---
 class PostgresPersistence(BasePersistence):
+    # ... (код класса без изменений) ...
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
@@ -171,7 +172,6 @@ class PostgresPersistence(BasePersistence):
         if self.db_pool: self.db_pool.closeall()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-# ... (код вспомогательных функций без изменений) ...
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
     now = datetime.datetime.now(pytz.timezone(timezone))
     days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
@@ -251,6 +251,7 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
                 user_prefix = f"[{user_id}; Name: {user_name}]: "
                 
                 for part_dict in entry["parts"]:
+                    # В историю для API отправляется только текст
                     if part_dict.get('type') == 'text':
                         prefixed_text = f"{user_prefix}{part_dict.get('content', '')}"
                         entry_api_parts.append(types.Part(text=prefixed_text))
@@ -443,15 +444,12 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     chat_history = context.chat_data.setdefault("history", [])
     
     entry_parts = []
-    # В постоянную историю сохраняем только текст, медиа хранятся только в сессионных данных
+    # В постоянную историю сохраняем только текст
     for part in parts:
         if part.text:
             entry_parts.append(part_to_dict(part))
 
-    if not entry_parts and role == 'model':
-         entry_parts.append({'type': 'text', 'content': ''})
-    elif not entry_parts:
-        return
+    if not entry_parts: return # Не сохраняем в историю сообщения без текста
             
     entry = {"role": role, "parts": entry_parts, **kwargs}
     if role == 'user' and user:
@@ -481,22 +479,35 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             if sent_message:
                 await add_to_history(context, role="user", parts=content_parts, user=user, original_message_id=message.message_id)
                 await add_to_history(context, role="model", parts=[types.Part(text=response_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
-            return
+        return
 
-        user_prefix = f"[{user.id}; Name: {user.first_name}]: "
-        
-        current_request_parts = []
-        text_part_found = False
-        for part in content_parts:
-            if part.text and not text_part_found:
-                # Убран grounding_instruction
-                final_prompt_text = f"{user_prefix}{part.text}"
+    user_prefix = f"[{user.id}; Name: {user.name}]: "
+    prompt_text = next((p.text for p in content_parts if p.text), "")
+    
+    # Проверяем, есть ли в запросе медиа-часть
+    has_media = any(p.file_data for p in content_parts)
+
+    # Добавляем строгую инструкцию для поиска только если это чисто текстовый запрос
+    if not has_media:
+        grounding_instruction = """
+ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Тебе уже предоставлены точная дата и время в системном промпте, используй эти данные и не пытайся вычислять их самостоятельно. Не анонсируй свои внутренние действия, а выполняй их в скрытом режиме.
+"""
+        final_prompt_text = f"{grounding_instruction}\n{user_prefix}{prompt_text}"
+    else:
+        final_prompt_text = f"{user_prefix}{prompt_text}"
+
+    current_request_parts = []
+    # Заменяем текстовую часть на новую, обработанную
+    text_part_found = False
+    for part in content_parts:
+        if part.text and not text_part_found:
+            if final_prompt_text: # Добавляем только если есть текст
                 current_request_parts.append(types.Part(text=final_prompt_text))
-                text_part_found = True
-            else:
-                current_request_parts.append(part)
-        
-        request_contents = history_for_api + [types.Content(parts=current_request_parts, role="user")]
+            text_part_found = True
+        elif not part.text: # Добавляем все нетекстовые части
+             current_request_parts.append(part)
+
+    request_contents = history_for_api + [types.Content(parts=current_request_parts, role="user")]
         
         tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
         response_obj = await generate_response(client, request_contents, context, tools)
@@ -540,7 +551,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         await message.reply_text("❌ Произошла критическая внутренняя ошибка. Попробуйте еще раз.")
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
-# ... (код команд без изменений) ...
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_text = """Я - Женя, интеллект новой Google Gemini 2.5 Flash с лучшим поиском:
 
@@ -665,7 +675,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_file = await photo.get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         file_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
-        await handle_media_request(update, context, file_part, message.caption or "Проанализируй и лаконично перескажи содержимое изображения, выскажи свое мнение.")
+        await handle_media_request(update, context, file_part, message.caption or "Проанализируй, лаконично перескажи и ответь на содержимое изображения, выскажи свое мнение.")
     except (BadRequest, IOError) as e:
         logger.error(f"Ошибка при обработке фото: {e}")
         await message.reply_text(f"❌ Ошибка обработки изображения: {e}")
@@ -695,7 +705,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc_file = await doc.get_file()
         doc_bytes = await doc_file.download_as_bytearray()
         file_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], doc_bytes, doc.mime_type, doc.file_name or "document")
-        await handle_media_request(update, context, file_part, message.caption or "Проанализируй и лаконично перескажи содержимое документа, выскажи свое мнение.")
+        await handle_media_request(update, context, file_part, message.caption or "Проанализируй, лаконично перескажи и ответь на содержимое документа, выскажи свое мнение.")
     except (BadRequest, IOError) as e:
         logger.error(f"Ошибка при обработке документа: {e}")
         await message.reply_text(f"❌ Ошибка обработки документа: {e}")
@@ -722,7 +732,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_file = await video.get_file()
         video_bytes = await video_file.download_as_bytearray()
         video_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], video_bytes, video.mime_type, video.file_name or "video.mp4")
-        await handle_media_request(update, context, video_part, message.caption or "Проанализируй и лаконично перескажи содержимое видео, выскажи свое мнение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом.")
+        await handle_media_request(update, context, video_part, message.caption or "Проанализируй, лаконично перескажи и ответь на содержимое видео, выскажи свое мнение. Не вставляй транскрипт и не указывай таймкоды, если я об этом не просил.")
     except (BadRequest, IOError) as e:
         logger.error(f"Ошибка при обработке видео: {e}")
         await message.reply_text(f"❌ Ошибка обработки видео: {e}")
@@ -746,7 +756,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
          return
 
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
-    user_text = message.caption or "Содержательно ответь на это голосовое сообщение, выскажи свое мнение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом."
+    user_text = message.caption or "Проанализируй и ответь на голосовое сообщение, выскажи свое мнение. Не вставляй транскрипт и не указывай таймкоды, если я об этом не просил."
     
     try:
         audio_file = await audio.get_file()
@@ -773,7 +783,8 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
         
-        user_prompt = text.replace(match.group(0), "").strip() or "Точно определи YouTube-видео по этой ссылке, не выдумывай. Проанализируй и лаконично перескажи содержимое видео, выскажи свое мнение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом."
+        # ИСПРАВЛЕНИЕ: Делаем промпт более строгим и конкретным
+        user_prompt = text.replace(match.group(0), "").strip() or "Проанализируй видео по ссылке, лаконично перескажи, ответь на содержимое и выскажи свое мнение. Не вставляй транскрипт и не указывай таймкоды, если я об этом не просил."
         
         await handle_media_request(update, context, youtube_part, user_prompt)
     except Exception as e:
