@@ -1,4 +1,4 @@
-# Версия 11.1 (исправленная)
+# Версия 11.2 (с твоими правками)
 
 import logging
 import os
@@ -346,7 +346,7 @@ async def generate_response(client: genai.Client, request_contents: list, contex
         tools=tools,
         system_instruction=types.Content(parts=[types.Part(text=final_system_instruction)]),
         temperature=1.0,
-        thinking_config=types.ThinkingConfig(thinking_budget=-1) # Динамическое мышление
+        thinking_config=types.ThinkingConfig(thinking_budget=24576) # Максимальный бюджет на мышление
     )
     
     try:
@@ -671,7 +671,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_file = await photo.get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         file_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], photo_bytes, 'image/jpeg', photo_file.file_unique_id + ".jpg")
-        await handle_media_request(update, context, file_part, message.caption or "Проанализируй, лаконично перескажи и ответь на содержимое изображения, выскажи свое мнение.")
+        await handle_media_request(update, context, file_part, message.caption or "В ПЕРВУЮ ОЧЕРЕДЬ проанализируй содержимое этого изображения. Лаконично перескажи, что на нем, и ответь на вопросы, если они подразумеваются. ПОСЛЕ ЭТОГО выскажи свое мнение.")
     except (BadRequest, IOError) as e:
         logger.error(f"Ошибка при обработке фото: {e}")
         await message.reply_text(f"❌ Ошибка обработки изображения: {e}")
@@ -701,7 +701,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc_file = await doc.get_file()
         doc_bytes = await doc_file.download_as_bytearray()
         file_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], doc_bytes, doc.mime_type, doc.file_name or "document")
-        await handle_media_request(update, context, file_part, message.caption or "Проанализируй, лаконично перескажи и ответь на содержимое документа, выскажи свое мнение.")
+        await handle_media_request(update, context, file_part, message.caption or "В ПЕРВУЮ ОЧЕРЕДЬ проанализируй содержимое этого документа. Лаконично перескажи его суть и ответь на вопросы, если они подразумеваются. ПОСЛЕ ЭТОГО выскажи свое мнение.")
     except (BadRequest, IOError) as e:
         logger.error(f"Ошибка при обработке документа: {e}")
         await message.reply_text(f"❌ Ошибка обработки документа: {e}")
@@ -728,7 +728,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         video_file = await video.get_file()
         video_bytes = await video_file.download_as_bytearray()
         video_part = await upload_and_wait_for_file(context.bot_data['gemini_client'], video_bytes, video.mime_type, video.file_name or "video.mp4")
-        await handle_media_request(update, context, video_part, message.caption or "Проанализируй, лаконично перескажи и ответь на содержимое видео, выскажи свое мнение. Не вставляй транскрипт и не указывай таймкоды, если я об этом не просил.")
+        await handle_media_request(update, context, video_part, message.caption or "В ПЕРВУЮ ОЧЕРЕДЬ проанализируй содержимое этого видео. Лаконично перескажи его суть и ответь на вопросы, если они подразумеваются. ПОСЛЕ ЭТОГО выскажи свое мнение. Не вставляй транскрипт и таймкоды, если я не просил.")
     except (BadRequest, IOError) as e:
         logger.error(f"Ошибка при обработке видео: {e}")
         await message.reply_text(f"❌ Ошибка обработки видео: {e}")
@@ -752,7 +752,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio
          return
 
     file_name = getattr(audio, 'file_name', 'voice_message.ogg')
-    user_text = message.caption or "Проанализируй и ответь на голосовое сообщение, выскажи свое мнение. Не вставляй транскрипт и не указывай таймкоды, если я об этом не просил."
+    user_text = message.caption or "В ПЕРВУЮ ОЧЕРЕДЬ проанализируй и ответь на это голосовое сообщение. ПОСЛЕ ЭТОГО выскажи свое мнение. Не вставляй транскрипт и таймкоды, если я не просил."
     
     try:
         audio_file = await audio.get_file()
@@ -779,7 +779,7 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
         
-        user_prompt = text.replace(match.group(0), "").strip() or "Проанализируй видео по ссылке, лаконично перескажи, ответь на содержимое и выскажи свое мнение. Не вставляй транскрипт и не указывай таймкоды, если я об этом не просил."
+        user_prompt = text.replace(match.group(0), "").strip() or "В ПЕРВУЮ ОЧЕРЕДЬ проанализируй видео по этой ссылке. Лаконично перескажи его суть и ответь на вопросы, если они подразумеваются. ПОСЛЕ ЭТОГО выскажи свое мнение. Не вставляй транскрипт и таймкоды, если я не просил."
         
         await handle_media_request(update, context, youtube_part, user_prompt)
     except Exception as e:
