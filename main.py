@@ -1,4 +1,4 @@
-# Версия 10.0 (Финальная, архитектура по твоим правилам: без "липкого" контекста)
+# Версия 12.0 (Финальная, без конфликта инструкций)
 
 import logging
 import os
@@ -76,7 +76,6 @@ except FileNotFoundError:
 
 # --- КЛАСС PERSISTENCE ---
 class PostgresPersistence(BasePersistence):
-    # ... (код класса без изменений) ...
     def __init__(self, database_url: str):
         super().__init__()
         self.db_pool = None
@@ -172,6 +171,7 @@ class PostgresPersistence(BasePersistence):
         if self.db_pool: self.db_pool.closeall()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# ... (код вспомогательных функций без изменений) ...
 def get_current_time_str(timezone: str = "Europe/Moscow") -> str:
     now = datetime.datetime.now(pytz.timezone(timezone))
     days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
@@ -251,7 +251,6 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
                 user_prefix = f"[{user_id}; Name: {user_name}]: "
                 
                 for part_dict in entry["parts"]:
-                    # В историю для API отправляется только текст
                     if part_dict.get('type') == 'text':
                         prefixed_text = f"{user_prefix}{part_dict.get('content', '')}"
                         entry_api_parts.append(types.Part(text=prefixed_text))
@@ -444,12 +443,15 @@ async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: l
     chat_history = context.chat_data.setdefault("history", [])
     
     entry_parts = []
-    # В постоянную историю сохраняем только текст
+    # В постоянную историю сохраняем только текст, медиа хранятся только в сессионных данных
     for part in parts:
         if part.text:
             entry_parts.append(part_to_dict(part))
 
-    if not entry_parts: return # Не сохраняем в историю сообщения без текста
+    if not entry_parts and role == 'model':
+         entry_parts.append({'type': 'text', 'content': ''})
+    elif not entry_parts:
+        return
             
     entry = {"role": role, "parts": entry_parts, **kwargs}
     if role == 'user' and user:
@@ -482,15 +484,13 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             return
 
         user_prefix = f"[{user.id}; Name: {user.first_name}]: "
-        grounding_instruction = """
-ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Тебе уже предоставлена точная дата и время в системной заметке, используй эти данные, не пытайся вычислить их самостоятельно. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.
-"""
         
         current_request_parts = []
         text_part_found = False
         for part in content_parts:
             if part.text and not text_part_found:
-                final_prompt_text = f"{grounding_instruction}\n{user_prefix}{part.text}"
+                # Убран grounding_instruction
+                final_prompt_text = f"{user_prefix}{part.text}"
                 current_request_parts.append(types.Part(text=final_prompt_text))
                 text_part_found = True
             else:
@@ -540,6 +540,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         await message.reply_text("❌ Произошла критическая внутренняя ошибка. Попробуйте еще раз.")
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
+# ... (код команд без изменений) ...
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_text = """Я - Женя, интеллект новой Google Gemini 2.5 Flash с лучшим поиском:
 
@@ -772,7 +773,6 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         youtube_part = types.Part(file_data=types.FileData(mime_type="video/youtube", file_uri=youtube_url))
         
-        # ИСПРАВЛЕНИЕ: Делаем промпт более строгим и конкретным
         user_prompt = text.replace(match.group(0), "").strip() or "Точно определи YouTube-видео по этой ссылке, не выдумывай. Проанализируй и лаконично перескажи содержимое видео, выскажи свое мнение. Не вставляй его транскрипт и не указывай таймкоды, если пользователь не просил об этом."
         
         await handle_media_request(update, context, youtube_part, user_prompt)
