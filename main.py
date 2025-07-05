@@ -1,4 +1,4 @@
-# Версия 9.0 (Финальная, с явным контекстом через "Ответ" и подсказками)
+# Версия 10.0 (Финальная, архитектура по твоим правилам: без "липкого" контекста)
 
 import logging
 import os
@@ -251,7 +251,7 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
                 user_prefix = f"[{user_id}; Name: {user_name}]: "
                 
                 for part_dict in entry["parts"]:
-                    # В историю для API отправляется только текст, медиа-контекст будет добавлен отдельно
+                    # В историю для API отправляется только текст
                     if part_dict.get('type') == 'text':
                         prefixed_text = f"{user_prefix}{part_dict.get('content', '')}"
                         entry_api_parts.append(types.Part(text=prefixed_text))
@@ -443,7 +443,15 @@ async def send_reply(target_message: Message, response_text: str, add_context_hi
 async def add_to_history(context: ContextTypes.DEFAULT_TYPE, role: str, parts: list[types.Part], user: User = None, **kwargs):
     chat_history = context.chat_data.setdefault("history", [])
     
-    entry = {"role": role, "parts": [part_to_dict(p) for p in parts if p], **kwargs}
+    entry_parts = []
+    # В постоянную историю сохраняем только текст
+    for part in parts:
+        if part.text:
+            entry_parts.append(part_to_dict(part))
+
+    if not entry_parts: return # Не сохраняем в историю сообщения без текста
+            
+    entry = {"role": role, "parts": entry_parts, **kwargs}
     if role == 'user' and user:
         entry['user_id'] = user.id
         entry['user_name'] = user.first_name
@@ -478,28 +486,17 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Тебе уже предоставлена точная дата и время в системной заметке, используй эти данные, не пытайся вычислить их самостоятельно. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.
 """
         
-        # Собираем запрос для API, включая "липкий" контекст если нужно
-        request_api_parts = list(content_parts)
-        if is_media_request and not any(p.file_data for p in request_api_parts):
-             # Эта ветка для reply, когда медиа нужно взять из контекста
-             media_context = find_media_context_in_history(context, message.reply_to_message.message_id)
-             if media_context:
-                 media_part = dict_to_part(media_context)
-                 if media_part:
-                     request_api_parts.insert(0, media_part)
-        
-        # Формируем текстовую часть
-        final_request_parts = []
+        current_request_parts = []
         text_part_found = False
-        for part in request_api_parts:
+        for part in content_parts:
             if part.text and not text_part_found:
                 final_prompt_text = f"{grounding_instruction}\n{user_prefix}{part.text}"
-                final_request_parts.append(types.Part(text=final_prompt_text))
+                current_request_parts.append(types.Part(text=final_prompt_text))
                 text_part_found = True
             else:
-                final_request_parts.append(part)
-
-        request_contents = history_for_api + [types.Content(parts=final_request_parts, role="user")]
+                current_request_parts.append(part)
+        
+        request_contents = history_for_api + [types.Content(parts=current_request_parts, role="user")]
         
         tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
         response_obj = await generate_response(client, request_contents, context, tools)
