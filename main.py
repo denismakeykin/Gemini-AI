@@ -251,7 +251,7 @@ def build_history_for_request(chat_history: list) -> list[types.Content]:
                 user_prefix = f"[{user_id}; Name: {user_name}]: "
                 
                 for part_dict in entry["parts"]:
-                    # Медиа из истории не добавляем в запрос к API, только текст
+                    # В историю для API отправляется только текст, медиа-контекст будет добавлен отдельно
                     if part_dict.get('type') == 'text':
                         prefixed_text = f"{user_prefix}{part_dict.get('content', '')}"
                         entry_api_parts.append(types.Part(text=prefixed_text))
@@ -458,8 +458,6 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
     chat_id = message.chat_id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-    user_parts_for_history = content_parts.copy()
-
     try:
         history_for_api = build_history_for_request(context.chat_data.get("history", []))
         
@@ -471,7 +469,7 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             response_text = f"{user.first_name}, {time_str[0].lower()}{time_str[1:]}"
             sent_message = await send_reply(message, response_text)
             if sent_message:
-                await add_to_history(context, role="user", parts=user_parts_for_history, user=user, original_message_id=message.message_id)
+                await add_to_history(context, role="user", parts=content_parts, user=user, original_message_id=message.message_id)
                 await add_to_history(context, role="model", parts=[types.Part(text=response_text)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
             return
 
@@ -480,17 +478,28 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 ВАЖНОЕ КРИТИЧЕСКОЕ ПРАВИЛО: Твоя внутренняя память устарела. Не отвечай на основе памяти, если вопрос подразумевает факты (события, личности, даты, статистика и т.д.). Ты ОБЯЗАН ВСЕГДА АКТИВНО использовать инструмент Grounding with Google Search. Тебе уже предоставлена точная дата и время в системной заметке, используй эти данные, не пытайся вычислить их самостоятельно. Не анонсируй свои внутренние действия. Выполняй их в скрытом режиме.
 """
         
-        current_request_parts = []
+        # Собираем запрос для API, включая "липкий" контекст если нужно
+        request_api_parts = list(content_parts)
+        if is_media_request and not any(p.file_data for p in request_api_parts):
+             # Эта ветка для reply, когда медиа нужно взять из контекста
+             media_context = find_media_context_in_history(context, message.reply_to_message.message_id)
+             if media_context:
+                 media_part = dict_to_part(media_context)
+                 if media_part:
+                     request_api_parts.insert(0, media_part)
+        
+        # Формируем текстовую часть
+        final_request_parts = []
         text_part_found = False
-        for part in content_parts:
+        for part in request_api_parts:
             if part.text and not text_part_found:
                 final_prompt_text = f"{grounding_instruction}\n{user_prefix}{part.text}"
-                current_request_parts.append(types.Part(text=final_prompt_text))
+                final_request_parts.append(types.Part(text=final_prompt_text))
                 text_part_found = True
             else:
-                current_request_parts.append(part)
-        
-        request_contents = history_for_api + [types.Content(parts=current_request_parts, role="user")]
+                final_request_parts.append(part)
+
+        request_contents = history_for_api + [types.Content(parts=final_request_parts, role="user")]
         
         tools = MEDIA_TOOLS if is_media_request else TEXT_TOOLS
         response_obj = await generate_response(client, request_contents, context, tools)
@@ -509,20 +518,17 @@ async def process_request(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         sent_message = await send_reply(message, reply_text, add_context_hint=is_media_request)
         
         if sent_message:
-            # Сохраняем медиа только в сессионные данные, а в постоянную историю - только текст
-            text_parts_for_history = [p for p in user_parts_for_history if p.text]
-            await add_to_history(context, role="user", parts=text_parts_for_history, user=user, original_message_id=message.message_id)
+            await add_to_history(context, role="user", parts=content_parts, user=user, original_message_id=message.message_id)
             await add_to_history(context, role="model", parts=[types.Part(text=full_response_for_history)], original_message_id=message.message_id, bot_message_id=sent_message.message_id)
             
             if is_media_request:
-                media_part = next((p for p in user_parts_for_history if p.file_data), None)
+                media_part = next((p for p in content_parts if p.file_data), None)
                 if media_part:
                     all_media_contexts = context.application.bot_data.setdefault('media_contexts', {})
                     chat_media_contexts = all_media_contexts.setdefault(chat_id, OrderedDict())
                     
                     chat_media_contexts[message.message_id] = part_to_dict(media_part)
                     if len(chat_media_contexts) > MAX_MEDIA_CONTEXTS: chat_media_contexts.popitem(last=False)
-
                     logger.info(f"Сохранен сессионный медиа-контекст для msg_id {message.message_id} в чате {chat_id}")
             
             await context.application.persistence.update_chat_data(chat_id, context.chat_data)
@@ -614,7 +620,7 @@ async def utility_media_command(update: Update, context: ContextTypes.DEFAULT_TY
         
         response_obj = await generate_response(client, [types.Content(parts=content_parts, role="user")], context, MEDIA_TOOLS)
         result_text = format_gemini_response(response_obj) if not isinstance(response_obj, str) else response_obj
-        await send_reply(update.message, result_text)
+        await send_reply(update.message, result_text, add_context_hint=True)
     
     except BadRequest as e:
         if "File is too big" in str(e):
